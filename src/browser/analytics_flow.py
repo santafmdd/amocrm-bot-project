@@ -2480,6 +2480,45 @@ class AnalyticsFlow:
             elapsed += step_ms
         return not self._is_tag_dropdown_open(panel)
 
+    def _choose_option_text(self, page: Page, target: str) -> bool:
+        """Select dropdown/list option by visible text (best-effort deterministic helper)."""
+        wanted = self._normalize_filter_text(target)
+        if not wanted:
+            return False
+
+        selectors = [
+            "[role='option']",
+            "li",
+            "[class*='select'] li",
+            "[class*='dropdown'] *",
+            "[class*='multisuggest'] li",
+        ]
+        for selector in selectors:
+            try:
+                locator = page.locator(selector)
+                count = min(locator.count(), 20)
+            except Exception:
+                continue
+
+            for idx in range(count):
+                item = locator.nth(idx)
+                try:
+                    if not item.is_visible(timeout=400):
+                        continue
+                    txt = (item.inner_text(timeout=400) or "").strip()
+                    norm = self._normalize_filter_text(txt)
+                    if not norm:
+                        continue
+                    if wanted != norm and wanted not in norm:
+                        continue
+                    item.click(timeout=1200)
+                    page.wait_for_timeout(150)
+                    return True
+                except Exception:
+                    continue
+
+        return False
+
     def _wait_for_apply_button_ready(self, panel: Locator, timeout_ms: int = 3000) -> dict[str, bool]:
         """Wait until panel apply button is visible/enabled."""
         step_ms = 150

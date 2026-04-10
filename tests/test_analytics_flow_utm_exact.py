@@ -393,3 +393,9 @@ def test_resolve_utm_row_context_prefers_payload_row_over_target_input(monkeypat
 
     assert resolved_row is payload_row
     assert resolved_target is target_input
+
+
+def test_analytics_flow_has_choose_option_text_helper():
+    flow = AnalyticsFlow(reader=_DummyReader(), project_root=Path.cwd())
+    assert hasattr(flow, "_choose_option_text")
+    assert callable(flow._choose_option_text)

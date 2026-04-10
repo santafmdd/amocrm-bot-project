@@ -48,6 +48,11 @@ class TestLayoutFilterDsl(unittest.TestCase):
         self.assertEqual(normalize_field_name("\u041f\u043e"), "date_to")
         self.assertEqual(normalize_field_name("utm_source"), "utm_source")
 
+
+    def test_normalize_field_name_dates_mode_variants(self):
+        self.assertEqual(normalize_field_name("dates_mode"), "dates_mode")
+        self.assertEqual(normalize_field_name("dates mode"), "dates_mode")
+
     def test_select_best_scenario(self):
         winner = select_best_scenario(
             [

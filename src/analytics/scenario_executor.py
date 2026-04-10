@@ -328,7 +328,9 @@ class ScenarioExecutor:
                 self.flow._apply_supported_filter(page, self.report_id, "tag", list(f.values), operator=f.operator)
                 continue
 
-            self.logger.warning("Unsupported or out-of-scope DSL filter in scenario execution: field=%s", field)
+            raise RuntimeError(
+                f"Unsupported DSL filter for scenario execution: field={field} raw_field={f.raw_field_name!r}"
+            )
 
         if combined_dates_mode or combined_period or combined_date_from or combined_date_to:
             date_values: list[str] = []
