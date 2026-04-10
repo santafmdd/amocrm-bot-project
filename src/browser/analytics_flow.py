@@ -4273,6 +4273,54 @@ class AnalyticsFlow:
         candidate, selector, _scope, _payloads, _winner = self._find_apply_button(page, panel, report_id="runtime")
         return candidate, selector
 
+    def _dump_apply_button_diagnostics(
+        self,
+        page: Page,
+        report_id: str,
+        payloads: list[dict[str, object]],
+    ) -> tuple[Path, Path]:
+        """Save apply-button candidate diagnostics (best-effort, never raises)."""
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base = self._debug_dir()
+        text_path = ensure_inside_root(base / f"{report_id}_apply_candidates_{stamp}.txt", self.project_root)
+        json_path = ensure_inside_root(base / f"{report_id}_apply_candidates_{stamp}.json", self.project_root)
+
+        def _safe_write(path: Path, content: str) -> None:
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding="utf-8")
+            except Exception as exc:
+                self.logger.warning("Apply diagnostics write warning path=%s error=%s", path, exc)
+
+        try:
+            lines: list[str] = [
+                f"report_id={report_id}",
+                f"page_url={getattr(page, 'url', '')}",
+                f"payload_count={len(payloads)}",
+                "",
+            ]
+            for idx, payload in enumerate(payloads):
+                lines.append(
+                    (
+                        f"[{idx}] selector={payload.get('selector', '')} scope={payload.get('scope', '')} "
+                        f"score={payload.get('score', '')} relevant={payload.get('relevant', '')} "
+                        f"is_exact_apply={payload.get('is_exact_apply', '')} "
+                        f"id={payload.get('elementId', '')} class={payload.get('className', '')} "
+                        f"text={payload.get('text', '')} visible={payload.get('visible', '')} "
+                        f"enabled={payload.get('enabled', '')} bbox={payload.get('bbox', '')}"
+                    )
+                )
+            _safe_write(text_path, "\n".join(lines))
+            _safe_write(json_path, json.dumps(payloads, ensure_ascii=False, indent=2))
+            return text_path, json_path
+        except Exception as exc:
+            fallback_txt = ensure_inside_root(base / f"{report_id}_apply_candidates_{stamp}_fallback.txt", self.project_root)
+            fallback_json = ensure_inside_root(base / f"{report_id}_apply_candidates_{stamp}_fallback.json", self.project_root)
+            _safe_write(fallback_txt, f"apply diagnostics collection failed: {exc}")
+            _safe_write(fallback_json, "[]")
+            self.logger.warning("Apply diagnostics fallback used report_id=%s error=%s", report_id, exc)
+            return fallback_txt, fallback_json
+
     def _get_panel_apply_state(self, page: Page, panel: Locator) -> dict[str, bool]:
         apply_btn, _ = self._get_panel_apply_button(page, panel)
         if apply_btn is None:
@@ -4329,7 +4377,12 @@ class AnalyticsFlow:
             self.logger.info("Apply candidate payload: %s", payload)
 
         if apply_btn is None:
-            text_path, selectors_path = self._dump_apply_button_diagnostics(page, report_id, payloads)
+            try:
+                text_path, selectors_path = self._dump_apply_button_diagnostics(page, report_id, payloads)
+            except Exception as exc:
+                self.logger.warning("Apply diagnostics failed in not-found path report_id=%s error=%s", report_id, exc)
+                text_path = Path("<apply_diagnostics_failed>")
+                selectors_path = Path("<apply_diagnostics_failed>")
             self.logger.warning("Apply candidates debug text dump: %s", text_path)
             self.logger.warning("Apply candidates debug selector dump: %s", selectors_path)
             self._debug_screenshot(page, f"profile_{report_id}_apply_not_found")
@@ -4376,12 +4429,23 @@ class AnalyticsFlow:
                 self.logger.info("Apply click attempt failed: %s error=%s", attempt_name, exc)
                 continue
 
-            page.wait_for_timeout(320)
-            if _apply_effect_observed():
-                self.logger.info("Filter apply confirmed")
-                return True
+            poll_attempts = 10
+            poll_step_ms = 200
+            for poll_idx in range(poll_attempts):
+                if _apply_effect_observed():
+                    self.logger.info("Filter apply confirmed attempt=%s poll=%s", attempt_name, poll_idx + 1)
+                    return True
+                try:
+                    page.wait_for_timeout(poll_step_ms)
+                except Exception:
+                    break
 
-        text_path, selectors_path = self._dump_apply_button_diagnostics(page, report_id, payloads)
+        try:
+            text_path, selectors_path = self._dump_apply_button_diagnostics(page, report_id, payloads)
+        except Exception as exc:
+            self.logger.warning("Apply diagnostics failed in click-failed path report_id=%s error=%s", report_id, exc)
+            text_path = Path("<apply_diagnostics_failed>")
+            selectors_path = Path("<apply_diagnostics_failed>")
         self.logger.warning("Apply click failed. debug text dump: %s", text_path)
         self.logger.warning("Apply click failed. debug selector dump: %s", selectors_path)
         self._debug_screenshot(page, f"profile_{report_id}_apply_click_failed")
