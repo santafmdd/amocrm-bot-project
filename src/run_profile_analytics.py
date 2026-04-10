@@ -195,6 +195,14 @@ def _build_parser() -> argparse.ArgumentParser:
             "instead of static report_profile filter_values."
         ),
     )
+    parser.add_argument(
+        "--execution-source-target-id",
+        default=None,
+        help=(
+            "Optional table_mappings target_id used only as DSL source for --execution-from-sheet-dsl. "
+            "Writer destination remains report.output.target_id."
+        ),
+    )
     return parser
 
 
@@ -269,13 +277,22 @@ def _resolve_execution_override_from_sheet_dsl(
     *,
     config,
     logger,
-    destination: WriterDestinationConfig,
+    execution_destination: WriterDestinationConfig,
+    execution_target_id: str,
+    writer_target_id: str,
+    writer_destination: WriterDestinationConfig,
     default_tabs: list[TabMode],
     target_dsl_row: int | None,
     target_dsl_text_contains: str | None,
 ) -> dict[str, Any]:
+    logger.info("execution_source=sheet_dsl")
+    logger.info("execution_input_target_id=%s", execution_target_id)
+    logger.info("execution_input_tab_name=%s", execution_destination.tab_name)
+    logger.info("writer_target_id=%s", writer_target_id)
+    logger.info("writer_tab_name=%s", writer_destination.tab_name)
+
     inspector = GoogleSheetsApiLayoutInspector(project_root=config.project_root, logger=logger)
-    discovery = inspector.inspect(destination=destination)
+    discovery = inspector.inspect(destination=execution_destination)
     anchors = discovery.get("anchors", []) if isinstance(discovery, dict) else []
     if not anchors:
         raise RuntimeError("execution-from-sheet-dsl: no anchors found in discovery")
@@ -401,6 +418,61 @@ def _resolve_writer_destination(report, table_mappings: dict, logger) -> WriterD
         layout_config=dict(getattr(mapping, "layout", {}) or {}),
     )
 
+
+
+def _resolve_execution_input_destination(
+    report,
+    table_mappings: dict,
+    logger,
+    override_target_id: str | None = None,
+) -> tuple[str, WriterDestinationConfig]:
+    configured_target_id = str((getattr(report, "execution_input", {}) or {}).get("target_id", "")).strip()
+    target_id = str(override_target_id or "").strip() or configured_target_id
+
+    if not target_id:
+        writer_target_id = str(report.output.get("target_id", "")).strip()
+        logger.warning(
+            "execution_input.target_id is not set; fallback to writer destination target_id=%s",
+            writer_target_id,
+        )
+        target_id = writer_target_id
+
+    mapping = table_mappings.get(target_id)
+    if mapping is None:
+        raise RuntimeError(
+            f"Execution input destination mapping not found for target_id={target_id}. "
+            "Configure report_profiles.yaml:execution_input.target_id or --execution-source-target-id."
+        )
+
+    sheet_url = str(mapping.sheet_url or os.getenv("GOOGLE_SHEETS_TEST_URL", "")).strip()
+    tab_name = str(mapping.tab_name or mapping.target_sheet_name or "analytics_writer_test").strip()
+    start_cell = str(mapping.start_cell or "A1").strip() or "A1"
+    write_mode = str(mapping.write_mode or "overwrite_tab").strip() or "overwrite_tab"
+
+    if not sheet_url:
+        raise RuntimeError(
+            "Execution input destination sheet_url is empty. Set table_mappings.yaml:sheet_url or "
+            "env GOOGLE_SHEETS_TEST_URL."
+        )
+
+    logger.info(
+        "execution input destination resolved: target_id=%s destination_kind=%s sheet_url_present=%s tab_name=%s write_mode=%s start_cell=%s",
+        target_id,
+        str(mapping.kind or "google_sheets_ui"),
+        str(bool(sheet_url)).lower(),
+        tab_name,
+        write_mode,
+        start_cell,
+    )
+
+    return target_id, WriterDestinationConfig(
+        sheet_url=sheet_url,
+        tab_name=tab_name,
+        write_mode=write_mode,
+        start_cell=start_cell,
+        kind=str(mapping.kind or "google_sheets_ui"),
+        layout_config=dict(getattr(mapping, "layout", {}) or {}),
+    )
 
 
 
@@ -855,12 +927,22 @@ def main() -> None:
     execution_source = "report_profile"
 
     destination = _resolve_writer_destination(report, table_mappings, logger)
+    writer_target_id = str(report.output.get("target_id", "")).strip()
 
     if bool(args.execution_from_sheet_dsl):
+        execution_target_id, execution_destination = _resolve_execution_input_destination(
+            report=report,
+            table_mappings=table_mappings,
+            logger=logger,
+            override_target_id=args.execution_source_target_id,
+        )
         override = _resolve_execution_override_from_sheet_dsl(
             config=config,
             logger=logger,
-            destination=destination,
+            execution_destination=execution_destination,
+            execution_target_id=execution_target_id,
+            writer_target_id=writer_target_id,
+            writer_destination=destination,
             default_tabs=tabs,
             target_dsl_row=args.writer_layout_api_target_dsl_row,
             target_dsl_text_contains=args.writer_layout_api_target_dsl_text_contains,

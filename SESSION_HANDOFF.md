@@ -1,3 +1,30 @@
+
+## Update (2026-04-10) ? Execution DSL Source Split
+
+### What Changed
+- `--execution-from-sheet-dsl` now resolves execution input from a dedicated DSL source target, not from writer destination.
+- New optional CLI override: `--execution-source-target-id`.
+- New report profile config section supported: `execution_input.target_id`.
+
+### Routing Rule
+- Execution DSL source: `execution_input.target_id` (or `--execution-source-target-id`).
+- Writer output destination: `output.target_id`.
+- These are now independent.
+
+### Fallback
+- If `execution_input.target_id` is missing, runtime falls back to writer target with explicit warning log.
+
+### New Runtime Logs
+- `execution_source=sheet_dsl`
+- `execution_input_target_id=...`
+- `execution_input_tab_name=...`
+- `writer_target_id=...`
+- `writer_tab_name=...`
+
+### Error Handling
+- If DSL source tab is missing, discovery now raises:
+  `DSL discovery sheet tab not found: <tab>. Check execution_input.target_id/table_mappings.yaml`
+
 # SESSION HANDOFF
 
 ## Update (2026-04-08)

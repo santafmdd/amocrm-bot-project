@@ -86,6 +86,8 @@ report_profiles:
       - active
       - closed
     compare_sources: []
+    execution_input:
+      target_id: analytics_layout_stage_blocks_destination
     output:
       target_type: table_block
       target_id: event_top_block_1

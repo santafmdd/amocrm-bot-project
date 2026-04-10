@@ -289,3 +289,23 @@ This section tracks validation state after filter-registry refactor (architectur
 
 ### Practical Validation Notes
 - `batch-from-sheet-dsl-dry-run` is useful for checking DSL parse and routing, but is NOT sufficient to claim standalone runtime verification for `pipeline/date/manager` unless corresponding DSL rows exist and runs complete.
+
+
+## Execution Input Source vs Writer Destination (2026-04-10)
+
+For `--execution-from-sheet-dsl` there are now two separate targets:
+
+- Execution DSL source target: where DSL anchors are read for runtime override.
+  - Config: `report_profiles.yaml -> execution_input.target_id`
+  - Optional CLI override: `--execution-source-target-id`
+- Writer destination target: where results are written.
+  - Config: `report_profiles.yaml -> output.target_id`
+
+Execution override fields from DSL:
+- `source_kind`
+- `filter_values`
+- `tabs` (if present in DSL)
+- `filter_operator` (`=` / `^=`)
+
+If execution source target is not configured, runtime falls back to writer destination and logs a warning.
+

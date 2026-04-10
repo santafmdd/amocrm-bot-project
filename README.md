@@ -1,3 +1,10 @@
+## Test Run Policy
+
+Run tests via module invocation only:
+`python -m pytest -q -p no:cacheprovider`
+
+This guarantees the active project interpreter/venv is used and keeps discovery limited to configured test paths.
+
 # amoCRM + Google Sheets + OpenClaw/Ollama Automation (Local Skeleton)
 
 

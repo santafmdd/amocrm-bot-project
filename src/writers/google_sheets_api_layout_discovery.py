@@ -96,6 +96,11 @@ class GoogleSheetsApiLayoutInspector:
             tab_meta.get("rowCount") if isinstance(tab_meta, dict) else None,
             tab_meta.get("columnCount") if isinstance(tab_meta, dict) else None,
         )
+        if tab_meta is None:
+            raise RuntimeError(
+                f"DSL discovery sheet tab not found: {tab_name}. "
+                "Check execution_input.target_id/table_mappings.yaml"
+            )
 
         col_label = _to_col_label(scan_cols)
         scanned_ranges: list[str] = []

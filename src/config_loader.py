@@ -52,6 +52,7 @@ class ReportProfile:
     tabs: list[str]
     compare_sources: list[dict[str, Any]]
     output: dict[str, Any]
+    execution_input: dict[str, Any]
     enabled: bool
 
 
@@ -150,6 +151,7 @@ def load_report_profiles(config: AppConfig) -> dict[str, ReportProfile]:
             tabs=[str(tab) for tab in item.get("tabs", [])],
             compare_sources=[dict(source) for source in item.get("compare_sources", [])],
             output=dict(item.get("output", {})),
+            execution_input=dict(item.get("execution_input", {})),
             enabled=bool(item.get("enabled", False)),
         )
         profiles[profile.id] = profile
