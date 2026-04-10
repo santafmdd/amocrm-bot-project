@@ -436,3 +436,36 @@ Failure signals to inspect first:
 - `utm_exact_fail_reason=active_popup_not_opened`
 - `utm_exact_fail_reason=row_scoped_input_not_activated`
 - `utm_exact_fail_reason=chip_not_detected`
+
+## Update (2026-04-10) - Apply Fallback Hardening (analytics browser flow)
+
+### Root Cause
+- `AnalyticsFlow._click_apply_in_panel(...)` called a missing helper: `_dump_apply_button_diagnostics(...)`.
+- On pointer interception (for example, overlay like MANGO OFFICE) normal apply click could fail, and diagnostics path crashed with `AttributeError`.
+- Post-click confirmation was too brittle (single short wait + single check).
+
+### Fix Implemented
+- Added `AnalyticsFlow._dump_apply_button_diagnostics(...)`.
+  - Saves both text and JSON candidate dumps to `exports/debug`.
+  - Best-effort only: diagnostics never aborts business flow.
+- Hardened `_click_apply_in_panel(...)`:
+  - diagnostics calls are wrapped and cannot break apply flow;
+  - keeps click strategy order: `normal -> force -> js`;
+  - apply confirmation now uses short polling window (~2s total, 200ms steps), not a single immediate check.
+
+### Apply Confirmation Signals (current)
+Apply is considered confirmed when at least one is observed:
+- URL markers changed (`useFilter` / filter marker via existing URL check), or
+- filter panel/overlay is closed, or
+- URL changed after click.
+
+### Validation Scope
+- Fix targets browser apply fallback only.
+- No writer/discovery/DSL logic changes in this step.
+
+## Update (2026-04-10) - Config Mojibake Cleanup
+
+- Apply fallback crash fix is closed (missing apply diagnostics helper + brittle confirmation addressed).
+- Next cleanup step completed for config path: removed `????????` placeholder from `config/report_profiles.yaml` active example profile values.
+- `suspicious_entries=['????????']` warning is no longer expected for current report profiles.
+- Added config hygiene test to prevent reintroducing `???` placeholders in `report_profiles.yaml`.

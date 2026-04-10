@@ -23,6 +23,7 @@ class GoogleSheetsUIWriter:
 
     def __init__(self) -> None:
         self.logger = logging.getLogger("project")
+        self._current_target_id = ""
 
     def write_profile_analytics_result(
         self,
@@ -34,6 +35,13 @@ class GoogleSheetsUIWriter:
         if not destination.sheet_url.strip():
             raise RuntimeError("Google Sheets destination URL is empty. Set sheet_url in table_mappings.yaml.")
 
+        self.logger.info(
+            "writer destination start: target_id=%s sheet_url=%s tab_name=%s write_mode=%s",
+            str(destination.target_id or "").strip(),
+            destination.sheet_url,
+            destination.tab_name,
+            destination.write_mode,
+        )
         self.logger.info("opening google sheet: %s", destination.sheet_url)
         page.goto(destination.sheet_url, wait_until="domcontentloaded")
         try:
@@ -41,6 +49,7 @@ class GoogleSheetsUIWriter:
         except PlaywrightTimeoutError:
             self.logger.info("google sheet load state not fully idle, continue in mvp mode")
 
+        self._current_target_id = str(destination.target_id or "").strip()
         self._select_target_tab(page, destination.tab_name)
         self.logger.info("target tab found: %s", destination.tab_name)
 
@@ -396,6 +405,34 @@ class GoogleSheetsUIWriter:
             return ""
         return self._safe_input_value(locator)
 
+    def _collect_visible_tab_names(self, page: Page) -> list[str]:
+        selectors = (
+            ".docs-sheet-tab-name",
+            "[role='tab']",
+            "[class*='sheet-tab']",
+        )
+        names: list[str] = []
+        seen: set[str] = set()
+        for selector in selectors:
+            loc = page.locator(selector)
+            try:
+                count = min(loc.count(), 80)
+            except Exception:
+                continue
+            for idx in range(count):
+                item = loc.nth(idx)
+                try:
+                    if not item.is_visible(timeout=120):
+                        continue
+                    text = (item.inner_text(timeout=120) or "").strip()
+                except Exception:
+                    continue
+                if not text or text in seen:
+                    continue
+                seen.add(text)
+                names.append(text)
+        return names
+
     def _select_target_tab(self, page: Page, tab_name: str) -> None:
         candidates = [
             page.locator(f".docs-sheet-tab-name:has-text('{tab_name}')"),
@@ -420,8 +457,12 @@ class GoogleSheetsUIWriter:
                 except Exception:
                     continue
 
+        visible_tabs = self._collect_visible_tab_names(page)
+        self.logger.warning("google sheet visible tab names: %s", visible_tabs)
         raise RuntimeError(
-            f"Google Sheets tab not found: '{tab_name}'. Open the sheet and ensure tab exists."
+            f"Google Sheets tab not found: '{tab_name}' for target_id='{self._current_target_id}'. "
+            "Open the sheet and ensure tab exists. Check config/table_mappings.yaml. "
+            f"Visible tabs: {visible_tabs}"
         )
 
     def _is_focus_on_sheet(self, page: Page) -> bool:

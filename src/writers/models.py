@@ -36,4 +36,5 @@ class WriterDestinationConfig:
     write_mode: str = "overwrite_tab"
     start_cell: str = "A1"
     kind: str = "google_sheets_ui"
+    target_id: str = ""
     layout_config: dict[str, Any] = field(default_factory=dict)

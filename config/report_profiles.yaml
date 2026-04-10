@@ -100,12 +100,32 @@ report_profiles:
     filters:
       filter_source: tag
       filter_values:
-        - ????????
+        - mashexpo_example_tag
     tabs:
       - all
       - active
       - closed
     compare_sources: []
+    output:
+      target_type: table_block
+      target_id: analytics_layout_stage_blocks_destination
+    enabled: true
+
+  - id: analytics_utm_layout_example
+    display_name: "Analytics utm_source layout writer profile (example)"
+    source:
+      page_type: analytics_sales
+    filters:
+      filter_source: utm_source
+      filter_values:
+        - yandex
+    tabs:
+      - all
+      - active
+      - closed
+    compare_sources: []
+    execution_input:
+      target_id: analytics_layout_stage_blocks_destination
     output:
       target_type: table_block
       target_id: analytics_layout_stage_blocks_destination

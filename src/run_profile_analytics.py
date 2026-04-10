@@ -415,6 +415,7 @@ def _resolve_writer_destination(report, table_mappings: dict, logger) -> WriterD
         write_mode=write_mode,
         start_cell=start_cell,
         kind=str(mapping.kind or "google_sheets_ui"),
+        target_id=target_id,
         layout_config=dict(getattr(mapping, "layout", {}) or {}),
     )
 
@@ -471,6 +472,7 @@ def _resolve_execution_input_destination(
         write_mode=write_mode,
         start_cell=start_cell,
         kind=str(mapping.kind or "google_sheets_ui"),
+        target_id=target_id,
         layout_config=dict(getattr(mapping, "layout", {}) or {}),
     )
 

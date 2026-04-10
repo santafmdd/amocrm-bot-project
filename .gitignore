@@ -30,3 +30,7 @@ credentials*.json
 node_modules/
 dist/
 build/
+pytest-cache-files-*
+exports/tmp*
+tests/tmp*
+*.pyc

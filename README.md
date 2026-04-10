@@ -3,7 +3,20 @@
 Run tests via module invocation only:
 `python -m pytest -q -p no:cacheprovider`
 
+Smoke/regression subset:
+`python -m pytest -q -p no:cacheprovider tests\test_analytics_flow_utm_exact.py tests\test_filter_handlers_v1.py tests\test_filter_registry_v1.py`
+
 This guarantees the active project interpreter/venv is used and keeps discovery limited to configured test paths.
+
+
+### Temp / Cache Hygiene
+
+- Run tests via `python -m pytest ...` from project root so discovery follows `pytest.ini`.
+- Do not use root-level scratch paths for tests (`tmp*`, `pytest-cache-files-*`).
+- Keep temporary/debug artifacts under project-owned paths:
+  - `exports/debug/` for runtime diagnostics
+  - `workspace/` for local working files
+- Ignore temporary directories in git (`exports/tmp*`, `tests/tmp*`, `.pytest_cache/`, `__pycache__/`, `*.pyc`).
 
 # amoCRM + Google Sheets + OpenClaw/Ollama Automation (Local Skeleton)
 
@@ -401,3 +414,56 @@ Tag x3:
 
 UTM exact x2:
 - `python -m src.run_profile_analytics --report-id analytics_utm_single_example --writer-layout-api-preferred --writer-layout-api-dry-run --browser-backend openclaw_cdp --tag-selection-mode script`
+
+
+## Writer Destination Diagnostics
+
+When Google Sheets UI writer starts, logs now include destination context:
+- `target_id`
+- `sheet_url`
+- `tab_name`
+- `write_mode`
+
+If tab is missing, runtime error includes `target_id`, `tab_name`, and a hint to verify `config/table_mappings.yaml`.
+Writer also logs visible tab names detected in the sheet for faster troubleshooting.
+
+
+## UTM Profile Routing (Legacy vs Layout)
+
+Two UTM report profiles are intentionally separated:
+
+- Legacy profile: `analytics_utm_single_example`
+  - keeps legacy output target: `event_top_block_1`
+- Layout writer profile: `analytics_utm_layout_example`
+  - execution DSL source target: `analytics_layout_stage_blocks_destination`
+  - writer output target: `analytics_layout_stage_blocks_destination`
+
+Recommended commands for layout profile:
+
+Dry-run:
+`python -m src.run_profile_analytics --report-id analytics_utm_layout_example --execution-from-sheet-dsl --writer-layout-api-target-dsl-row 14 --writer-layout-api-dry-run --browser-backend openclaw_cdp --tag-selection-mode script`
+
+Real write:
+`python -m src.run_profile_analytics --report-id analytics_utm_layout_example --execution-from-sheet-dsl --writer-layout-api-target-dsl-row 14 --writer-layout-api-write --browser-backend openclaw_cdp --tag-selection-mode script`
+
+
+## Apply Fallback Reliability (2026-04-10)
+
+`analytics_flow` apply path is hardened for UI pointer interception cases.
+
+What changed:
+- Added missing diagnostics helper `_dump_apply_button_diagnostics(...)` in `AnalyticsFlow`.
+- Diagnostics are best-effort only and cannot crash runtime.
+- `_click_apply_in_panel(...)` now confirms apply via short polling instead of one immediate check.
+- Click strategy remains deterministic: `normal -> force -> js`.
+
+Success confirmation for apply uses existing runtime signals:
+- URL/filter marker confirmation,
+- panel/overlay close,
+- URL change after click.
+
+## Config Hygiene (2026-04-10)
+
+- Removed placeholder/mojibake-style `????????` value from `config/report_profiles.yaml` (`analytics_tag_layout_example`).
+- Current profile config should no longer emit `suspicious_entries=['????????']` warning from config loader.
+- Added regression test to guard report profile config against `???` placeholders.

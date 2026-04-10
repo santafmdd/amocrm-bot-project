@@ -309,3 +309,23 @@ Execution override fields from DSL:
 
 If execution source target is not configured, runtime falls back to writer destination and logs a warning.
 
+
+## UTM Report Profiles: Legacy vs Layout (2026-04-10)
+
+Profiles are intentionally split to avoid coupling execution DSL source and writer destination.
+
+- `analytics_utm_single_example` (legacy path)
+  - output target: `event_top_block_1`
+  - keep for legacy/non-layout checks.
+
+- `analytics_utm_layout_example` (layout writer path)
+  - execution input target: `analytics_layout_stage_blocks_destination`
+  - output target: `analytics_layout_stage_blocks_destination`
+  - use for `--execution-from-sheet-dsl` and layout API write.
+
+Examples:
+- Dry-run:
+  `python -m src.run_profile_analytics --report-id analytics_utm_layout_example --execution-from-sheet-dsl --writer-layout-api-target-dsl-row 14 --writer-layout-api-dry-run --browser-backend openclaw_cdp --tag-selection-mode script`
+- Real write:
+  `python -m src.run_profile_analytics --report-id analytics_utm_layout_example --execution-from-sheet-dsl --writer-layout-api-target-dsl-row 14 --writer-layout-api-write --browser-backend openclaw_cdp --tag-selection-mode script`
+
