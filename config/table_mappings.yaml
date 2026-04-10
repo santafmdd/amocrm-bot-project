@@ -1,0 +1,63 @@
+table_mappings:
+  - id: event_top_block_1
+    target_sheet_name: "events_summary"
+    target_block_id: "top_block_1"
+    write_mode: replace_block
+    notes:
+      - "Основной блок для краткого среза по событию."
+      - "На текущем этапе используется как целевой пример."
+
+  - id: weekly_rejections_2m_block
+    target_sheet_name: "weekly_rejections"
+    target_block_id: "rejections_2m"
+    write_mode: clear_then_fill
+    notes:
+      - "Блок для weekly отчета по отказам за 2 месяца."
+      - "Подразумевает полную перезапись блока перед заполнением."
+
+  - id: weekly_rejections_long_block
+    target_sheet_name: "weekly_rejections"
+    target_block_id: "rejections_long"
+    write_mode: append_to_totals
+    notes:
+      - "Длинный исторический блок со скользящими итогами."
+      - "В будущем может использовать накопительный режим."
+
+  - id: analytics_layout_stage_blocks_destination
+    kind: google_sheets_layout_ui
+    sheet_url: "https://docs.google.com/spreadsheets/d/1snOH42aIRUtxS3AU9PJPHSrk1vDyFQdiIJNJRhasxX0/edit?gid=1057004550#gid=1057004550"
+    tab_name: "analytics_writer_test"
+    write_mode: "layout_anchor_update"
+    start_cell: "A1"
+
+    layout:
+      dsl_scan_max_rows: 120
+      dsl_scan_max_cols: 6
+      header_search_window: 6
+      block_scan_max_rows: 140
+      block_scan_max_cols: 10
+      cell_read_hard_limit: 1200
+
+      tag_block_aliases:
+        - "уралстрой"
+        - "машэкспо"
+        - "инглегмаш"
+        - "conf_ufa_stroyka_2026 уралстрой"
+        - "conf_novosib_mechanical_engineering_2026 машэкспо"
+        - "conf_msk_light_industry_2026 инглегмаш"
+
+      summary_block_aliases:
+        - "все 3 выставки"
+        - "все выставки"
+
+      header_aliases:
+        stage: ["этап", "статус"]
+        all: ["все", "все (шт)", "все шт", "ВСЕ"]
+        active: ["активные", "активные (шт)", "активные шт", "АКТИВНЫЕ"]
+        closed: ["закрытые", "закрытые (шт)", "закрытые шт", "ЗАКРЫТЫЕ"]
+
+      stage_aliases:
+        "первый контакт. квалификация": ["первичный контакт. квалификация", "первич. контакт. квалификация"]
+        "проведена демонстрация": ["демонстрация проведена"]
+        "закрыто и не реализовано": ["не реализовано"]
+

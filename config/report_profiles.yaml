@@ -1,0 +1,111 @@
+report_profiles:
+  - id: exhibition_single_event_example
+    display_name: "Выставка: один источник (пример)"
+    source:
+      page_type: analytics_sales
+    filters:
+      type: tag
+      include:
+        - exhibition_2026
+        - booth_leads
+    tabs:
+      - closed
+    compare_sources: []
+    output:
+      target_type: table_block
+      target_id: event_top_block_1
+    enabled: false
+
+  - id: exhibition_all_events_example
+    display_name: "Выставка: все события (пример)"
+    source:
+      page_type: analytics_sales
+    filters:
+      type: tag
+      include:
+        - exhibition_2026
+    tabs:
+      - all
+      - active
+      - closed
+    compare_sources:
+      - source_page_type: events_list
+        mode: manual_compare_for_now
+    output:
+      target_type: table_block
+      target_id: event_top_block_1
+    enabled: false
+
+  - id: weekly_rejections_2m_example
+    display_name: "Еженедельные отказы за 2 месяца (пример)"
+    source:
+      page_type: analytics_sales
+    filters:
+      type: date_range
+      period: last_2_months
+      extra:
+        status: rejections
+    tabs:
+      - closed
+    compare_sources:
+      - source_page_type: deals_list
+        mode: optional_in_future
+    output:
+      target_type: table_block
+      target_id: weekly_rejections_2m_block
+    enabled: true
+
+  - id: analytics_tag_single_example
+    display_name: "Analytics tag profile (example)"
+    source:
+      page_type: analytics_sales
+    filters:
+      filter_source: tag
+      filter_values:
+        - машэкспо
+    tabs:
+      - all
+      - active
+      - closed
+    compare_sources: []
+    output:
+      target_type: table_block
+      target_id: analytics_layout_stage_blocks_destination
+    enabled: true
+
+  - id: analytics_utm_single_example
+    display_name: "Analytics utm_source profile (example)"
+    source:
+      page_type: analytics_sales
+    filters:
+      filter_source: utm_source
+      filter_values:
+        - yandex
+    tabs:
+      - all
+      - active
+      - closed
+    compare_sources: []
+    output:
+      target_type: table_block
+      target_id: event_top_block_1
+    enabled: true
+
+  - id: analytics_tag_layout_example
+    display_name: "Analytics tag layout writer profile (example)"
+    source:
+      page_type: analytics_sales
+    filters:
+      filter_source: tag
+      filter_values:
+        - ????????
+    tabs:
+      - all
+      - active
+      - closed
+    compare_sources: []
+    output:
+      target_type: table_block
+      target_id: analytics_layout_stage_blocks_destination
+    enabled: true
+
