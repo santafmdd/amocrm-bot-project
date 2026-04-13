@@ -1,16 +1,17 @@
-﻿"""CLI entrypoint for profile-driven analytics capture flow."""
+"""CLI entrypoint for profile-driven analytics capture flow."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import os
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
 from src.analytics.scenario_executor import ScenarioExecutor
 from src.browser.analytics_flow import AnalyticsFlow, AnalyticsFlowInput
+from src.browser.events_flow import EventsFlow, EventsFlowInput
 from src.browser.amo_reader import AmoAnalyticsReader
 from src.browser.models import AnalyticsSnapshot, SourceKind, TabMode
 from src.browser.session import BrowserSession, load_browser_settings
@@ -31,6 +32,8 @@ from src.writers.google_sheets_api_layout_writer import GoogleSheetsApiLayoutWri
 from src.writers.google_sheets_ui_writer import GoogleSheetsUIWriter
 from src.writers.layout_dsl_routing import execution_input_to_dict, parse_dsl_execution_inputs
 from src.writers.models import WriterDestinationConfig
+from src.parsers.weekly_refusals_parser import parse_weekly_refusals_rows
+from src.writers.weekly_refusals_block_writer import WeeklyRefusalsBlockWriter
 
 def _as_bool(value: Any) -> bool:
     if isinstance(value, bool):
@@ -172,6 +175,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Optional target anchor selector for API layout writer: substring match in DSL text.",
     )
     parser.add_argument(
+        "--writer-layout-api-target-dsl-cell",
+        default=None,
+        help="Optional target anchor selector for API layout writer: exact DSL command cell (e.g. A1, F14).",
+    )
+    parser.add_argument(
         "--writer-layout-api-batch-from-sheet-dsl-dry-run",
         action="store_true",
         help=(
@@ -233,15 +241,64 @@ def _normalize_tabs(raw_tabs: list[str]) -> list[TabMode]:
     return unique
 
 
+def _parse_dsl_cell_ref(cell: str | None) -> tuple[int, int] | None:
+    raw = str(cell or "").strip().upper()
+    if not raw:
+        return None
+    import re
+
+    m = re.match(r"^([A-Z]+)(\d+)$", raw)
+    if not m:
+        return None
+    col_s, row_s = m.groups()
+    row = int(row_s)
+    col = 0
+    for ch in col_s:
+        col = col * 26 + (ord(ch) - ord("A") + 1)
+    if row <= 0 or col <= 0:
+        return None
+    return row, col
+
+
+def _anchor_sort_key(anchor: dict[str, Any]) -> tuple[int, int]:
+    return (int(anchor.get("dsl_row", 0) or 0), int(anchor.get("dsl_col", 0) or 0))
+
+
+def _anchor_dsl_cell(anchor: dict[str, Any]) -> str:
+    row = int(anchor.get("dsl_row", 0) or 0)
+    col = int(anchor.get("dsl_col", 0) or 0)
+    if row <= 0 or col <= 0:
+        return ""
+    label = ""
+    x = col
+    while x > 0:
+        x, rem = divmod(x - 1, 26)
+        label = chr(ord("A") + rem) + label
+    return f"{label}{row}"
+
+
 def _select_execution_anchor_from_discovery(
     anchors: list[dict[str, Any]],
     *,
     target_dsl_row: int | None,
     target_dsl_text_contains: str | None,
+    target_dsl_cell: str | None = None,
 ) -> dict[str, Any] | None:
     rows = [a for a in anchors if isinstance(a, dict)]
     if not rows:
         return None
+
+    rows.sort(key=_anchor_sort_key)
+
+    parsed_cell = _parse_dsl_cell_ref(target_dsl_cell)
+    if parsed_cell is not None:
+        row_n, col_n = parsed_cell
+        matched = [a for a in rows if int(a.get("dsl_row", 0) or 0) == row_n and int(a.get("dsl_col", 0) or 0) == col_n]
+        if target_dsl_text_contains:
+            needle = str(target_dsl_text_contains).strip().lower()
+            matched = [a for a in matched if needle in str(a.get("dsl_text", "")).lower()]
+        if matched:
+            return matched[0]
 
     if target_dsl_row is not None:
         matched = [a for a in rows if int(a.get("dsl_row", 0) or 0) == int(target_dsl_row)]
@@ -257,7 +314,6 @@ def _select_execution_anchor_from_discovery(
         if matched:
             return matched[0]
 
-    rows.sort(key=lambda a: int(a.get("dsl_row", 0) or 0))
     return rows[0]
 
 
@@ -284,6 +340,7 @@ def _resolve_execution_override_from_sheet_dsl(
     default_tabs: list[TabMode],
     target_dsl_row: int | None,
     target_dsl_text_contains: str | None,
+    target_dsl_cell: str | None = None,
 ) -> dict[str, Any]:
     logger.info("execution_source=sheet_dsl")
     logger.info("execution_input_target_id=%s", execution_target_id)
@@ -301,6 +358,7 @@ def _resolve_execution_override_from_sheet_dsl(
         anchors=anchors,
         target_dsl_row=target_dsl_row,
         target_dsl_text_contains=target_dsl_text_contains,
+        target_dsl_cell=target_dsl_cell,
     )
     if selected_anchor is None:
         raise RuntimeError("execution-from-sheet-dsl: could not select anchor")
@@ -328,12 +386,143 @@ def _resolve_execution_override_from_sheet_dsl(
 
     return {
         "dsl_row": dsl_row,
+        "dsl_col": int(selected_anchor.get("dsl_col", 0) or 0),
+        "dsl_cell": _anchor_dsl_cell(selected_anchor),
         "dsl_text": dsl_text,
         "source_kind": source_kind,
         "filter_values": [str(selected_input.filter_value).strip()],
         "tabs": override_tabs,
         "filter_operator": filter_operator,
     }
+
+
+
+
+def _resolve_weekly_period_mode(current_date: date | None = None) -> str:
+    day = current_date or date.today()
+    # Monday=0 ... Sunday=6
+    return "\u0417\u0430 \u044d\u0442\u0443 \u043d\u0435\u0434\u0435\u043b\u044e" if day.weekday() == 6 else "\u0417\u0430 \u043f\u0440\u043e\u0448\u043b\u0443\u044e \u043d\u0435\u0434\u0435\u043b\u044e"
+
+
+def _build_weekly_refusals_flow_input(report) -> EventsFlowInput:
+    filters = dict(getattr(report, "filters", {}) or {})
+    date_cfg = dict(filters.get("date", {}) or {})
+
+    pipeline_name = str(filters.get("pipeline", "")).strip()
+    if not pipeline_name:
+        raise RuntimeError("Weekly refusals profile requires filters.pipeline")
+
+    status_after = str(filters.get("status_after", "")).strip() or "\u0417\u0430\u043a\u0440\u044b\u0442\u043e \u0438 \u043d\u0435 \u0440\u0435\u0430\u043b\u0438\u0437\u043e\u0432\u0430\u043d\u043e"
+    status_before = str(filters.get("status_before", "")).strip()
+    status_before_values_raw = filters.get("status_before_values", [])
+    status_before_values = [str(v).strip() for v in (status_before_values_raw or []) if str(v).strip()]
+
+    date_mode = str(filters.get("date_mode", date_cfg.get("mode", "\u0421\u043e\u0437\u0434\u0430\u043d\u044b"))).strip() or "\u0421\u043e\u0437\u0434\u0430\u043d\u044b"
+    period_strategy = str(filters.get("period_strategy", "auto_weekly")).strip() or "auto_weekly"
+
+    explicit_period_override = str(filters.get("period_mode_override", "")).strip()
+    configured_period_mode = str(filters.get("period_mode", date_cfg.get("period", ""))).strip()
+    mode = str(filters.get("mode", "")).strip().lower()
+
+    if explicit_period_override:
+        period_mode = explicit_period_override
+        period_resolution = "explicit_override"
+    elif mode == "weekly" and configured_period_mode.lower() in {"", "auto", "auto_weekly"}:
+        period_mode = _resolve_weekly_period_mode()
+        period_resolution = "weekly_strategy"
+    else:
+        period_mode = configured_period_mode or "\u0417\u0430 \u043f\u0440\u043e\u0448\u043b\u0443\u044e \u043d\u0435\u0434\u0435\u043b\u044e"
+        period_resolution = "profile_config"
+
+    date_from = str(filters.get("date_from", date_cfg.get("from", ""))).strip()
+    date_to = str(filters.get("date_to", date_cfg.get("to", ""))).strip()
+
+    entity_kind = str(filters.get("entity_kind", "\u0421\u0434\u0435\u043b\u043a\u0438")).strip() or "\u0421\u0434\u0435\u043b\u043a\u0438"
+    event_type = str(filters.get("event_type", "\u0418\u0437\u043c\u0435\u043d\u0435\u043d\u0438\u0435 \u044d\u0442\u0430\u043f\u0430 \u043f\u0440\u043e\u0434\u0430\u0436\u0438")).strip() or "\u0418\u0437\u043c\u0435\u043d\u0435\u043d\u0438\u0435 \u044d\u0442\u0430\u043f\u0430 \u043f\u0440\u043e\u0434\u0430\u0436\u0438"
+
+    managers_raw = filters.get("managers", [])
+    managers = [str(v).strip() for v in (managers_raw or []) if str(v).strip()]
+
+    filter_mode = str(filters.get("filter_mode", "ui_controls")).strip() or "ui_controls"
+    saved_preset_name = str(filters.get("saved_preset_name", "")).strip()
+    saved_preset_exact_match = _as_bool(filters.get("saved_preset_exact_match", False))
+
+    return EventsFlowInput(
+        report_id=str(report.id),
+        pipeline_name=pipeline_name,
+        date_mode=date_mode,
+        period_mode=period_mode,
+        date_from=date_from,
+        date_to=date_to,
+        status_before=status_before,
+        status_before_values=status_before_values,
+        status_after=status_after,
+        entity_kind=entity_kind,
+        event_type=event_type,
+        period_strategy=f"{period_strategy}:{period_resolution}",
+        managers=managers,
+        filter_mode=filter_mode,
+        saved_preset_name=saved_preset_name,
+        saved_preset_exact_match=saved_preset_exact_match,
+    )
+
+
+def _run_weekly_refusals_profile(
+    *,
+    config,
+    settings,
+    logger,
+    report,
+    destination: WriterDestinationConfig,
+    wait_for_enter: bool,
+    weekly_dry_run: bool,
+) -> None:
+    logger.info("weekly refusals flow started: report_id=%s", report.id)
+    flow_input = _build_weekly_refusals_flow_input(report)
+    logger.info("weekly period strategy resolved: report_id=%s period_strategy=%s period_mode=%s", report.id, flow_input.period_strategy, flow_input.period_mode)
+
+    with BrowserSession(settings) as session:
+        page = session.new_page()
+        if wait_for_enter:
+            logger.info("Wait-for-enter mode enabled before weekly refusals flow start.")
+            _wait_for_login_ready()
+
+        events_flow = EventsFlow(settings=settings, project_root=config.project_root)
+        rows = events_flow.run_capture(page=page, flow_input=flow_input)
+
+    parsed = parse_weekly_refusals_rows(
+        report_id=report.id,
+        display_name=report.display_name,
+        rows=rows,
+    )
+
+    compiled_dir = ensure_inside_root(config.exports_dir / "compiled", config.project_root)
+    compiled_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    compiled_path = ensure_inside_root(
+        compiled_dir / f"weekly_refusals_{report.id}_{stamp}.json",
+        config.project_root,
+    )
+    compiled_path.write_text(json.dumps(parsed.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.info("weekly refusals artifact saved: %s", compiled_path)
+
+    writer = WeeklyRefusalsBlockWriter(
+        project_root=config.project_root,
+        exports_dir=config.exports_dir,
+        logger=logger,
+    )
+    write_result = writer.write_block(
+        destination=destination,
+        parsed_result=parsed.to_dict(),
+        dry_run=bool(weekly_dry_run),
+    )
+    logger.info(
+        "weekly refusals write result: dry_run=%s planned_updates=%s updated_cells=%s summary=%s",
+        str(write_result.dry_run).lower(),
+        write_result.planned_updates,
+        write_result.updated_cells,
+        write_result.summary_path,
+    )
 
 
 def _resolve_source_and_values(filters: dict[str, object]) -> tuple[SourceKind, list[str]]:
@@ -570,6 +759,7 @@ def _run_api_layout_writer_from_latest_compiled(
     dry_run: bool,
     target_dsl_row: int | None = None,
     target_dsl_text_contains: str | None = None,
+    target_dsl_cell: str | None = None,
 ) -> None:
     compiled_stage_pivot_path = find_latest_compiled_artifact(
         exports_dir=config.exports_dir,
@@ -603,8 +793,9 @@ def _run_api_layout_writer_from_latest_compiled(
         )
 
     logger.info(
-        "isolated api writer target_selector input: dsl_row=%s dsl_text_contains=%s",
+        "isolated api writer target_selector input: dsl_row=%s dsl_cell=%s dsl_text_contains=%s",
         target_dsl_row,
+        str(target_dsl_cell or ""),
         str(target_dsl_text_contains or ""),
     )
 
@@ -615,6 +806,7 @@ def _run_api_layout_writer_from_latest_compiled(
         dry_run=dry_run,
         target_dsl_row=target_dsl_row,
         target_dsl_text_contains=target_dsl_text_contains,
+        target_dsl_cell=target_dsl_cell,
     )
     _log_latest_api_layout_summary(logger, config.exports_dir)
 
@@ -654,6 +846,7 @@ def _run_layout_writer_with_routing(
     api_fallback_to_ui: bool,
     target_dsl_row: int | None,
     target_dsl_text_contains: str | None,
+    target_dsl_cell: str | None = None,
     api_writer_factory=GoogleSheetsApiLayoutWriter,
     ui_writer_factory=GoogleSheetsUILayoutWriter,
 ) -> tuple[str, bool]:
@@ -686,6 +879,7 @@ def _run_layout_writer_with_routing(
             dry_run=api_dry_run,
             target_dsl_row=target_dsl_row,
             target_dsl_text_contains=target_dsl_text_contains,
+            target_dsl_cell=target_dsl_cell,
         )
         logger.info("api discovery finish")
         logger.info("api write success")
@@ -741,6 +935,9 @@ def _run_api_layout_batch_from_sheet_dsl(
     source_kind: str,
     filter_values: list[str],
     dry_run: bool,
+    target_dsl_row: int | None = None,
+    target_dsl_text_contains: str | None = None,
+    target_dsl_cell: str | None = None,
 ) -> None:
     if destination.kind != "google_sheets_layout_ui":
         raise RuntimeError("batch-from-sheet-dsl requires destination kind google_sheets_layout_ui")
@@ -753,8 +950,19 @@ def _run_api_layout_batch_from_sheet_dsl(
 
     sorted_anchors = sorted(
         [a for a in anchors if isinstance(a, dict)],
-        key=lambda a: int(a.get("dsl_row", 0) or 0),
+        key=_anchor_sort_key,
     )
+
+    if target_dsl_row is not None or (target_dsl_text_contains or "").strip() or (target_dsl_cell or "").strip():
+        selected = _select_execution_anchor_from_discovery(
+            anchors=sorted_anchors,
+            target_dsl_row=target_dsl_row,
+            target_dsl_text_contains=target_dsl_text_contains,
+            target_dsl_cell=target_dsl_cell,
+        )
+        if selected is None:
+            raise RuntimeError("Batch DSL mode: target selector did not match any anchor")
+        sorted_anchors = [selected]
 
     logger.info(
         "api batch from sheet dsl start: anchors=%s dry_run=%s",
@@ -775,11 +983,15 @@ def _run_api_layout_batch_from_sheet_dsl(
 
     for anchor in sorted_anchors:
         dsl_row = int(anchor.get("dsl_row", 0) or 0)
+        dsl_col = int(anchor.get("dsl_col", 0) or 0)
+        dsl_cell = _anchor_dsl_cell(anchor)
         dsl_text = str(anchor.get("dsl_text", "") or "").strip()
-        logger.info("batch anchor start: dsl_row=%s dsl_text=%s", dsl_row, dsl_text)
+        logger.info("batch anchor start: dsl_row=%s dsl_col=%s dsl_cell=%s dsl_text=%s", dsl_row, dsl_col, dsl_cell, dsl_text)
 
         row_summary: dict[str, Any] = {
             "dsl_row": dsl_row,
+            "dsl_col": dsl_col,
+            "dsl_cell": dsl_cell,
             "dsl_text": dsl_text,
             "anchor": anchor,
             "dry_run": bool(dry_run),
@@ -807,11 +1019,6 @@ def _run_api_layout_batch_from_sheet_dsl(
                 item.period,
                 item.date_mode,
             )
-
-        if dry_run:
-            row_summary["status"] = "dry_run_planned"
-            summary_rows.append(row_summary)
-            continue
 
         try:
             block_result = scenario_executor.execute_block_scenarios(page=page, block_config=block_config)
@@ -852,16 +1059,15 @@ def _run_api_layout_batch_from_sheet_dsl(
             response = api_writer.write_profile_analytics_result(
                 compiled_result=compiled_result,
                 destination=destination,
-                dry_run=False,
+                dry_run=bool(dry_run),
                 target_dsl_row=dsl_row,
+                target_dsl_cell=dsl_cell,
             )
             latest_summary_path, latest_summary_payload = _get_latest_api_layout_summary(config.exports_dir)
             _log_latest_api_layout_summary(logger, config.exports_dir)
 
-            row_summary["status"] = "written"
             row_summary["compiled_profile_path"] = str(compiled_json_path)
             row_summary["compiled_stage_pivot_path"] = str(pivot_path)
-            row_summary["updated_cells_count"] = int(response.get("totalUpdatedCells", 0) or 0)
             row_summary["layout_api_write_summary_path"] = str(latest_summary_path) if latest_summary_path else ""
             row_summary["selected_block_boundaries"] = {
                 "next_anchor_dsl_row": (latest_summary_payload or {}).get("next_anchor_dsl_row") if latest_summary_payload else None,
@@ -870,11 +1076,24 @@ def _run_api_layout_batch_from_sheet_dsl(
                 "stage_rows_selected_count": (latest_summary_payload or {}).get("stage_rows_selected_count") if latest_summary_payload else None,
                 "stop_reason": (latest_summary_payload or {}).get("stop_reason") if latest_summary_payload else None,
             }
-            logger.info(
-                "batch anchor write success: dsl_row=%s updated_cells=%s",
-                dsl_row,
-                row_summary["updated_cells_count"],
-            )
+
+            if dry_run:
+                row_summary["status"] = "dry_run_planned"
+                row_summary["planned_updates"] = int(response.get("planned_updates", 0) or 0)
+                row_summary["updated_cells_count"] = 0
+                logger.info(
+                    "batch anchor dry-run success: dsl_row=%s planned_updates=%s",
+                    dsl_row,
+                    row_summary["planned_updates"],
+                )
+            else:
+                row_summary["status"] = "written"
+                row_summary["updated_cells_count"] = int(response.get("totalUpdatedCells", 0) or 0)
+                logger.info(
+                    "batch anchor write success: dsl_row=%s updated_cells=%s",
+                    dsl_row,
+                    row_summary["updated_cells_count"],
+                )
             successes += 1
         except Exception as exc:
             row_summary["status"] = "write_failed"
@@ -917,10 +1136,25 @@ def main() -> None:
         raise RuntimeError(f"Report profile not found: {args.report_id}")
 
     page_type = str(report.source.get("page_type", "")).strip()
+
+    destination = _resolve_writer_destination(report, table_mappings, logger)
+
+    if page_type == "events_list":
+        _run_weekly_refusals_profile(
+            config=config,
+            settings=settings,
+            logger=logger,
+            report=report,
+            destination=destination,
+            wait_for_enter=bool(args.wait_for_enter),
+            weekly_dry_run=bool(args.writer_layout_api_dry_run or args.writer_layout_dry_run),
+        )
+        return
+
     if page_type != "analytics_sales":
         raise RuntimeError(
             f"Unsupported source.page_type={page_type}. "
-            "This entrypoint currently supports only analytics_sales."
+            "This entrypoint currently supports analytics_sales and events_list."
         )
 
     source_kind, filter_values = _resolve_source_and_values(report.filters)
@@ -928,7 +1162,6 @@ def main() -> None:
     filter_operator = "="
     execution_source = "report_profile"
 
-    destination = _resolve_writer_destination(report, table_mappings, logger)
     writer_target_id = str(report.output.get("target_id", "")).strip()
 
     if bool(args.execution_from_sheet_dsl):
@@ -948,6 +1181,7 @@ def main() -> None:
             default_tabs=tabs,
             target_dsl_row=args.writer_layout_api_target_dsl_row,
             target_dsl_text_contains=args.writer_layout_api_target_dsl_text_contains,
+            target_dsl_cell=args.writer_layout_api_target_dsl_cell,
         )
         execution_source = "sheet_dsl"
         source_kind = override["source_kind"]
@@ -957,6 +1191,8 @@ def main() -> None:
 
         logger.info("execution_source=%s", execution_source)
         logger.info("dsl_row=%s", override.get("dsl_row"))
+        logger.info("dsl_col=%s", override.get("dsl_col"))
+        logger.info("dsl_cell=%s", override.get("dsl_cell"))
         logger.info("dsl_text=%s", override.get("dsl_text"))
         logger.info("overridden_source_kind=%s", source_kind)
         logger.info("overridden_filter_values=%s", filter_values)
@@ -990,6 +1226,11 @@ def main() -> None:
     api_layout_write_enabled = api_routing["api_write_enabled"]
     batch_from_sheet_dsl = bool(args.writer_layout_api_batch_from_sheet_dsl)
     batch_from_sheet_dsl_dry_run = bool(args.writer_layout_api_batch_from_sheet_dsl_dry_run)
+    if batch_from_sheet_dsl and batch_from_sheet_dsl_dry_run:
+        raise RuntimeError(
+            "Use only one mode: --writer-layout-api-batch-from-sheet-dsl or "
+            "--writer-layout-api-batch-from-sheet-dsl-dry-run"
+        )
 
     if args.writer_layout_api_write_from_latest_compiled:
         logger.info(
@@ -1011,6 +1252,7 @@ def main() -> None:
                 dry_run=bool(args.writer_layout_api_dry_run),
                 target_dsl_row=args.writer_layout_api_target_dsl_row,
                 target_dsl_text_contains=args.writer_layout_api_target_dsl_text_contains,
+                target_dsl_cell=args.writer_layout_api_target_dsl_cell,
             )
             logger.info("isolated API layout writer run finished successfully")
         except Exception as exc:
@@ -1127,6 +1369,9 @@ def main() -> None:
                 source_kind=source_kind,
                 filter_values=filter_values,
                 dry_run=batch_from_sheet_dsl_dry_run and not batch_from_sheet_dsl,
+                target_dsl_row=args.writer_layout_api_target_dsl_row,
+                target_dsl_text_contains=args.writer_layout_api_target_dsl_text_contains,
+                target_dsl_cell=args.writer_layout_api_target_dsl_cell,
             )
             return
 
@@ -1198,6 +1443,7 @@ def main() -> None:
                     api_fallback_to_ui=api_routing["api_fallback_to_ui"],
                     target_dsl_row=args.writer_layout_api_target_dsl_row,
                     target_dsl_text_contains=args.writer_layout_api_target_dsl_text_contains,
+                    target_dsl_cell=args.writer_layout_api_target_dsl_cell,
                 )
                 logger.info("writer mode final = %s", mode_used)
                 logger.info("fallback used = %s", str(fallback_used).lower())
@@ -1218,6 +1464,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
 
 

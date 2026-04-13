@@ -1,133 +1,273 @@
 report_profiles:
-  - id: exhibition_single_event_example
-    display_name: "Выставка: один источник (пример)"
-    source:
-      page_type: analytics_sales
-    filters:
-      type: tag
-      include:
-        - exhibition_2026
-        - booth_leads
-    tabs:
-      - closed
-    compare_sources: []
-    output:
-      target_type: table_block
-      target_id: event_top_block_1
-    enabled: false
-
-  - id: exhibition_all_events_example
-    display_name: "Выставка: все события (пример)"
-    source:
-      page_type: analytics_sales
-    filters:
-      type: tag
-      include:
-        - exhibition_2026
-    tabs:
-      - all
-      - active
-      - closed
-    compare_sources:
-      - source_page_type: events_list
-        mode: manual_compare_for_now
-    output:
-      target_type: table_block
-      target_id: event_top_block_1
-    enabled: false
-
-  - id: weekly_rejections_2m_example
-    display_name: "Еженедельные отказы за 2 месяца (пример)"
-    source:
-      page_type: analytics_sales
-    filters:
-      type: date_range
-      period: last_2_months
-      extra:
-        status: rejections
-    tabs:
-      - closed
-    compare_sources:
-      - source_page_type: deals_list
-        mode: optional_in_future
-    output:
-      target_type: table_block
-      target_id: weekly_rejections_2m_block
-    enabled: true
-
-  - id: analytics_tag_single_example
-    display_name: "Analytics tag profile (example)"
-    source:
-      page_type: analytics_sales
-    filters:
-      filter_source: tag
-      filter_values:
-        - машэкспо
-    tabs:
-      - all
-      - active
-      - closed
-    compare_sources: []
-    output:
-      target_type: table_block
-      target_id: analytics_layout_stage_blocks_destination
-    enabled: true
-
-  - id: analytics_utm_single_example
-    display_name: "Analytics utm_source profile (example)"
-    source:
-      page_type: analytics_sales
-    filters:
-      filter_source: utm_source
-      filter_values:
-        - yandex
-    tabs:
-      - all
-      - active
-      - closed
-    compare_sources: []
-    execution_input:
-      target_id: analytics_layout_stage_blocks_destination
-    output:
-      target_type: table_block
-      target_id: event_top_block_1
-    enabled: true
-
-  - id: analytics_tag_layout_example
-    display_name: "Analytics tag layout writer profile (example)"
-    source:
-      page_type: analytics_sales
-    filters:
-      filter_source: tag
-      filter_values:
-        - mashexpo_example_tag
-    tabs:
-      - all
-      - active
-      - closed
-    compare_sources: []
-    output:
-      target_type: table_block
-      target_id: analytics_layout_stage_blocks_destination
-    enabled: true
-
-  - id: analytics_utm_layout_example
-    display_name: "Analytics utm_source layout writer profile (example)"
-    source:
-      page_type: analytics_sales
-    filters:
-      filter_source: utm_source
-      filter_values:
-        - yandex
-    tabs:
-      - all
-      - active
-      - closed
-    compare_sources: []
-    execution_input:
-      target_id: analytics_layout_stage_blocks_destination
-    output:
-      target_type: table_block
-      target_id: analytics_layout_stage_blocks_destination
-    enabled: true
-
+- id: exhibition_single_event_example
+  display_name: 'Ð â  Ð¡â ¹Ð¡Ð Ð¡â  Ð Â°Ð Ð Ð Ñ Ð Â°: Ð Ñ Ð Ò Ð Ñ Ð Ð  Ð Ñ Ð¡Ð Ð¡â  Ð Ñ
+    Ð¡â ¡Ð Ð Ð Ñ Ð Ñ  (Ð Ñ Ð¡Ð Ð Ñ Ð Ñ Ð ÂµÐ¡Ð )'
+  source:
+    page_type: analytics_sales
+  filters:
+    type: tag
+    include:
+    - exhibition_2026
+    - booth_leads
+  tabs:
+  - closed
+  compare_sources: []
+  output:
+    target_type: table_block
+    target_id: event_top_block_1
+  enabled: false
+- id: exhibition_all_events_example
+  display_name: 'Ð â  Ð¡â ¹Ð¡Ð Ð¡â  Ð Â°Ð Ð Ð Ñ Ð Â°: Ð Ð Ð¡Ð Ð Âµ Ð¡Ð Ð Ñ Ð Â±Ð¡â
+    ¹Ð¡â  Ð Ñ Ð¡Ð  (Ð Ñ Ð¡Ð Ð Ñ Ð Ñ Ð ÂµÐ¡Ð )'
+  source:
+    page_type: analytics_sales
+  filters:
+    type: tag
+    include:
+    - exhibition_2026
+  tabs:
+  - all
+  - active
+  - closed
+  compare_sources:
+  - source_page_type: events_list
+    mode: manual_compare_for_now
+  output:
+    target_type: table_block
+    target_id: event_top_block_1
+  enabled: false
+- id: weekly_rejections_2m_example
+  display_name: Ð â ¢Ð Â¶Ð ÂµÐ Ð Ð ÂµÐ Ò Ð ÂµÐ Â»Ð¡Ð Ð Ð Ð¡â ¹Ð Âµ Ð Ñ Ð¡â  Ð Ñ Ð Â°Ð Â·Ð¡â
+    ¹ Ð Â·Ð Â° 2 Ð Ñ Ð ÂµÐ¡Ð Ð¡Ð Ð¡â  Ð Â° (Ð Ñ Ð¡Ð Ð Ñ Ð Ñ Ð ÂµÐ¡Ð )
+  source:
+    page_type: analytics_sales
+  filters:
+    type: date_range
+    period: last_2_months
+    extra:
+      status: rejections
+  tabs:
+  - closed
+  compare_sources:
+  - source_page_type: deals_list
+    mode: optional_in_future
+  output:
+    target_type: table_block
+    target_id: weekly_rejections_2m_block
+  enabled: true
+- id: analytics_tag_single_example
+  display_name: Analytics tag profile (example)
+  source:
+    page_type: analytics_sales
+  filters:
+    filter_source: tag
+    filter_values:
+    - Ð Ñ Ð Â°Ð¡â ¬Ð¡Ð Ð Ñ Ð¡Ð Ð Ñ Ð Ñ
+  tabs:
+  - all
+  - active
+  - closed
+  compare_sources: []
+  output:
+    target_type: table_block
+    target_id: analytics_layout_stage_blocks_destination
+  enabled: true
+- id: analytics_utm_single_example
+  display_name: Analytics utm_source profile (example)
+  source:
+    page_type: analytics_sales
+  filters:
+    filter_source: utm_source
+    filter_values:
+    - yandex
+  tabs:
+  - all
+  - active
+  - closed
+  compare_sources: []
+  execution_input:
+    target_id: analytics_layout_stage_blocks_destination
+  output:
+    target_type: table_block
+    target_id: event_top_block_1
+  enabled: true
+- id: analytics_tag_layout_example
+  display_name: Analytics tag layout writer profile (example)
+  source:
+    page_type: analytics_sales
+  filters:
+    filter_source: tag
+    filter_values:
+    - mashexpo_example_tag
+  tabs:
+  - all
+  - active
+  - closed
+  compare_sources: []
+  output:
+    target_type: table_block
+    target_id: analytics_layout_stage_blocks_destination
+  enabled: true
+- id: analytics_utm_layout_example
+  display_name: Analytics utm_source layout writer profile (example)
+  source:
+    page_type: analytics_sales
+  filters:
+    filter_source: utm_source
+    filter_values:
+    - yandex
+  tabs:
+  - all
+  - active
+  - closed
+  compare_sources: []
+  execution_input:
+    target_id: analytics_layout_stage_blocks_destination
+  output:
+    target_type: table_block
+    target_id: analytics_layout_stage_blocks_destination
+  enabled: true
+- id: weekly_refusals_weekly_2m
+  display_name: Weekly refusals / pipeline 2m / weekly
+  source:
+    page_type: events_list
+  filters:
+    pipeline: Привлечение (2 месяца)
+    date_mode: Созданы
+    period_mode: За эту неделю
+    period_strategy: auto_weekly
+    status_before: ''
+    status_before_values: &id001
+    - Привлечение(2 месяца) неразобранное
+    - Привлечение(2 месяца) верификация
+    - Привлечение(2 месяца) первый контакт. квалификация
+    - Привлечение(2 месяца) есть интерес к продукту
+    - Привлечение(2 месяца) проведена демонстрация
+    - Привлечение(2 месяца) тестирование системы
+    - Привлечение(2 месяца) принимают решение
+    - Привлечение(2 месяца) выставлено кп
+    - Привлечение(2 месяца) оплата
+    - Привлечение(2 месяца) успешно реализовано
+    status_after: Закрыто и не реализовано
+    entity_kind: Сделки
+    event_type: Изменение этапа продажи
+    managers: []
+    mode: weekly
+    filter_mode: ui_controls
+    saved_preset_name: ''
+    saved_preset_exact_match: false
+  tabs: []
+  compare_sources: []
+  output:
+    target_type: table_block
+    target_id: weekly_refusals_weekly_2m_block
+  enabled: true
+- id: weekly_refusals_weekly_long
+  display_name: Weekly refusals / pipeline long / weekly
+  source:
+    page_type: events_list
+  filters:
+    pipeline: Привлечение (долгие)
+    date_mode: Созданы
+    period_mode: За эту неделю
+    period_strategy: auto_weekly
+    status_before: ''
+    status_before_values: &id002
+    - Привлечение(долгие) первичный контакт
+    - Привлечение(долгие) квалификация
+    - Привлечение(долгие) есть интерес к продукту
+    - Привлечение(долгие) проведена демонстрация
+    - Привлечение(долгие) запущено тестирование
+    - Привлечение(долгие) принимают решение
+    - Привлечение(долгие) выставлено кп
+    - Привлечение(долгие) успешно реализовано
+    status_after: Закрыто и не реализовано
+    entity_kind: Сделки
+    event_type: Изменение этапа продажи
+    managers: []
+    mode: weekly
+    filter_mode: ui_controls
+    saved_preset_name: ''
+    saved_preset_exact_match: false
+  tabs: []
+  compare_sources: []
+  output:
+    target_type: table_block
+    target_id: weekly_refusals_weekly_long_block
+  enabled: true
+- id: weekly_refusals_cumulative_2m
+  display_name: Weekly refusals / pipeline 2m / cumulative
+  source:
+    page_type: events_list
+  filters:
+    pipeline: Привлечение (2 месяца)
+    date_mode: Созданы
+    period_mode: За эту неделю
+    period_strategy: auto_weekly
+    status_before: ''
+    status_before_values: *id001
+    status_after: Закрыто и не реализовано
+    entity_kind: Сделки
+    event_type: Изменение этапа продажи
+    managers: []
+    mode: cumulative
+    filter_mode: ui_controls
+    saved_preset_name: ''
+    saved_preset_exact_match: false
+  tabs: []
+  compare_sources: []
+  output:
+    target_type: table_block
+    target_id: weekly_refusals_cumulative_2m_block
+  enabled: true
+- id: weekly_refusals_cumulative_long
+  display_name: Weekly refusals / pipeline long / cumulative
+  source:
+    page_type: events_list
+  filters:
+    pipeline: Привлечение (долгие)
+    date_mode: Созданы
+    period_mode: За эту неделю
+    period_strategy: auto_weekly
+    status_before: ''
+    status_before_values: *id002
+    status_after: Закрыто и не реализовано
+    entity_kind: Сделки
+    event_type: Изменение этапа продажи
+    managers: []
+    mode: cumulative
+    filter_mode: ui_controls
+    saved_preset_name: ''
+    saved_preset_exact_match: false
+  tabs: []
+  compare_sources: []
+  output:
+    target_type: table_block
+    target_id: weekly_refusals_cumulative_long_block
+  enabled: true
+- id: weekly_refusals_example
+  display_name: Weekly refusals smoke example (alias -> weekly_2m)
+  source:
+    page_type: events_list
+  filters:
+    pipeline: Привлечение (2 месяца)
+    date_mode: Созданы
+    period_mode: За эту неделю
+    period_strategy: auto_weekly
+    status_before: ''
+    status_before_values: *id001
+    status_after: Закрыто и не реализовано
+    entity_kind: Сделки
+    event_type: Изменение этапа продажи
+    managers: []
+    mode: weekly
+    alias_of: weekly_refusals_weekly_2m
+    filter_mode: ui_controls
+    saved_preset_name: ''
+    saved_preset_exact_match: false
+  tabs: []
+  compare_sources: []
+  output:
+    target_type: table_block
+    target_id: weekly_refusals_weekly_2m_block
+  enabled: true

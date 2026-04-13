@@ -1,3 +1,118 @@
+## Update (2026-04-13): Weekly Refusals Checkbox Dropdown Pragmatic Fix
+
+- Blocker moved from panel-open to entity selector apply (`??? ???????? -> ??????`) in amoCRM `checkboxes_dropdown` widget.
+- Added pragmatic special-case path for checkbox dropdown controls:
+  - open via `.checkboxes_dropdown__title_wrapper` first,
+  - value select via checkbox/label rows,
+  - close via `Escape` (no forced OK for this control type).
+- Generic select logic is preserved as fallback for non-checkbox controls.
+- Added optional weekly profile routing fields:
+  - `filter_mode` (`ui_controls` default, `saved_preset` optional)
+  - `saved_preset_name`
+  - `saved_preset_exact_match`
+- Saved-preset mode is now routed in weekly flow (`apply preset` + `date refresh`).
+- Hybrid recommendation for MVP weekly reports:
+  - use `saved_preset` for repetitive stable filters,
+  - keep `ui_controls` for autonomous/future analysis scenarios.
+
+## Update (2026-04-13): Weekly Refusals Entity Control Apply/Verification
+
+- `events/list` opener and panel-open paths are stable.
+- Current blocker was narrowed to entity apply stage (`??? ???????? -> ??????`) due to container-level click without real control target.
+- `EventsFlow` control apply now resolves clickable descendants inside control container first; parent-only click is no longer primary.
+- Added right-side bbox fallback click for select-like controls when clickable descendant is not found.
+- Added popup diagnostics after control click: `popup_opened`, visible options, control text before/after.
+- Added broader option pick selectors for checkbox/pseudo-option rows (`label/li/role=option` variants).
+- Selection verification now accepts any confirmed reflection source:
+  - `control_text`,
+  - `input_value`,
+  - `chip_text`.
+- Weekly profile config now stores non-empty `status_before_values` for 2m/long weekly and cumulative profiles.
+- Weekly period strategy remains:
+  - Sunday = `?? ??? ??????`
+  - otherwise = `?? ??????? ??????`
+
+## Update (2026-04-13): Weekly Refusals Filter Control Resolver
+
+- `events/list` filter opener remains fixed; current blocker moved into control resolution inside opened panel.
+- Fixed overmatch path in `EventsFlow._apply_control_values(...)`: no blind first-match from broad `*:has-text(...)`.
+- Added `_resolve_filter_control(panel, control_label)` with candidate ranking and control-container promotion.
+- Added popup confirmation support for multi-select controls with `OK/??` buttons.
+- Added/updated diagnostics per stage (`entity/event_type/status_before/status_after/apply`) via `weekly_refusals_<stage>_failed_<ts>.*` artifacts.
+- Weekly period strategy is now explicit:
+  - Sunday -> `?? ??? ??????`
+  - Monday-Saturday -> `?? ??????? ??????`
+
+﻿## Update (2026-04-12): Google Auth UX Guard
+
+Root cause of confusing browser popup:
+- OAuth desktop flow can open system default browser when token cache is missing/invalid.
+- This is expected Google OAuth behavior and is not related to OpenClaw amoCRM browser session.
+
+Implemented guardrails:
+- Added auth mode selection via `GOOGLE_API_AUTH_MODE`:
+  - `auto`, `cache_only`, `interactive_bootstrap`.
+- Runtime now logs selected auth mode and auth decision path.
+- Cached token/refresh token path is preferred and logged.
+- In `cache_only` mode no browser popup is allowed; command fails with explicit bootstrap instruction.
+
+Key logs:
+- `google auth mode selected: ...`
+- `google auth: using cached token`
+- `google auth: refresh token updated`
+- `google auth: interactive authorization required (system browser OAuth flow)`
+- `google auth: interactive authorization disabled (mode=cache_only) reason=...`
+## Update (2026-04-12): Discovery Stop + Targeted Anchor Selection
+
+- Added deterministic anchor sorting by `(dsl_row, dsl_col)` for API batch/discovery paths.
+- Added exact block selector: `--writer-layout-api-target-dsl-cell` (example: `F1`).
+- API discovery payload now includes `dsl_cell` for each anchor; summaries/logs show selected cell explicitly.
+- Discovery stop logic hardened:
+  - `cell_read_hard_limit` is now a high safety fuse,
+  - default behavior scans configured range and stops structurally (`scan_range_exhausted`, `anchors_found_limit_reached`, etc.),
+  - safer for future lower blocks after large row gaps.
+- Dry-run safety preserved: no real Sheets updates in batch dry-run path.
+## Update (2026-04-12) ? Discovery Geometry + Strict Dry-Run
+
+- API discovery refactored to generalized block geometry:
+  - independent DSL candidate detection,
+  - independent header detection,
+  - mapping by nearest valid table geometry,
+  - anchor bounds persisted (row/col ranges + topology).
+- Batch dry-run contract hardened:
+  - dry-run keeps execution and planning,
+  - real sheet update path is forbidden (`dry_run=true` propagated into API writer).
+
+## Update (2026-04-12) ? Batch Dry-Run Write Guard
+
+- Fixed contract bug: batch dry-run no longer performs real Google Sheets writes.
+- `_run_api_layout_batch_from_sheet_dsl` now always forwards runtime `dry_run` into API writer.
+- Dry-run keeps scenario execution and write planning enabled for realistic diagnostics.
+- Dry-run summary rows: `dry_run_planned`, `planned_updates`, `updated_cells_count=0`.
+
+## UTM Prefix Note
+
+- `utm_source^=` support is best-effort via available UI control entry/selection.
+- This is not equivalent to guaranteed server-side/native prefix operator behavior.
+
+## UTM Prefix Contract (Current)
+
+- `utm_source^=` is supported as a routed execution mode (`utm_prefix`).
+- Runtime behavior is best-effort through available UI controls, not a guaranteed native prefix operator.
+- Success/failure is logged explicitly; no silent fallback to fake success.
+
+
+## Update (2026-04-11) ? DSL UTF-8 + Date Canonicalization
+
+- Fixed DSL parsing aliases back to UTF-8 canonical names (`????`, `utm_source`, `???????`, `????`, `??????`, `?`, `??`).
+- Removed destructive mojibake "repair" path in API layout discovery/routing; discovery now keeps raw UTF-8 text from Google Sheets.
+- Added canonical date normalization before handler apply in scenario execution:
+  - `???????/created -> created`
+  - `???????/closed -> closed`
+  - `?? ??? ?????/all time -> all_time` (plus other period presets)
+- Date handler now verifies by normalized state (mode + period), and treats already-matched state as success.
+- Added diagnostics in date handler for raw/normalized inputs and detected current widget state.
+
 
 ## Update (2026-04-10) ? Execution DSL Source Split
 
@@ -99,24 +214,24 @@ Stabilize `utm_exact` filter automation in analytics browser flow and keep exist
 
 ## Current Stage
 
-Layout writer С‚РµРїРµСЂСЊ СѓРјРµРµС‚ РЅРµ С‚РѕР»СЊРєРѕ РїР°СЂСЃРёС‚СЊ DSL, РЅРѕ Рё Р·Р°РїСѓСЃРєР°С‚СЊ per-scenario execution РґР»СЏ `||` С‡РµСЂРµР· СЂРµР°Р»СЊРЅС‹Р№ UI amoCRM.
+Layout writer РЎвЂљР ВµР С—Р ВµРЎР‚РЎРЉ РЎС“Р СР ВµР ВµРЎвЂљ Р Р…Р Вµ РЎвЂљР С•Р В»РЎРЉР С”Р С• Р С—Р В°РЎР‚РЎРѓР С‘РЎвЂљРЎРЉ DSL, Р Р…Р С• Р С‘ Р В·Р В°Р С—РЎС“РЎРѓР С”Р В°РЎвЂљРЎРЉ per-scenario execution Р Т‘Р В»РЎРЏ `||` РЎвЂЎР ВµРЎР‚Р ВµР В· РЎР‚Р ВµР В°Р В»РЎРЉР Р…РЎвЂ№Р в„– UI amoCRM.
 
 ## What Was Added
 
 1. New execution layer:
 - `src/analytics/scenario_executor.py`
-- РћСЃРЅРѕРІРЅР°СЏ С‚РѕС‡РєР°: `ScenarioExecutor.execute_block_scenarios(...)`
+- Р С›РЎРѓР Р…Р С•Р Р†Р Р…Р В°РЎРЏ РЎвЂљР С•РЎвЂЎР С”Р В°: `ScenarioExecutor.execute_block_scenarios(...)`
 
 2. End-to-end scenario run per block:
-- Р±РµСЂС‘Рј DSL Р¶С‘Р»С‚РѕР№ СЃС‚СЂРѕРєРё;
-- СЂР°Р·Р±РёРІР°РµРј РЅР° `scenarios[]`;
-- РґР»СЏ РєР°Р¶РґРѕРіРѕ СЃС†РµРЅР°СЂРёСЏ РѕС‚РґРµР»СЊРЅРѕ:
+- Р В±Р ВµРЎР‚РЎвЂР С DSL Р В¶РЎвЂР В»РЎвЂљР С•Р в„– РЎРѓРЎвЂљРЎР‚Р С•Р С”Р С‘;
+- РЎР‚Р В°Р В·Р В±Р С‘Р Р†Р В°Р ВµР С Р Р…Р В° `scenarios[]`;
+- Р Т‘Р В»РЎРЏ Р С”Р В°Р В¶Р Т‘Р С•Р С–Р С• РЎРѓРЎвЂ Р ВµР Р…Р В°РЎР‚Р С‘РЎРЏ Р С•РЎвЂљР Т‘Р ВµР В»РЎРЉР Р…Р С•:
   - reset to clean analytics state;
   - open filter panel;
   - apply filters scenario;
   - apply and wait;
   - capture `all/active/closed` snapshots;
-  - СЃС‡РёС‚Р°С‚СЊ score (`total_count`, `non_empty_stage_rows`).
+  - РЎРѓРЎвЂЎР С‘РЎвЂљР В°РЎвЂљРЎРЉ score (`total_count`, `non_empty_stage_rows`).
 
 3. Best scenario selection:
 - max `total_count`
@@ -125,31 +240,31 @@ Layout writer С‚РµРїРµСЂСЊ СѓРјРµРµС‚ РЅРµ С‚Рѕ
 
 4. Layout writer integration:
 - `src/writers/google_sheets_layout_ui_writer.py`
-- РµСЃР»Рё Сѓ Р±Р»РѕРєР° РµСЃС‚СЊ DSL Рё РїРµСЂРµРґР°РЅ executor:
-  - РІС‹РїРѕР»РЅСЏСЋС‚СЃСЏ СЂРµР°Р»СЊРЅС‹Рµ scenario runs;
-  - Р±РµСЂС‘С‚СЃСЏ best scenario result;
-  - СЃС‚СЂРѕРёС‚СЃСЏ block-specific pivot;
-  - РІ С‚Р°Р±Р»РёС†Сѓ РїРёС€СѓС‚СЃСЏ Р·РЅР°С‡РµРЅРёСЏ С‚РѕР»СЊРєРѕ best scenario.
+- Р ВµРЎРѓР В»Р С‘ РЎС“ Р В±Р В»Р С•Р С”Р В° Р ВµРЎРѓРЎвЂљРЎРЉ DSL Р С‘ Р С—Р ВµРЎР‚Р ВµР Т‘Р В°Р Р… executor:
+  - Р Р†РЎвЂ№Р С—Р С•Р В»Р Р…РЎРЏРЎР‹РЎвЂљРЎРѓРЎРЏ РЎР‚Р ВµР В°Р В»РЎРЉР Р…РЎвЂ№Р Вµ scenario runs;
+  - Р В±Р ВµРЎР‚РЎвЂРЎвЂљРЎРѓРЎРЏ best scenario result;
+  - РЎРѓРЎвЂљРЎР‚Р С•Р С‘РЎвЂљРЎРѓРЎРЏ block-specific pivot;
+  - Р Р† РЎвЂљР В°Р В±Р В»Р С‘РЎвЂ РЎС“ Р С—Р С‘РЎв‚¬РЎС“РЎвЂљРЎРѓРЎРЏ Р В·Р Р…Р В°РЎвЂЎР ВµР Р…Р С‘РЎРЏ РЎвЂљР С•Р В»РЎРЉР С”Р С• best scenario.
 
 5. Entrypoint integration:
 - `src/run_profile_analytics.py`
-- РїСЂРё `destination.kind == google_sheets_layout_ui` СЃРѕР·РґР°С‘С‚СЃСЏ `ScenarioExecutor`
-  Рё РїРµСЂРµРґР°С‘С‚СЃСЏ РІ layout writer.
+- Р С—РЎР‚Р С‘ `destination.kind == google_sheets_layout_ui` РЎРѓР С•Р В·Р Т‘Р В°РЎвЂРЎвЂљРЎРѓРЎРЏ `ScenarioExecutor`
+  Р С‘ Р С—Р ВµРЎР‚Р ВµР Т‘Р В°РЎвЂРЎвЂљРЎРѓРЎРЏ Р Р† layout writer.
 
 6. Tests:
 - `tests/test_scenario_executor.py` (selection/merge-level checks)
 
 ## Current Practical Limits
 
-- Р¤РёР»СЊС‚СЂС‹ `pipeline/period/dates_mode` РїСЂРёРјРµРЅСЏСЋС‚СЃСЏ best-effort С‡РµСЂРµР· label-driven UI path.
-- Р”Р»СЏ `^=` prefix РІ UI РїРѕРєР° С‡РµСЃС‚РЅС‹Р№ best-effort (СЃ warning, РµСЃР»Рё РїРѕР»Рµ/РјРµС…Р°РЅРёРєР° РЅРµ РЅР°Р№РґРµРЅС‹).
-- РќРёР¶РЅСЏСЏ С‚Р°Р±Р»РёС†Р° РѕС‚РєР°Р·РѕРІ РїРѕ-РїСЂРµР¶РЅРµРјСѓ out-of-scope.
+- Р В¤Р С‘Р В»РЎРЉРЎвЂљРЎР‚РЎвЂ№ `pipeline/period/dates_mode` Р С—РЎР‚Р С‘Р СР ВµР Р…РЎРЏРЎР‹РЎвЂљРЎРѓРЎРЏ best-effort РЎвЂЎР ВµРЎР‚Р ВµР В· label-driven UI path.
+- Р вЂќР В»РЎРЏ `^=` prefix Р Р† UI Р С—Р С•Р С”Р В° РЎвЂЎР ВµРЎРѓРЎвЂљР Р…РЎвЂ№Р в„– best-effort (РЎРѓ warning, Р ВµРЎРѓР В»Р С‘ Р С—Р С•Р В»Р Вµ/Р СР ВµРЎвЂ¦Р В°Р Р…Р С‘Р С”Р В° Р Р…Р Вµ Р Р…Р В°Р в„–Р Т‘Р ВµР Р…РЎвЂ№).
+- Р СњР С‘Р В¶Р Р…РЎРЏРЎРЏ РЎвЂљР В°Р В±Р В»Р С‘РЎвЂ Р В° Р С•РЎвЂљР С”Р В°Р В·Р С•Р Р† Р С—Р С•-Р С—РЎР‚Р ВµР В¶Р Р…Р ВµР СРЎС“ out-of-scope.
 
 ## Next Step
 
-1. РЈСЃРёР»РёС‚СЊ field-specific apply РґР»СЏ `dates_mode/period/pipeline` (UI selectors per real account).
-2. Р”РѕР±Р°РІРёС‚СЊ Р±РѕР»РµРµ СЃС‚СЂРѕРіСѓСЋ РІР°Р»РёРґР°С†РёСЋ РїСЂРёРјРµРЅС‘РЅРЅРѕРіРѕ С„РёР»СЊС‚СЂР° РїРµСЂРµРґ capture.
-3. Р Р°СЃС€РёСЂРёС‚СЊ diagnostics per scenario (structured summary + screenshot map).
+1. Р Р€РЎРѓР С‘Р В»Р С‘РЎвЂљРЎРЉ field-specific apply Р Т‘Р В»РЎРЏ `dates_mode/period/pipeline` (UI selectors per real account).
+2. Р вЂќР С•Р В±Р В°Р Р†Р С‘РЎвЂљРЎРЉ Р В±Р С•Р В»Р ВµР Вµ РЎРѓРЎвЂљРЎР‚Р С•Р С–РЎС“РЎР‹ Р Р†Р В°Р В»Р С‘Р Т‘Р В°РЎвЂ Р С‘РЎР‹ Р С—РЎР‚Р С‘Р СР ВµР Р…РЎвЂР Р…Р Р…Р С•Р С–Р С• РЎвЂћР С‘Р В»РЎРЉРЎвЂљРЎР‚Р В° Р С—Р ВµРЎР‚Р ВµР Т‘ capture.
+3. Р В Р В°РЎРѓРЎв‚¬Р С‘РЎР‚Р С‘РЎвЂљРЎРЉ diagnostics per scenario (structured summary + screenshot map).
 
 
 ## New Debug Tool: Layout Grid Inspector
@@ -393,9 +508,9 @@ Scope: supported filters v1 at browser-layer (`tag`, `utm_source exact`, `pipeli
 
 ### Minimal Additions Needed for Full Runtime Validation
 - Add one runtime-ready DSL block with manager, e.g.:
-  - `...; Менеджер=<name>; Теги=<value>`
+  - `...; РњРµРЅРµРґР¶РµСЂ=<name>; РўРµРіРё=<value>`
   or
-  - `...; Менеджер=<name>; utm_source=<value>`
+  - `...; РњРµРЅРµРґР¶РµСЂ=<name>; utm_source=<value>`
 - Optional: add dedicated report profiles for manual single-scenario checks if needed.
 
 ## Runtime Status Update (2026-04-09)
@@ -469,3 +584,143 @@ Apply is considered confirmed when at least one is observed:
 - Next cleanup step completed for config path: removed `????????` placeholder from `config/report_profiles.yaml` active example profile values.
 - `suspicious_entries=['????????']` warning is no longer expected for current report profiles.
 - Added config hygiene test to prevent reintroducing `???` placeholders in `report_profiles.yaml`.
+
+## Update (2026-04-10) - Batch DSL Prefix/Strictness Fix
+
+### Fixed
+- Restored missing `AnalyticsFlow._choose_option_text` used by filter handlers in batch scenario execution.
+- Primary DSL operator for source filter is now propagated into runtime apply (`=` / `^=`).
+- For `utm_source^=...`, batch execution now routes primary apply to `utm_prefix` handler instead of exact-only path.
+
+### Behavior Change (Intentional)
+- Scenario execution no longer keeps partial successes for non-primary filters.
+- If `pipeline/date/manager/secondary-tag` handler apply fails, scenario gets controlled failure:
+  - `Scenario filter apply failed: field=...`
+- Unknown DSL field now fails explicitly:
+  - `Unsupported DSL filter for scenario execution: field=...`
+
+### Notes
+- This keeps already-working tag / utm-exact blocks intact while making prefix handling explicit and deterministic in batch path.
+
+## Update (2026-04-10) - Pipeline Runtime Diagnostics
+
+- Pipeline apply in batch scenario execution is now deterministic row-scoped with verbose diagnostics.
+- If pipeline cannot be applied/verified, scenario fails explicitly with controlled message and payload context.
+- This keeps hard-fail semantics while exposing exact failure point (row, click-target, options, reflection).
+
+
+
+## 2026-04-12 Weekly Refusals MVP Update
+
+Implemented separate `events_list` execution path (no regression in analytics_sales routing expected):
+- `src/browser/events_flow.py`
+- `src/parsers/weekly_refusals_parser.py`
+- `src/writers/weekly_refusals_block_writer.py`
+- `run_profile_analytics.py` now routes `page_type=events_list` to weekly refusals runner.
+
+Current capabilities:
+- open events list
+- apply refusal-specific filters (date/pipeline/status/entity/event type/managers)
+- parse event rows
+- aggregate before/after statuses
+- persist deal refs for future AI stage
+- save compiled artifact + write summary
+
+Profiles added:
+- weekly_refusals_weekly_2m
+- weekly_refusals_weekly_long
+- weekly_refusals_cumulative_2m
+- weekly_refusals_cumulative_long
+
+Dry-run behavior:
+- use `--writer-layout-api-dry-run` (or `--writer-layout-dry-run`) to avoid sheet updates while keeping artifacts.
+
+Known limitations:
+- events-list selector set is MVP-level and may require tuning against live amoCRM DOM changes.
+- no AI analysis / no deep deal crawling yet.
+
+## Weekly Refusals IDs Sync (2026-04-13)
+
+Documentation/command mismatch fixed.
+
+Canonical weekly refusals report IDs:
+- `weekly_refusals_weekly_2m`
+- `weekly_refusals_weekly_long`
+- `weekly_refusals_cumulative_2m`
+- `weekly_refusals_cumulative_long`
+- `weekly_refusals_example` (alias smoke profile; equivalent filters/output to weekly_2m)
+
+Recommended smoke dry-run command:
+```bash
+python -m src.run_profile_analytics --report-id weekly_refusals_example --writer-layout-api-dry-run --browser-backend openclaw_cdp --tag-selection-mode script
+```
+
+## Update (2026-04-13): Weekly Refusals Filter-Open Diagnostics
+
+Runtime blocker moved to early browser layer on `events_list`:
+- filter panel opening could fail before any refusal parsing/writing.
+
+Implemented in `src/browser/events_flow.py`:
+- `_open_filter_panel` now first checks if panel is already open.
+- Added readiness wait before selector scan.
+- Expanded selector set for text/role/aria/title/data-test/class/toolbar button variants.
+- Added per-selector diagnostics in logs:
+  - selector candidates list
+  - `matched_count` for each candidate
+- Added fail artifacts when panel open fails:
+  - `exports/debug/weekly_refusals_filter_open_failed_<ts>.png`
+  - `exports/debug/weekly_refusals_filter_open_failed_<ts>.json`
+  - `exports/debug/weekly_refusals_filter_open_failed_<ts>.txt`
+  - `exports/debug/weekly_refusals_filter_open_failed_<ts>.html`
+- RuntimeError now includes:
+  - `checked_selectors_count`
+  - `visible_candidates_count`
+  - `current_url`
+  - `debug_artifacts_path`
+
+## Update (2026-04-13): Events List Filter Opener Fix
+
+Root blocker in weekly refusals runtime was `events/list` filter opener.
+In live amoCRM UI opener is top search-like control with text `Фильтр` + icon,
+not always a classic `button`.
+
+Implemented in `src/browser/events_flow.py`:
+- panel detection now based on visible labels (>=3 markers):
+  - `Менеджеры`, `Все сущности`, `Типы событий`, `Значение до`, `Значение после`, `За все время`
+- opener flow now multi-step:
+  1) direct selector click (visible candidates only, top-position preferred)
+  2) clickable ancestor search/click from `Фильтр` text node
+  3) bbox center click fallback
+- `[class*='filter'] button` demoted to low-priority fallback (no longer primary opener).
+
+Fail diagnostics extended:
+- `weekly_refusals_filter_open_failed_<ts>.png`
+- `weekly_refusals_filter_open_failed_<ts>.json`
+- `weekly_refusals_filter_open_failed_<ts>.txt`
+- `weekly_refusals_filter_open_failed_<ts>.html`
+with checked selectors, candidate payloads, marker visibility, URL and explanation.
+
+
+## Update (2026-04-13): Weekly Refusals Filter Controls Mapping + Apply Variants
+
+- Events/list opener remained fixed; next blocker was control mapping in panel filters before apply.
+- Weekly refusals events flow now uses control-specific selection (not generic text input) for:
+  - `??? ????????`
+  - `???? ???????`
+  - `???????`
+  - `???????? ??` (multi-select)
+  - `???????? ?????`
+  - date mode + period control (`.date_filter`)
+- Added backward-compatible profile support:
+  - `status_before_values: list[str]` (primary)
+  - `status_before` (legacy fallback)
+  - `period_strategy` field (non-breaking, default `ui_period_control`)
+- Apply button logic expanded to variants:
+  - `?????????` / `???????` / `??????`
+  - click fallback: `normal -> force -> js`
+  - confirmation uses short polling (panel close or URL change or rows visible)
+- Stage-specific fail diagnostics added to `exports/debug`:
+  - `weekly_refusals_entity_failed_<ts>.*`
+  - `weekly_refusals_event_type_failed_<ts>.*`
+  - `weekly_refusals_status_before_failed_<ts>.*`
+  - `weekly_refusals_apply_failed_<ts>.*`
