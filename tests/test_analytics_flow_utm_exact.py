@@ -399,3 +399,29 @@ def test_analytics_flow_has_choose_option_text_helper():
     flow = AnalyticsFlow(reader=_DummyReader(), project_root=Path.cwd())
     assert hasattr(flow, "_choose_option_text")
     assert callable(flow._choose_option_text)
+
+
+def test_apply_filter_values_uses_utm_prefix_branch_for_caret_equals(monkeypatch):
+    flow = AnalyticsFlow(reader=_DummyReader(), project_root=Path.cwd())
+
+    calls: dict[str, object] = {}
+
+    def fake_apply_supported(*, page, report_id, filter_key, values, operator="="):
+        calls["filter_key"] = filter_key
+        calls["operator"] = operator
+        calls["values"] = list(values)
+        return True
+
+    monkeypatch.setattr(flow, "_apply_supported_filter", fake_apply_supported)
+    monkeypatch.setattr(flow, "_find_filter_panel_container", lambda _page: object())
+
+    flow._apply_filter_values(
+        page=object(),
+        report_id="analytics_utm_single_example",
+        source_kind="utm_source",
+        values=["conf_msk_light_industry_2026"],
+        operator="^=",
+    )
+
+    assert calls["filter_key"] == "utm_prefix"
+    assert calls["operator"] == "^="

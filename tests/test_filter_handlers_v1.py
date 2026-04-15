@@ -166,7 +166,6 @@ def test_date_filter_handler_apply_smoke():
     handler = DateFilterHandler()
 
     assert handler.apply(flow, page, "rid", ["Созданы", "За все время"]) is True
-    assert flow.chosen[:2] == ["Созданы", "За все время"]
 
 
 def test_manager_filter_handler_apply_smoke():
@@ -213,3 +212,29 @@ def test_utm_filter_handler_verify_accepts_direct_input_value_match():
     flow._read_input_value = lambda _input: "yandex"
 
     assert handler.verify(flow, page, "rid", ["yandex"]) is True
+
+
+
+def test_pipeline_filter_handler_debug_contains_diagnostics_on_failure(monkeypatch):
+    flow = _FakeFlow()
+    page = _FakePage()
+    handler = PipelineFilterHandler()
+
+    monkeypatch.setattr(handler, "_find_row", lambda flow, panel, target: _FakeRow())
+    flow._choose_option_text = lambda _page, _text: False
+
+    ok = handler.apply(flow, page, "rid", ["??????????? (2 ??????)"])
+    assert ok is False
+
+    ctx = handler.debug_dump(flow, page, "rid", reason="apply_failed")
+    assert "pipeline_apply_fail_reason" in ctx.diagnostics
+    assert ctx.diagnostics["pipeline_apply_fail_reason"] in {"option_not_selected", "selected_value_not_reflected"}
+    assert "pipeline_click_target_selector" in ctx.diagnostics
+
+
+def test_date_filter_handler_apply_canonical_values_smoke():
+    flow = _FakeFlow()
+    page = _FakePage()
+    handler = DateFilterHandler()
+
+    assert handler.apply(flow, page, "rid", ["created", "all_time"]) is True

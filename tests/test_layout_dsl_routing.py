@@ -35,10 +35,17 @@ def test_parse_dsl_execution_inputs_utm_exact_and_prefix() -> None:
     assert inputs[1].filter_value == "conf_"
 
 
-
 def test_parse_dsl_execution_inputs_tabs_override() -> None:
-    text = "????: utm_source=conf_exact; tabs=all|closed"
+    text = "Тест: utm_source=conf_exact; tabs=all|closed"
     _block, inputs = parse_dsl_execution_inputs(text)
     assert len(inputs) == 1
     assert inputs[0].source_kind == "utm_exact"
     assert inputs[0].tabs == ["all", "closed"]
+
+
+def test_parse_dsl_execution_inputs_date_values_are_canonical() -> None:
+    text = "Тест: Даты=Созданы; Период=За все время; utm_source=conf_exact"
+    _block, inputs = parse_dsl_execution_inputs(text)
+    assert len(inputs) == 1
+    assert inputs[0].date_mode == "created"
+    assert inputs[0].period == "all_time"

@@ -1,4 +1,4 @@
-"""CLI entrypoint for profile-driven analytics capture flow."""
+﻿"""CLI entrypoint for profile-driven analytics capture flow."""
 
 from __future__ import annotations
 
@@ -42,6 +42,25 @@ def _as_bool(value: Any) -> bool:
         return False
     text = str(value).strip().lower()
     return text in {"1", "true", "yes", "y", "on"}
+
+def _normalize_google_auth_mode(raw: str | None) -> str:
+    value = str(raw or "").strip().lower()
+    if value in {"auto", "cache_only", "interactive_bootstrap"}:
+        return value
+    return "auto"
+
+
+def _resolve_google_auth_mode(cli_value: str | None) -> str:
+    if str(cli_value or "").strip():
+        return _normalize_google_auth_mode(cli_value)
+    return _normalize_google_auth_mode(os.getenv("GOOGLE_API_AUTH_MODE", "auto"))
+
+
+def _apply_google_auth_mode_override(cli_value: str | None) -> str:
+    mode = _resolve_google_auth_mode(cli_value)
+    os.environ["GOOGLE_API_AUTH_MODE"] = mode
+    return mode
+
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -201,6 +220,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Build analytics execution input from a discovered Google Sheets DSL anchor "
             "instead of static report_profile filter_values."
+        ),
+    )
+    parser.add_argument(
+        "--google-auth-mode",
+        choices=["auto", "cache_only", "interactive_bootstrap"],
+        default=None,
+        help=(
+            "Google API auth mode override for current process. "
+            "Use cache_only in normal runtime to avoid interactive system-browser OAuth popups."
         ),
     )
     parser.add_argument(
@@ -372,6 +400,8 @@ def _resolve_execution_override_from_sheet_dsl(
     if not execution_inputs:
         raise RuntimeError(f"execution-from-sheet-dsl: no execution inputs parsed for dsl_row={dsl_row}")
 
+    # Runtime currently executes one source filter scenario/value per run.
+    # If DSL row contains multiple source scenarios/values, we select the first supported one.
     selected_input = None
     for item in execution_inputs:
         if str(item.filter_value or "").strip() and str(item.source_kind or "").strip() in {"tag", "utm_exact", "utm_prefix", "utm_source"}:
@@ -382,6 +412,7 @@ def _resolve_execution_override_from_sheet_dsl(
         raise RuntimeError(f"execution-from-sheet-dsl: no supported input parsed for dsl_row={dsl_row}")
 
     source_kind, filter_operator = _map_dsl_source_to_flow(selected_input.source_kind, selected_input.filter_operator)
+    logger.info("dsl_execution_mode=single_value_first_supported")
     override_tabs = _normalize_tabs(selected_input.tabs) if selected_input.tabs else list(default_tabs)
 
     return {
@@ -401,7 +432,7 @@ def _resolve_execution_override_from_sheet_dsl(
 def _resolve_weekly_period_mode(current_date: date | None = None) -> str:
     day = current_date or date.today()
     # Monday=0 ... Sunday=6
-    return "\u0417\u0430 \u044d\u0442\u0443 \u043d\u0435\u0434\u0435\u043b\u044e" if day.weekday() == 6 else "\u0417\u0430 \u043f\u0440\u043e\u0448\u043b\u0443\u044e \u043d\u0435\u0434\u0435\u043b\u044e"
+    return "\u0417\u0430 \u044d\u0442\u0443 \u043d\u0435\u0434\u0435\u043b\u044e" if day.weekday() == 0 else "\u0417\u0430 \u043f\u0440\u043e\u0448\u043b\u0443\u044e \u043d\u0435\u0434\u0435\u043b\u044e"
 
 
 def _build_weekly_refusals_flow_input(report) -> EventsFlowInput:
@@ -418,7 +449,7 @@ def _build_weekly_refusals_flow_input(report) -> EventsFlowInput:
     status_before_values = [str(v).strip() for v in (status_before_values_raw or []) if str(v).strip()]
 
     date_mode = str(filters.get("date_mode", date_cfg.get("mode", "\u0421\u043e\u0437\u0434\u0430\u043d\u044b"))).strip() or "\u0421\u043e\u0437\u0434\u0430\u043d\u044b"
-    period_strategy = str(filters.get("period_strategy", "auto_weekly")).strip() or "auto_weekly"
+    period_strategy_raw = str(filters.get("period_strategy", "monday_current_else_previous")).strip() or "monday_current_else_previous"
 
     explicit_period_override = str(filters.get("period_mode_override", "")).strip()
     configured_period_mode = str(filters.get("period_mode", date_cfg.get("period", ""))).strip()
@@ -427,12 +458,36 @@ def _build_weekly_refusals_flow_input(report) -> EventsFlowInput:
     if explicit_period_override:
         period_mode = explicit_period_override
         period_resolution = "explicit_override"
-    elif mode == "weekly" and configured_period_mode.lower() in {"", "auto", "auto_weekly"}:
-        period_mode = _resolve_weekly_period_mode()
-        period_resolution = "weekly_strategy"
+        period_strategy_resolved = "manual_range"
     else:
-        period_mode = configured_period_mode or "\u0417\u0430 \u043f\u0440\u043e\u0448\u043b\u0443\u044e \u043d\u0435\u0434\u0435\u043b\u044e"
-        period_resolution = "profile_config"
+        strategy_norm = period_strategy_raw.strip().lower()
+        if strategy_norm in {"", "auto", "auto_weekly"}:
+            strategy_norm = "monday_current_else_previous"
+
+        if strategy_norm == "current_week":
+            period_mode = "\u0417\u0430 \u044d\u0442\u0443 \u043d\u0435\u0434\u0435\u043b\u044e"
+            period_strategy_resolved = "current_week"
+            period_resolution = "strategy_current_week"
+        elif strategy_norm == "previous_week":
+            period_mode = "\u0417\u0430 \u043f\u0440\u043e\u0448\u043b\u0443\u044e \u043d\u0435\u0434\u0435\u043b\u044e"
+            period_strategy_resolved = "previous_week"
+            period_resolution = "strategy_previous_week"
+        elif strategy_norm == "manual_range":
+            period_mode = configured_period_mode or "\u0417\u0430 \u043f\u0435\u0440\u0438\u043e\u0434"
+            period_strategy_resolved = "manual_range"
+            period_resolution = "strategy_manual_range"
+        elif strategy_norm == "monday_current_else_previous":
+            period_mode = _resolve_weekly_period_mode()
+            period_strategy_resolved = "monday_current_else_previous"
+            period_resolution = "strategy_monday_current_else_previous"
+        elif mode == "weekly" and configured_period_mode.lower() in {"", "auto", "auto_weekly"}:
+            period_mode = _resolve_weekly_period_mode()
+            period_strategy_resolved = "monday_current_else_previous"
+            period_resolution = "weekly_fallback_strategy"
+        else:
+            period_mode = configured_period_mode or "\u0417\u0430 \u043f\u0440\u043e\u0448\u043b\u0443\u044e \u043d\u0435\u0434\u0435\u043b\u044e"
+            period_strategy_resolved = "profile_config"
+            period_resolution = "profile_config"
 
     date_from = str(filters.get("date_from", date_cfg.get("from", ""))).strip()
     date_to = str(filters.get("date_to", date_cfg.get("to", ""))).strip()
@@ -459,7 +514,7 @@ def _build_weekly_refusals_flow_input(report) -> EventsFlowInput:
         status_after=status_after,
         entity_kind=entity_kind,
         event_type=event_type,
-        period_strategy=f"{period_strategy}:{period_resolution}",
+        period_strategy=f"raw={period_strategy_raw}|resolved={period_strategy_resolved}|mode={period_resolution}",
         managers=managers,
         filter_mode=filter_mode,
         saved_preset_name=saved_preset_name,
@@ -478,8 +533,27 @@ def _run_weekly_refusals_profile(
     weekly_dry_run: bool,
 ) -> None:
     logger.info("weekly refusals flow started: report_id=%s", report.id)
+    logger.info("weekly_refusals_runner_version=parsed_to_dict_fix_v1")
     flow_input = _build_weekly_refusals_flow_input(report)
-    logger.info("weekly period strategy resolved: report_id=%s period_strategy=%s period_mode=%s", report.id, flow_input.period_strategy, flow_input.period_mode)
+    strategy_parts = str(flow_input.period_strategy or "").split("|")
+    strategy_raw = ""
+    strategy_resolved = ""
+    strategy_mode = ""
+    for part in strategy_parts:
+        if part.startswith("raw="):
+            strategy_raw = part.split("=", 1)[1]
+        elif part.startswith("resolved="):
+            strategy_resolved = part.split("=", 1)[1]
+        elif part.startswith("mode="):
+            strategy_mode = part.split("=", 1)[1]
+    logger.info(
+        "weekly period strategy resolved: report_id=%s raw_strategy=%s resolved_strategy=%s resolution_mode=%s resolved_period_mode=%s",
+        report.id,
+        strategy_raw,
+        strategy_resolved,
+        strategy_mode,
+        flow_input.period_mode,
+    )
 
     with BrowserSession(settings) as session:
         page = session.new_page()
@@ -503,7 +577,9 @@ def _run_weekly_refusals_profile(
         compiled_dir / f"weekly_refusals_{report.id}_{stamp}.json",
         config.project_root,
     )
-    compiled_path.write_text(json.dumps(parsed.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+    parsed_payload = parsed.to_dict()
+    parsed_payload["mode"] = str((report.filters or {}).get("mode", "weekly") or "weekly").strip().lower() or "weekly"
+    compiled_path.write_text(json.dumps(parsed_payload, ensure_ascii=False, indent=2), encoding="utf-8")
     logger.info("weekly refusals artifact saved: %s", compiled_path)
 
     writer = WeeklyRefusalsBlockWriter(
@@ -513,7 +589,7 @@ def _run_weekly_refusals_profile(
     )
     write_result = writer.write_block(
         destination=destination,
-        parsed_result=parsed.to_dict(),
+        parsed_result=parsed_payload,
         dry_run=bool(weekly_dry_run),
     )
     logger.info(
@@ -543,6 +619,8 @@ def _resolve_source_and_values(filters: dict[str, object]) -> tuple[SourceKind, 
         )
 
     values = [str(v).strip() for v in (filter_values_raw or []) if str(v).strip()]
+    # Current report-profile execution keeps all provided values and passes them to UI handlers.
+    # Explicit boolean semantics (OR/AND) are not configured by this layer and depend on CRM widget behavior.
     if not values:
         raise RuntimeError("Report profile filter_values is empty. Add at least one value.")
 
@@ -1122,11 +1200,14 @@ def main() -> None:
     parser = _build_parser()
     args = parser.parse_args()
 
+    effective_google_auth_mode = _apply_google_auth_mode_override(args.google_auth_mode)
+
     config = load_config()
     ensure_inside_root(Path(os.getcwd()), config.project_root)
     ensure_project_structure(config)
 
     logger = setup_logging(config.logs_dir, level=os.getenv("LOG_LEVEL", "INFO"))
+    logger.info("google_auth_mode_effective=%s", effective_google_auth_mode)
     settings = load_browser_settings(config, browser_backend_override=args.browser_backend)
 
     report_profiles = load_report_profiles(config)
@@ -1464,6 +1545,11 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
 
 
 

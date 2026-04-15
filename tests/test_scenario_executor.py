@@ -89,3 +89,92 @@ def test_unsupported_filter_field_raises_controlled_error():
         assert "Unsupported DSL filter for scenario execution" in str(exc)
         assert "unknownfield" in str(exc)
     assert raised
+
+
+
+def test_execute_one_scenario_passes_primary_operator_to_flow():
+    cfg = parse_layout_row("????: utm_source^=conf_msk_light_industry_2026")
+
+    class _Flow:
+        def __init__(self):
+            self.tag_selection_mode = "script"
+            self.reader = type("_R", (), {
+                "open_analytics_page": staticmethod(lambda _page: None),
+                "build_tab_mode_url": staticmethod(lambda base, tab: base),
+            })()
+            self.captured_operator = None
+
+        def _open_filter_panel(self, _page):
+            return None
+
+        def _select_filter_kind(self, _page, _source_kind, _report_id):
+            return None
+
+        def _apply_filter_values(self, _page, _report_id, _source_kind, _values, operator="="):
+            self.captured_operator = operator
+
+        def _click_apply(self, _page):
+            return None
+
+        def _wait_after_apply(self, _page):
+            return None
+
+        def _wait_for_tab_content_ready(self, _page, _tab):
+            return True
+
+        def _read_tab_with_stability_retries(self, _page, _profile, tab, precheck_ready=True):
+            from src.browser.models import AnalyticsSnapshot, StageCount
+            return AnalyticsSnapshot(
+                source_kind="utm_source",
+                filter_id="x",
+                tab_mode=tab,
+                captured_at="2026-01-01T00:00:00",
+                total_count=1,
+                stages=[StageCount(stage_name="stage", count=1)],
+                top_cards={},
+                parse_method="test",
+                parse_debug={},
+                raw_lines=[],
+            )
+
+        def _debug_screenshot(self, _page, _name):
+            return None
+
+    class _Page:
+        url = "https://example.test"
+        def wait_for_timeout(self, _ms):
+            return None
+        def goto(self, _url, wait_until="domcontentloaded"):
+            return None
+
+    flow = _Flow()
+    ex = ScenarioExecutor(flow=flow, project_root=Path('.'), tabs=['all'], report_id='rid')
+    ex._save_scenario_debug_result = lambda *args, **kwargs: None
+    from types import SimpleNamespace
+    ex._capture_tabs_from_current_view = lambda *_args, **_kwargs: [
+        SimpleNamespace(tab_mode="all", total_count=1, stages=[SimpleNamespace(count=1)])
+    ]
+    result = ex._execute_one_scenario(_Page(), "block", 0, cfg.scenarios[0])
+    assert result.success is True
+    assert flow.captured_operator == "^="
+
+
+def test_apply_non_primary_filters_raises_when_pipeline_apply_fails():
+    cfg = parse_layout_row("X: tags=mashexpo; pipeline=Sales")
+
+    class _Flow:
+        tag_selection_mode = "script"
+        reader = type("_R", (), {"open_analytics_page": staticmethod(lambda _page: None)})()
+        def _apply_supported_filter(self, _page, _report_id, key, values, operator="="):
+            if key == "pipeline":
+                return False
+            return True
+
+    ex = ScenarioExecutor(flow=_Flow(), project_root=Path('.'), tabs=['all'], report_id='rid')
+    try:
+        ex._apply_non_primary_filters(page=None, scenario=cfg.scenarios[0], primary_kind='tag')
+        raised = False
+    except RuntimeError as exc:
+        raised = True
+        assert "Scenario filter apply failed: field=pipeline" in str(exc)
+    assert raised

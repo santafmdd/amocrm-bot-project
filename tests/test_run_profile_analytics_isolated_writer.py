@@ -179,6 +179,7 @@ def test_layout_writer_routing_api_preferred_dry_run_path() -> None:
         api_fallback_to_ui=False,
         target_dsl_row=None,
         target_dsl_text_contains=None,
+        target_dsl_cell=None,
         api_writer_factory=_DummyApiWriterSuccess,
         ui_writer_factory=_DummyUiWriter,
     )
@@ -212,6 +213,7 @@ def test_layout_writer_routing_fallback_to_ui_on_api_failure() -> None:
         api_fallback_to_ui=True,
         target_dsl_row=None,
         target_dsl_text_contains=None,
+        target_dsl_cell=None,
         api_writer_factory=_DummyApiWriterFail,
         ui_writer_factory=_DummyUiWriter,
     )
@@ -229,19 +231,45 @@ def test_layout_writer_routing_fallback_to_ui_on_api_failure() -> None:
 
 def test_select_execution_anchor_from_discovery_by_row() -> None:
     anchors = [
-        {"dsl_row": 1, "dsl_text": "A"},
-        {"dsl_row": 14, "dsl_text": "B"},
+        {"dsl_row": 1, "dsl_col": 6, "dsl_text": "A-right"},
+        {"dsl_row": 1, "dsl_col": 1, "dsl_text": "A-left"},
+        {"dsl_row": 14, "dsl_col": 1, "dsl_text": "B"},
     ]
     selected = _select_execution_anchor_from_discovery(
         anchors,
         target_dsl_row=14,
         target_dsl_text_contains=None,
+        target_dsl_cell=None,
     )
     assert selected is not None
     assert int(selected.get("dsl_row", 0)) == 14
+
 
 
 def test_map_dsl_source_to_flow_utm_prefix() -> None:
     source_kind, operator = _map_dsl_source_to_flow("utm_prefix", "^=")
     assert source_kind == "utm_source"
     assert operator == "^="
+
+
+def test_select_execution_anchor_from_discovery_by_cell_same_row() -> None:
+    anchors = [
+        {"dsl_row": 1, "dsl_col": 1, "dsl_text": "left"},
+        {"dsl_row": 1, "dsl_col": 6, "dsl_text": "right"},
+        {"dsl_row": 14, "dsl_col": 1, "dsl_text": "bottom"},
+    ]
+    selected = _select_execution_anchor_from_discovery(
+        anchors,
+        target_dsl_row=None,
+        target_dsl_text_contains=None,
+        target_dsl_cell="F1",
+    )
+    assert selected is not None
+    assert int(selected.get("dsl_row", 0)) == 1
+    assert int(selected.get("dsl_col", 0)) == 6
+
+
+
+
+
+
