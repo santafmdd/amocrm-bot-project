@@ -1,4 +1,4 @@
-table_mappings:
+﻿table_mappings:
   - id: event_top_block_1
     target_sheet_name: "events_summary"
     target_block_id: "top_block_1"
@@ -45,6 +45,7 @@ table_mappings:
         - "conf_ufa_stroyka_2026 уралстрой"
         - "conf_novosib_mechanical_engineering_2026 машэкспо"
         - "conf_msk_light_industry_2026 инглегмаш"
+      allow_generic_tag_alias_fallback: false
 
       summary_block_aliases:
         - "все 3 выставки"
@@ -60,4 +61,179 @@ table_mappings:
         "первый контакт. квалификация": ["первичный контакт. квалификация", "первич. контакт. квалификация"]
         "проведена демонстрация": ["демонстрация проведена"]
         "закрыто и не реализовано": ["не реализовано"]
+
+  - id: weekly_refusals_weekly_2m_block
+    kind: google_sheets_ui
+    sheet_url: "https://docs.google.com/spreadsheets/d/1snOH42aIRUtxS3AU9PJPHSrk1vDyFQdiIJNJRhasxX0/edit"
+    tab_name: "analytics_writer_test"
+    write_mode: "weekly_refusals_block_update"
+    start_cell: "A1"
+    layout:
+      block_kind: weekly_refusals
+      clear_strategy: until_next_section_title
+      block_direction: down
+      block_width: 6
+      data_start_row_offset: 2
+      anchor_scan_max_rows: 500
+      anchor_scan_max_cols: 20
+      detect_header_row: true
+      allow_start_cell_fallback: false
+      section_title_text_contains: "отказы привлечение (2 месяца) - за неделю"
+      next_section_title_text_contains: "отказы привлечение (долгие) - накопительный свод"
+      section_title_candidates:
+        - "отказы привлечение (2 месяца) - накопительный свод"
+        - "отказы привлечение (2 месяца) - за неделю"
+        - "отказы привлечение (долгие) - накопительный свод"
+        - "отказы привлечение (долгие) - за неделю"
+      canonical_before_order:
+        - "Привлечение(2 месяца) неразобранное"
+        - "Привлечение(2 месяца) верификация"
+        - "Привлечение(2 месяца) первый контакт. квалификация"
+        - "Привлечение(2 месяца) есть интерес к продукту"
+        - "Привлечение(2 месяца) проведена демонстрация"
+        - "Привлечение(2 месяца) тестирование системы"
+        - "Привлечение(2 месяца) принимают решение"
+        - "Привлечение(2 месяца) выставлено кп"
+        - "Привлечение(2 месяца) оплата"
+        - "Привлечение(2 месяца) успешно реализовано"
+      canonical_after_group_order:
+        - "Верификация"
+        - "Первичный контакт. Квалификация"
+        - "Есть интерес к продукту"
+        - "Проведена демонстрация"
+        - "Тестирование системы"
+        - "Принимают решение"
+        - "Выставлено КП"
+        - "Оплата"
+        - "Успешно реализовано"
+
+  - id: weekly_refusals_weekly_long_block
+    kind: google_sheets_ui
+    sheet_url: "https://docs.google.com/spreadsheets/d/1snOH42aIRUtxS3AU9PJPHSrk1vDyFQdiIJNJRhasxX0/edit"
+    tab_name: "analytics_writer_test"
+    write_mode: "weekly_refusals_block_update"
+    start_cell: "F1"
+    layout:
+      block_kind: weekly_refusals
+      clear_strategy: until_next_section_title
+      block_direction: down
+      block_width: 6
+      data_start_row_offset: 2
+      anchor_scan_max_rows: 500
+      anchor_scan_max_cols: 20
+      detect_header_row: true
+      allow_start_cell_fallback: false
+      section_title_text_contains: "отказы привлечение (долгие) - за неделю"
+      section_title_candidates:
+        - "отказы привлечение (2 месяца) - накопительный свод"
+        - "отказы привлечение (2 месяца) - за неделю"
+        - "отказы привлечение (долгие) - накопительный свод"
+        - "отказы привлечение (долгие) - за неделю"
+      canonical_before_order:
+        - "Привлечение(долгие) первичный контакт"
+        - "Привлечение(долгие) квалификация"
+        - "Привлечение(долгие) есть интерес к продукту"
+        - "Привлечение(долгие) проведена демонстрация"
+        - "Привлечение(долгие) запущено тестирование"
+        - "Привлечение(долгие) принимают решение"
+        - "Привлечение(долгие) выставлено кп"
+        - "Привлечение(долгие) успешно реализовано"
+      canonical_after_group_order:
+        - "Первичный контакт"
+        - "Квалификация"
+        - "Есть интерес к продукту"
+        - "Проведена демонстрация"
+        - "Запущено тестирование"
+        - "Принимают решение"
+        - "Выставлено КП"
+        - "Успешно реализовано"
+
+  - id: weekly_refusals_cumulative_2m_block
+    kind: google_sheets_ui
+    sheet_url: "https://docs.google.com/spreadsheets/d/1snOH42aIRUtxS3AU9PJPHSrk1vDyFQdiIJNJRhasxX0/edit"
+    tab_name: "analytics_writer_test"
+    write_mode: "weekly_refusals_block_update"
+    start_cell: "A30"
+    layout:
+      block_kind: weekly_refusals
+      clear_strategy: until_next_section_title
+      block_direction: down
+      block_width: 6
+      data_start_row_offset: 2
+      anchor_scan_max_rows: 500
+      anchor_scan_max_cols: 20
+      detect_header_row: true
+      allow_start_cell_fallback: false
+      section_title_text_contains: "отказы привлечение (2 месяца) - накопительный свод"
+      next_section_title_text_contains: "отказы привлечение (2 месяца) - за неделю"
+      section_title_candidates:
+        - "отказы привлечение (2 месяца) - накопительный свод"
+        - "отказы привлечение (2 месяца) - за неделю"
+        - "отказы привлечение (долгие) - накопительный свод"
+        - "отказы привлечение (долгие) - за неделю"
+      canonical_before_order:
+        - "Привлечение(2 месяца) неразобранное"
+        - "Привлечение(2 месяца) верификация"
+        - "Привлечение(2 месяца) первый контакт. квалификация"
+        - "Привлечение(2 месяца) есть интерес к продукту"
+        - "Привлечение(2 месяца) проведена демонстрация"
+        - "Привлечение(2 месяца) тестирование системы"
+        - "Привлечение(2 месяца) принимают решение"
+        - "Привлечение(2 месяца) выставлено кп"
+        - "Привлечение(2 месяца) оплата"
+        - "Привлечение(2 месяца) успешно реализовано"
+      canonical_after_group_order:
+        - "Верификация"
+        - "Первичный контакт. Квалификация"
+        - "Есть интерес к продукту"
+        - "Проведена демонстрация"
+        - "Тестирование системы"
+        - "Принимают решение"
+        - "Выставлено КП"
+        - "Оплата"
+        - "Успешно реализовано"
+
+  - id: weekly_refusals_cumulative_long_block
+    kind: google_sheets_ui
+    sheet_url: "https://docs.google.com/spreadsheets/d/1snOH42aIRUtxS3AU9PJPHSrk1vDyFQdiIJNJRhasxX0/edit"
+    tab_name: "analytics_writer_test"
+    write_mode: "weekly_refusals_block_update"
+    start_cell: "F30"
+    layout:
+      block_kind: weekly_refusals
+      clear_strategy: until_next_section_title
+      block_direction: down
+      block_width: 6
+      data_start_row_offset: 2
+      anchor_scan_max_rows: 500
+      anchor_scan_max_cols: 20
+      detect_header_row: true
+      allow_start_cell_fallback: false
+      section_title_text_contains: "отказы привлечение (долгие) - накопительный свод"
+      next_section_title_text_contains: "отказы привлечение (долгие) - за неделю"
+      section_title_candidates:
+        - "отказы привлечение (2 месяца) - накопительный свод"
+        - "отказы привлечение (2 месяца) - за неделю"
+        - "отказы привлечение (долгие) - накопительный свод"
+        - "отказы привлечение (долгие) - за неделю"
+      canonical_before_order:
+        - "Привлечение(долгие) первичный контакт"
+        - "Привлечение(долгие) квалификация"
+        - "Привлечение(долгие) есть интерес к продукту"
+        - "Привлечение(долгие) проведена демонстрация"
+        - "Привлечение(долгие) запущено тестирование"
+        - "Привлечение(долгие) принимают решение"
+        - "Привлечение(долгие) выставлено кп"
+        - "Привлечение(долгие) успешно реализовано"
+      canonical_after_group_order:
+        - "Первичный контакт"
+        - "Квалификация"
+        - "Есть интерес к продукту"
+        - "Проведена демонстрация"
+        - "Запущено тестирование"
+        - "Принимают решение"
+        - "Выставлено КП"
+        - "Успешно реализовано"
+
+
 

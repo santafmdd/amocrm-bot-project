@@ -188,6 +188,9 @@ class WeeklyRefusalsBlockWriter:
             inserted_new_after_items=inserted_new_after_items,
             final_before_order=final_before_order,
             final_after_order=final_after_order,
+            anchor_required=bool(anchor.get("anchor_required", True)),
+            anchor_found=bool(anchor.get("anchor_found", False)),
+            fallback_allowed=bool(anchor.get("fallback_allowed", False)),
             fallback_used=bool(anchor.get("fallback_used", False)),
             clear_cells_count=0,
             write_cells_count=self._count_cells(write_updates),
@@ -456,6 +459,11 @@ class WeeklyRefusalsBlockWriter:
         scan_suffix = f"A1:{_col_to_label(scan_cols)}{scan_rows}"
         matrix = client.get_values(spreadsheet_id=spreadsheet_id, range_a1=client.build_tab_a1_range(tab_title=tab_title, range_suffix=scan_suffix))
 
+        block_kind = str(layout.get("block_kind", "")).strip().lower()
+        is_weekly_refusals = block_kind == "weekly_refusals"
+        anchor_required = bool(layout.get("anchor_required", True if is_weekly_refusals else False))
+        fallback_allowed = bool(layout.get("allow_start_cell_fallback", False if is_weekly_refusals else True))
+
         fallback_start_cell = str(destination.start_cell or "A1").strip() or "A1"
         fallback_row, fallback_col = _parse_a1_cell(fallback_start_cell)
 
@@ -473,6 +481,9 @@ class WeeklyRefusalsBlockWriter:
                             "anchor_col": c_idx,
                             "anchor_cell": f"{_col_to_label(c_idx)}{r_idx}",
                             "anchor_text": raw,
+                            "anchor_required": anchor_required,
+                            "anchor_found": True,
+                            "fallback_allowed": fallback_allowed,
                             "fallback_used": False,
                             "scan_suffix": scan_suffix,
                             "scan_rows": scan_rows,
@@ -488,6 +499,9 @@ class WeeklyRefusalsBlockWriter:
                     "anchor_col": col,
                     "anchor_cell": f"{_col_to_label(col)}{row}",
                     "anchor_text": "",
+                    "anchor_required": anchor_required,
+                    "anchor_found": True,
+                    "fallback_allowed": fallback_allowed,
                     "fallback_used": False,
                     "scan_suffix": scan_suffix,
                     "scan_rows": scan_rows,
@@ -496,17 +510,46 @@ class WeeklyRefusalsBlockWriter:
             except Exception:
                 pass
 
-        return {
-            "anchor_source": "start_cell_fallback",
-            "anchor_row": fallback_row,
-            "anchor_col": fallback_col,
-            "anchor_cell": f"{_col_to_label(fallback_col)}{fallback_row}",
-            "anchor_text": "",
-            "fallback_used": True,
-            "scan_suffix": scan_suffix,
-            "scan_rows": scan_rows,
-            "scan_cols": scan_cols,
-        }
+        if fallback_allowed:
+            return {
+                "anchor_source": "start_cell_fallback",
+                "anchor_row": fallback_row,
+                "anchor_col": fallback_col,
+                "anchor_cell": f"{_col_to_label(fallback_col)}{fallback_row}",
+                "anchor_text": "",
+                "anchor_required": anchor_required,
+                "anchor_found": False,
+                "fallback_allowed": fallback_allowed,
+                "fallback_used": True,
+                "scan_suffix": scan_suffix,
+                "scan_rows": scan_rows,
+                "scan_cols": scan_cols,
+            }
+
+        similar_titles: list[str] = []
+        token = section_matcher[0] if section_matcher else ""
+        for row in matrix:
+            for value in row:
+                raw = str(value or "").strip()
+                if not raw:
+                    continue
+                norm = _norm(raw)
+                if token and (token in norm or norm in token or "отказы" in norm):
+                    if raw not in similar_titles:
+                        similar_titles.append(raw)
+                if len(similar_titles) >= 12:
+                    break
+            if len(similar_titles) >= 12:
+                break
+
+        raise RuntimeError(
+            "Weekly refusals anchor not found: "
+            f"target_id={destination.target_id} tab_name={tab_title} "
+            f"section_title_text_contains={layout.get('section_title_text_contains', '')!r} "
+            f"scan_range={scan_suffix} scan_rows={scan_rows} scan_cols={scan_cols} "
+            f"fallback_allowed={str(fallback_allowed).lower()} "
+            f"similar_titles={similar_titles}"
+        )
 
     def _resolve_next_section_row(
         self,
@@ -662,6 +705,9 @@ class WeeklyRefusalsBlockWriter:
         inserted_new_after_items: list[str],
         final_before_order: list[str],
         final_after_order: list[str],
+        anchor_required: bool,
+        anchor_found: bool,
+        fallback_allowed: bool,
         fallback_used: bool,
         clear_cells_count: int,
         write_cells_count: int,
@@ -703,6 +749,9 @@ class WeeklyRefusalsBlockWriter:
             "next_section_title_row": next_section_row,
             "clear_bounds": clear_bounds,
             "write_bounds": write_bounds,
+            "anchor_required": bool(anchor_required),
+            "anchor_found": bool(anchor_found),
+            "fallback_allowed": bool(fallback_allowed),
             "fallback_used": bool(fallback_used),
             "inserted_new_before_statuses": inserted_new_before_statuses,
             "inserted_new_after_groups": inserted_new_after_groups,

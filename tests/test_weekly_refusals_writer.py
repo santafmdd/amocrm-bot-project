@@ -118,6 +118,7 @@ def _make_destination() -> WriterDestinationConfig:
             "data_start_row_offset": 2,
             "anchor_cell": "A1",
             "detect_header_row": True,
+            "allow_start_cell_fallback": False,
             "canonical_before_order": [
                 "Привлечение(2 месяца) неразобранное",
                 "Привлечение(2 месяца) верификация",
@@ -158,6 +159,10 @@ def test_weekly_refusals_writer_dry_run_does_not_update_sheet() -> None:
     assert _FakeClient.called == 0
     payload = result.summary_path.read_text(encoding="utf-8")
     assert '"anchor_source": "section_title"' in payload
+    assert '"anchor_required": true' in payload
+    assert '"anchor_found": true' in payload
+    assert '"fallback_allowed": false' in payload
+    assert '"fallback_used": false' in payload
     assert '"preserved_manual_columns": [' in payload
 
 
@@ -262,6 +267,7 @@ def test_weekly_writer_uses_start_cell_fallback_when_anchor_not_found() -> None:
             **destination.layout_config,
             "section_title_text_contains": "missing anchor text",
             "anchor_cell": "",
+            "allow_start_cell_fallback": True,
         },
     )
     writer = WeeklyRefusalsBlockWriter(
@@ -275,6 +281,43 @@ def test_weekly_writer_uses_start_cell_fallback_when_anchor_not_found() -> None:
     assert '"fallback_used": true' in payload
     assert '"anchor_cell": "F10"' in payload
 
+
+
+
+def test_weekly_writer_raises_when_anchor_missing_and_fallback_disabled() -> None:
+    base = _tmp_base("test_weekly_refusals_writer_no_fallback")
+    destination = _make_destination()
+    destination = WriterDestinationConfig(
+        sheet_url=destination.sheet_url,
+        tab_name=destination.tab_name,
+        start_cell="F10",
+        write_mode=destination.write_mode,
+        kind=destination.kind,
+        target_id=destination.target_id,
+        layout_config={
+            **destination.layout_config,
+            "section_title_text_contains": "missing anchor text",
+            "anchor_cell": "",
+            "allow_start_cell_fallback": False,
+        },
+    )
+    writer = WeeklyRefusalsBlockWriter(
+        project_root=base,
+        exports_dir=base,
+        client_factory=lambda root, logger=None: _FallbackClient(root, logger),
+    )
+
+    raised = False
+    try:
+        writer.write_block(destination=destination, parsed_result=_parsed_payload(), dry_run=True)
+    except RuntimeError as exc:
+        raised = True
+        message = str(exc)
+        assert "Weekly refusals anchor not found" in message
+        assert "target_id=weekly_refusals_weekly_2m_block" in message
+        assert "tab_name=analytics_writer_test" in message
+        assert "section_title_text_contains='missing anchor text'" in message
+    assert raised is True
 
 def test_sort_before_rows_matches_known_statuses_across_format_variants() -> None:
     base = _tmp_base("test_weekly_refusals_before_known_variants")

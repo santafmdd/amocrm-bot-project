@@ -1,4 +1,4 @@
-"""Google Sheets API-based layout writer (stage block update via batch values)."""
+﻿"""Google Sheets API-based layout writer (stage block update via batch values)."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from src.writers.models import CompiledProfileAnalyticsResult, WriterDestination
 
 
 def _norm(text: str) -> str:
-    value = (text or "").strip().lower().replace("?", "?")
+    value = (text or "").strip().lower().replace("ё", "е")
     value = re.sub(r"[\.;:,]+", " ", value)
     value = re.sub(r"\s+", " ", value)
     return value.strip()
@@ -30,6 +30,22 @@ def _to_col_label(col_idx: int) -> str:
         chars.append(chr(ord("A") + remainder))
     return "".join(reversed(chars))
 
+
+def _parse_cell_ref(cell: str | None) -> tuple[int, int] | None:
+    raw = str(cell or "").strip().upper()
+    if not raw:
+        return None
+    m = re.match(r"^([A-Z]+)(\d+)$", raw)
+    if not m:
+        return None
+    col_s, row_s = m.groups()
+    row = int(row_s)
+    col = 0
+    for ch in col_s:
+        col = col * 26 + (ord(ch) - ord("A") + 1)
+    if row <= 0 or col <= 0:
+        return None
+    return row, col
 
 class GoogleSheetsApiLayoutWriter:
     """Write stage metrics to discovered layout block via Google Sheets API."""
@@ -47,6 +63,7 @@ class GoogleSheetsApiLayoutWriter:
         dry_run: bool = False,
         target_dsl_row: int | None = None,
         target_dsl_text_contains: str | None = None,
+        target_dsl_cell: str | None = None,
     ) -> dict[str, Any]:
         if not destination.sheet_url.strip():
             raise RuntimeError("Google Sheets API writer: destination.sheet_url is empty")
@@ -68,6 +85,11 @@ class GoogleSheetsApiLayoutWriter:
                 if target_dsl_text_contains is not None
                 else str(layout.get("api_target_dsl_text_contains", "")).strip()
             ),
+            "dsl_cell": (
+                str(target_dsl_cell).strip().upper()
+                if target_dsl_cell is not None
+                else str(layout.get("api_target_dsl_cell", "")).strip().upper()
+            ),
         }
         selected_anchor = self._select_anchor(
             anchors=anchors,
@@ -75,6 +97,7 @@ class GoogleSheetsApiLayoutWriter:
             layout=layout,
             target_dsl_row=target_selector.get("dsl_row"),
             target_dsl_text_contains=target_selector.get("dsl_text_contains"),
+            target_dsl_cell=target_selector.get("dsl_cell"),
         )
         if selected_anchor is None:
             raise RuntimeError("API layout writer: could not select target anchor for current compiled result")
@@ -95,6 +118,9 @@ class GoogleSheetsApiLayoutWriter:
             row_count=row_count,
             pivot_keys={_norm(name) for name in pivot.keys()},
             next_anchor_dsl_row=next_anchor_dsl_row,
+            table_row_end=(int(selected_anchor.get("table_row_end", 0) or 0) or None),
+            table_col_start=(int(selected_anchor.get("table_col_start", 0) or 0) or None),
+            table_col_end=(int(selected_anchor.get("table_col_end", 0) or 0) or None),
         )
         stage_rows = boundary["stage_rows"]
 
@@ -176,6 +202,7 @@ class GoogleSheetsApiLayoutWriter:
         layout: dict[str, Any],
         target_dsl_row: int | None = None,
         target_dsl_text_contains: str | None = None,
+        target_dsl_cell: str | None = None,
     ) -> dict[str, Any] | None:
         aliases: list[str] = []
         aliases.extend([str(v).strip() for v in compiled_result.filter_values if str(v).strip()])
@@ -184,6 +211,11 @@ class GoogleSheetsApiLayoutWriter:
 
         alias_norm = [_norm(a) for a in aliases if a]
         filter_norm = [_norm(v) for v in compiled_result.filter_values if str(v).strip()]
+        ordered_anchors = sorted(
+            [a for a in anchors if isinstance(a, dict)],
+            key=lambda a: (int(a.get("dsl_row", 0) or 0), int(a.get("dsl_col", 0) or 0)),
+        )
+
 
         row_selector: int | None = None
         if target_dsl_row is not None:
@@ -192,9 +224,33 @@ class GoogleSheetsApiLayoutWriter:
             except Exception:
                 row_selector = None
         text_selector = _norm(str(target_dsl_text_contains or ""))
+        cell_selector = _parse_cell_ref(target_dsl_cell)
+
+        if cell_selector is not None:
+            sel_row, sel_col = cell_selector
+            by_cell = [
+                a for a in ordered_anchors
+                if int(a.get("dsl_row", -1)) == sel_row and int(a.get("dsl_col", -1)) == sel_col
+            ]
+            if text_selector:
+                by_cell = [a for a in by_cell if text_selector in _norm(str(a.get("dsl_text", "")))]
+            if by_cell:
+                chosen = by_cell[0]
+                self.logger.info(
+                    "api layout writer selected anchor by target_dsl_cell: dsl_cell=%s dsl_row=%s header_row=%s dsl_text=%s",
+                    str(target_dsl_cell),
+                    chosen.get("dsl_row"),
+                    chosen.get("header_row"),
+                    chosen.get("dsl_text"),
+                )
+                return chosen
+            self.logger.warning(
+                "api layout writer target_dsl_cell did not match any anchor: dsl_cell=%s",
+                str(target_dsl_cell),
+            )
 
         if row_selector is not None:
-            by_row = [a for a in anchors if int(a.get("dsl_row", -1)) == row_selector]
+            by_row = [a for a in ordered_anchors if int(a.get("dsl_row", -1)) == row_selector]
             if text_selector:
                 by_row = [a for a in by_row if text_selector in _norm(str(a.get("dsl_text", "")))]
             if by_row:
@@ -213,7 +269,7 @@ class GoogleSheetsApiLayoutWriter:
             )
 
         if text_selector:
-            by_text = [a for a in anchors if text_selector in _norm(str(a.get("dsl_text", "")))]
+            by_text = [a for a in ordered_anchors if text_selector in _norm(str(a.get("dsl_text", "")))]
             if by_text:
                 chosen = by_text[0]
                 self.logger.info(
@@ -230,7 +286,7 @@ class GoogleSheetsApiLayoutWriter:
             )
 
         best: tuple[int, dict[str, Any]] | None = None
-        for anchor in anchors:
+        for anchor in ordered_anchors:
             text = str(anchor.get("dsl_text", ""))
             text_norm = _norm(text)
             score = 0
@@ -302,6 +358,9 @@ class GoogleSheetsApiLayoutWriter:
         row_count: int,
         pivot_keys: set[str],
         next_anchor_dsl_row: int | None = None,
+        table_row_end: int | None = None,
+        table_col_start: int | None = None,
+        table_col_end: int | None = None,
     ) -> dict[str, Any]:
         start_row = header_row + 1
         scan_end_row = min(row_count, header_row + 220)
@@ -309,9 +368,14 @@ class GoogleSheetsApiLayoutWriter:
         if isinstance(next_anchor_dsl_row, int) and next_anchor_dsl_row > start_row:
             hard_row_upper_bound = max(start_row, next_anchor_dsl_row - 1)
         end_row = min(scan_end_row, hard_row_upper_bound) if hard_row_upper_bound is not None else scan_end_row
+        if isinstance(table_row_end, int) and table_row_end >= start_row:
+            end_row = min(end_row, table_row_end)
 
         min_col = min(stage_col, all_col, active_col, closed_col)
         max_col = max(stage_col, all_col, active_col, closed_col)
+        if isinstance(table_col_start, int) and isinstance(table_col_end, int):
+            min_col = min(min_col, table_col_start)
+            max_col = max(max_col, table_col_end)
         min_label = _to_col_label(min_col)
         max_label = _to_col_label(max_col)
         range_a1 = f"{tab_name}!{min_label}{start_row}:{max_label}{end_row}"
@@ -361,12 +425,12 @@ class GoogleSheetsApiLayoutWriter:
                 first_excluded_row = row_idx
                 break
 
-            # Stop on next header-like row for adjacent block.
+                        # Stop on next header-like row for adjacent block.
             is_header_like = (
-                stage_norm in {"????", "??????"}
-                and all_norm in {"???", "??? (??)", "??? ??"}
-                and active_norm in {"????????", "???????? (??)", "???????? ??"}
-                and closed_norm in {"????????", "???????? (??)", "???????? ??"}
+                stage_norm in {"этап", "статус", "stage", "status"}
+                and all_norm in {"все", "все (шт)", "все шт", "all", "all (qty)"}
+                and active_norm in {"активные", "активные (шт)", "активные шт", "active", "active (qty)"}
+                and closed_norm in {"закрытые", "закрытые (шт)", "закрытые шт", "closed", "closed (qty)"}
             )
             if is_header_like:
                 stop_reason = "new_header_row"
@@ -375,9 +439,9 @@ class GoogleSheetsApiLayoutWriter:
 
             # Stop on service rows / refusal block labels.
             if (
-                stage_norm == "??????"
-                or stage_norm.startswith("???????? ??")
-                or stage_norm.startswith("??????")
+                stage_norm == "статус"
+                or stage_norm.startswith("значение до")
+                or stage_norm.startswith("отказы")
             ):
                 stop_reason = "service_row"
                 first_excluded_row = row_idx
@@ -469,3 +533,10 @@ class GoogleSheetsApiLayoutWriter:
         }
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         return path
+
+
+
+
+
+
+

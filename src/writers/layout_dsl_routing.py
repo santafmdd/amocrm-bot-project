@@ -19,6 +19,48 @@ class DslExecutionInput:
     tabs: list[str]
 
 
+def _canon_text(value: str) -> str:
+    return " ".join(str(value or "").strip().lower().replace("ё", "е").replace("_", " ").split())
+
+
+def _canonical_date_mode(value: str) -> str:
+    v = _canon_text(value)
+    if not v:
+        return ""
+    if v in {"closed", "close", "закрыты", "закрытые"} or "закры" in v:
+        return "closed"
+    if v in {"created", "созданы", "создано", "созданные"} or "создан" in v:
+        return "created"
+    return v
+
+
+def _canonical_period(value: str) -> str:
+    v = _canon_text(value)
+    if not v:
+        return ""
+    if v in {"all time", "за все время", "за всё время"}:
+        return "all_time"
+    if v in {"today", "за сегодня"}:
+        return "current_day"
+    if v in {"yesterday", "за вчера"}:
+        return "previous_day"
+    if v in {"last 30 days", "за последние 30 дней"}:
+        return "last_30_days"
+    if v in {"this week", "за эту неделю"}:
+        return "current_week"
+    if v in {"last week", "за прошлую неделю"}:
+        return "previous_week"
+    if v in {"this month", "за этот месяц"}:
+        return "current_month"
+    if v in {"last month", "за прошлый месяц"}:
+        return "previous_month"
+    if v in {"quarter", "за квартал"}:
+        return "quarter"
+    if v in {"this year", "за этот год"}:
+        return "current_year"
+    return v
+
+
 def _first_non_empty(values: list[str]) -> str:
     for value in values:
         val = str(value).strip()
@@ -53,6 +95,8 @@ def _extract_from_scenario(scenario: LayoutScenario, original_text: str) -> DslE
     filter_operator = "="
     filter_value = ""
 
+    # Current execution contract is single-value for source filters: we keep only the first non-empty
+    # value from DSL and pass one value to runtime. Multi-value OR/AND semantics are not executed yet.
     if tags_filter is not None:
         source_kind = "tag"
         filter_field = "tags"
@@ -71,8 +115,8 @@ def _extract_from_scenario(scenario: LayoutScenario, original_text: str) -> DslE
         filter_operator=filter_operator,
         filter_value=filter_value,
         pipeline_name=_first_non_empty(pipeline_filter.values) if pipeline_filter else "",
-        period=_first_non_empty(period_filter.values) if period_filter else "",
-        date_mode=_first_non_empty(dates_filter.values) if dates_filter else "",
+        period=_canonical_period(_first_non_empty(period_filter.values)) if period_filter else "",
+        date_mode=_canonical_date_mode(_first_non_empty(dates_filter.values)) if dates_filter else "",
         tabs=_normalize_tabs_values(tabs_filter.values) if tabs_filter else [],
     )
 

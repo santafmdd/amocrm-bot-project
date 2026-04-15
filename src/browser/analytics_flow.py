@@ -2388,15 +2388,24 @@ class AnalyticsFlow:
                 raise RuntimeError(f"Could not set/apply tag filter value '{target_value}': {exc}") from exc
 
         if source_kind == "utm_source":
+            normalized_operator = operator if operator in {"=", "^="} else "="
+            filter_key = "utm_prefix" if normalized_operator == "^=" else "utm_source"
             applied = self._apply_supported_filter(
                 page=page,
                 report_id=report_id,
-                filter_key="utm_source",
+                filter_key=filter_key,
                 values=values,
-                operator=operator if operator in {"=", "^="} else "=",
+                operator=normalized_operator,
+            )
+            self.logger.info(
+                "utm primary apply route: filter_key=%s operator=%s applied=%s",
+                filter_key,
+                normalized_operator,
+                str(bool(applied)).lower(),
             )
             if not applied:
-                raise RuntimeError("UTM source exact filter handler failed in script flow.")
+                mode = "prefix" if normalized_operator == "^=" else "exact"
+                raise RuntimeError(f"UTM source {mode} filter handler failed in script flow.")
             return
 
         input_locator: Locator | None = None

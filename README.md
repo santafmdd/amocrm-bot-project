@@ -1,3 +1,79 @@
+﻿## Update (2026-04-12): Google OAuth Auth Modes
+
+Why system browser opens:
+- Google OAuth desktop flow uses `InstalledAppFlow.run_local_server(...)`.
+- This is independent from OpenClaw CDP and always launches the OS default browser when interactive auth is needed.
+
+Current auth modes (`GOOGLE_API_AUTH_MODE`):
+- `auto` (default): use cached token/refresh first; if unusable, allow interactive OAuth.
+- `cache_only`: never open browser; fail fast if token is missing/invalid.
+- `interactive_bootstrap`: explicit bootstrap mode for first-time token creation/refresh.
+
+Recommended flow:
+1. One-time bootstrap (explicit):
+   - set `GOOGLE_API_AUTH_MODE=interactive_bootstrap`
+   - run API inspector/write command once to create/update `token.json`.
+2. Regular runs:
+   - set `GOOGLE_API_AUTH_MODE=cache_only`
+   - no unexpected OAuth popup browser.
+
+Token/credentials storage:
+- credentials: `credentials.json` (or `GOOGLE_API_CREDENTIALS_FILE`)
+- token cache: `token.json` (or `GOOGLE_API_TOKEN_FILE`)
+- refresh token is reused automatically when present.
+## Update (2026-04-12): Anchor Targeting + Safer Discovery Stop
+
+- Batch/isolated API layout modes now support exact DSL cell targeting:
+  - `--writer-layout-api-target-dsl-cell A1|F1|...`
+- Anchor ordering is deterministic by `(dsl_row, dsl_col)`.
+- Discovery summary now includes `dsl_cell` per anchor.
+- Discovery hard-limit is treated as a safety fuse only:
+  - effective limit auto-raises above scan budget,
+  - normal runs stop by `scan_range_exhausted` / configured structural reasons, not premature `cell_read_hard_limit`.
+- Dry-run contract remains strict: `--writer-layout-api-batch-from-sheet-dsl-dry-run` never performs Google Sheets value updates.
+## Update (2026-04-12): Generalized API Layout Discovery
+
+- Discovery is now sheet-geometry based (not vertical-only):
+  - scans metadata-bounded row/column bands,
+  - collects DSL candidates across full scan range,
+  - detects header blocks independently,
+  - maps `DSL -> nearest valid table block` with row/column distance scoring.
+- Supports blocks stacked vertically, side-by-side, and lower blocks after large gaps.
+- Anchor payload now includes table bounds (`table_row_start/end`, `table_col_start/end`, `topology`).
+
+## Batch Dry-Run Contract (Strict)
+
+- `--writer-layout-api-batch-from-sheet-dsl-dry-run` performs discovery/parsing/scenario execution/write planning,
+  but API writer is always called with `dry_run=true`.
+- No real Google Sheets updates are allowed in this mode.
+
+## Update (2026-04-12): Batch Dry-Run Contract
+
+- `--writer-layout-api-batch-from-sheet-dsl-dry-run` now executes discovery + DSL parse + scenario execution + write planning,
+  but calls API writer strictly with `dry_run=true`.
+- Dry-run never sends Google Sheets `batchUpdate` value writes.
+- Summary rows use `status=dry_run_planned` with `planned_updates`, and `updated_cells_count=0`.
+
+## UTM Prefix Limitation (Current)
+
+- `utm_source^=` is routed to `utm_prefix` handler.
+- In current amoCRM UI route this remains best-effort deterministic entry/selection,
+  not a guaranteed native prefix operator for all accounts/layouts.
+
+## UTM Prefix Behavior (Current)
+
+- `utm_source^=...` in batch DSL is routed to `utm_prefix` browser handler.
+- Current UI path is **best-effort** and uses direct value entry/selection in available control.
+- There is no guaranteed dedicated amoCRM UI operator for true prefix query in every account layout.
+- If UI does not expose deterministic prefix semantics, runtime logs warning/failure explicitly.
+
+
+## Update (2026-04-11): DSL Encoding + Date Normalization
+
+- Google Sheets DSL discovery/routing now uses UTF-8 text as source-of-truth (no lossy mojibake repair conversions).
+- Scenario execution normalizes date DSL values to canonical tokens before applying filters (`created/closed`, `all_time/...`).
+- Date filter handler verifies normalized widget state and returns success when target state is already selected.
+
 ## Test Run Policy
 
 Run tests via module invocation only:
@@ -73,154 +149,154 @@ Not production-ready yet:
 - log retention/cleanup
 
 
-Этот проект — безопасный локальный каркас для пошаговой автоматизации на домашней Windows-машине.
-Текущий шаг добавляет read-only MVP браузерного чтения аналитики amoCRM: скрипт открывает интерфейс, читает текущие цифры и сохраняет результат в `exports`.
+Р­С‚РѕС‚ РїСЂРѕРµРєС‚ вЂ” Р±РµР·РѕРїР°СЃРЅС‹Р№ Р»РѕРєР°Р»СЊРЅС‹Р№ РєР°СЂРєР°СЃ РґР»СЏ РїРѕС€Р°РіРѕРІРѕР№ Р°РІС‚РѕРјР°С‚РёР·Р°С†РёРё РЅР° РґРѕРјР°С€РЅРµР№ Windows-РјР°С€РёРЅРµ.
+РўРµРєСѓС‰РёР№ С€Р°Рі РґРѕР±Р°РІР»СЏРµС‚ read-only MVP Р±СЂР°СѓР·РµСЂРЅРѕРіРѕ С‡С‚РµРЅРёСЏ Р°РЅР°Р»РёС‚РёРєРё amoCRM: СЃРєСЂРёРїС‚ РѕС‚РєСЂС‹РІР°РµС‚ РёРЅС‚РµСЂС„РµР№СЃ, С‡РёС‚Р°РµС‚ С‚РµРєСѓС‰РёРµ С†РёС„СЂС‹ Рё СЃРѕС…СЂР°РЅСЏРµС‚ СЂРµР·СѓР»СЊС‚Р°С‚ РІ `exports`.
 
-## Этапы реализации
+## Р­С‚Р°РїС‹ СЂРµР°Р»РёР·Р°С†РёРё
 
-1. MVP заполнения листа "воронка отказов"
-2. Weekly summary по отказам
-3. Анализ сделок, звонков и презентаций
+1. MVP Р·Р°РїРѕР»РЅРµРЅРёСЏ Р»РёСЃС‚Р° "РІРѕСЂРѕРЅРєР° РѕС‚РєР°Р·РѕРІ"
+2. Weekly summary РїРѕ РѕС‚РєР°Р·Р°Рј
+3. РђРЅР°Р»РёР· СЃРґРµР»РѕРє, Р·РІРѕРЅРєРѕРІ Рё РїСЂРµР·РµРЅС‚Р°С†РёР№
 
-## Что уже есть
+## Р§С‚Рѕ СѓР¶Рµ РµСЃС‚СЊ
 
-- Изолированная структура директорий внутри `project`
-- Базовая конфигурация через `.env`
-- Проверки безопасности путей (запрет выхода за пределы проекта)
-- Логирование в консоль и файл
-- Browser read-only MVP для amoCRM аналитики:
-  - Playwright-сессия с `storage state`
-  - большое окно браузера для стабильного layout (`--start-maximized`, `no_viewport=True`)
-  - чтение текущего экрана аналитики
-  - DOM-debug дампы для подбора селекторов
-  - скриншот + экспорт JSON/CSV в `exports`
-- Подготовительный config-driven слой:
+- РР·РѕР»РёСЂРѕРІР°РЅРЅР°СЏ СЃС‚СЂСѓРєС‚СѓСЂР° РґРёСЂРµРєС‚РѕСЂРёР№ РІРЅСѓС‚СЂРё `project`
+- Р‘Р°Р·РѕРІР°СЏ РєРѕРЅС„РёРіСѓСЂР°С†РёСЏ С‡РµСЂРµР· `.env`
+- РџСЂРѕРІРµСЂРєРё Р±РµР·РѕРїР°СЃРЅРѕСЃС‚Рё РїСѓС‚РµР№ (Р·Р°РїСЂРµС‚ РІС‹С…РѕРґР° Р·Р° РїСЂРµРґРµР»С‹ РїСЂРѕРµРєС‚Р°)
+- Р›РѕРіРёСЂРѕРІР°РЅРёРµ РІ РєРѕРЅСЃРѕР»СЊ Рё С„Р°Р№Р»
+- Browser read-only MVP РґР»СЏ amoCRM Р°РЅР°Р»РёС‚РёРєРё:
+  - Playwright-СЃРµСЃСЃРёСЏ СЃ `storage state`
+  - Р±РѕР»СЊС€РѕРµ РѕРєРЅРѕ Р±СЂР°СѓР·РµСЂР° РґР»СЏ СЃС‚Р°Р±РёР»СЊРЅРѕРіРѕ layout (`--start-maximized`, `no_viewport=True`)
+  - С‡С‚РµРЅРёРµ С‚РµРєСѓС‰РµРіРѕ СЌРєСЂР°РЅР° Р°РЅР°Р»РёС‚РёРєРё
+  - DOM-debug РґР°РјРїС‹ РґР»СЏ РїРѕРґР±РѕСЂР° СЃРµР»РµРєС‚РѕСЂРѕРІ
+  - СЃРєСЂРёРЅС€РѕС‚ + СЌРєСЃРїРѕСЂС‚ JSON/CSV РІ `exports`
+- РџРѕРґРіРѕС‚РѕРІРёС‚РµР»СЊРЅС‹Р№ config-driven СЃР»РѕР№:
   - `config/page_profiles.yaml`
   - `config/report_profiles.yaml`
   - `config/table_mappings.yaml`
   - `src/config_loader.py`
-- Постоянные правила агентной разработки в `AGENTS.md`
+- РџРѕСЃС‚РѕСЏРЅРЅС‹Рµ РїСЂР°РІРёР»Р° Р°РіРµРЅС‚РЅРѕР№ СЂР°Р·СЂР°Р±РѕС‚РєРё РІ `AGENTS.md`
 
-## Установка
+## РЈСЃС‚Р°РЅРѕРІРєР°
 
-1. Установить Python 3.11+.
-2. Создать и активировать виртуальное окружение.
-3. Установить зависимости:
+1. РЈСЃС‚Р°РЅРѕРІРёС‚СЊ Python 3.11+.
+2. РЎРѕР·РґР°С‚СЊ Рё Р°РєС‚РёРІРёСЂРѕРІР°С‚СЊ РІРёСЂС‚СѓР°Р»СЊРЅРѕРµ РѕРєСЂСѓР¶РµРЅРёРµ.
+3. РЈСЃС‚Р°РЅРѕРІРёС‚СЊ Р·Р°РІРёСЃРёРјРѕСЃС‚Рё:
    `pip install -r requirements.txt`
-4. Установить браузер для Playwright:
+4. РЈСЃС‚Р°РЅРѕРІРёС‚СЊ Р±СЂР°СѓР·РµСЂ РґР»СЏ Playwright:
    `python -m playwright install chromium`
-5. Скопировать `.env.example` в `.env` и заполнить значения, особенно:
+5. РЎРєРѕРїРёСЂРѕРІР°С‚СЊ `.env.example` РІ `.env` Рё Р·Р°РїРѕР»РЅРёС‚СЊ Р·РЅР°С‡РµРЅРёСЏ, РѕСЃРѕР±РµРЅРЅРѕ:
    - `AMO_BASE_URL`
    - `AMO_ANALYTICS_URL`
-   - `AMO_VIEWPORT_WIDTH` / `AMO_VIEWPORT_HEIGHT` (для headless режима)
+   - `AMO_VIEWPORT_WIDTH` / `AMO_VIEWPORT_HEIGHT` (РґР»СЏ headless СЂРµР¶РёРјР°)
 
-## Первый ручной запуск
+## РџРµСЂРІС‹Р№ СЂСѓС‡РЅРѕР№ Р·Р°РїСѓСЃРє
 
-1. В `.env` поставить `AMO_HEADLESS=false`.
-2. Запустить reader с ручной паузой:
+1. Р’ `.env` РїРѕСЃС‚Р°РІРёС‚СЊ `AMO_HEADLESS=false`.
+2. Р—Р°РїСѓСЃС‚РёС‚СЊ reader СЃ СЂСѓС‡РЅРѕР№ РїР°СѓР·РѕР№:
    `python -m src.run_read_analytics --source-kind tag --filter-id manual --tab-mode all --wait-for-enter`
-3. В окне браузера при необходимости войти в amoCRM.
-4. Открыть нужный экран аналитики.
-5. Выставить фильтры и вкладку вручную.
-6. Вернуться в терминал и нажать Enter.
-7. Reader считает текущий экран и сохранит screenshot + JSON/CSV.
+3. Р’ РѕРєРЅРµ Р±СЂР°СѓР·РµСЂР° РїСЂРё РЅРµРѕР±С…РѕРґРёРјРѕСЃС‚Рё РІРѕР№С‚Рё РІ amoCRM.
+4. РћС‚РєСЂС‹С‚СЊ РЅСѓР¶РЅС‹Р№ СЌРєСЂР°РЅ Р°РЅР°Р»РёС‚РёРєРё.
+5. Р’С‹СЃС‚Р°РІРёС‚СЊ С„РёР»СЊС‚СЂС‹ Рё РІРєР»Р°РґРєСѓ РІСЂСѓС‡РЅСѓСЋ.
+6. Р’РµСЂРЅСѓС‚СЊСЃСЏ РІ С‚РµСЂРјРёРЅР°Р» Рё РЅР°Р¶Р°С‚СЊ Enter.
+7. Reader СЃС‡РёС‚Р°РµС‚ С‚РµРєСѓС‰РёР№ СЌРєСЂР°РЅ Рё СЃРѕС…СЂР°РЅРёС‚ screenshot + JSON/CSV.
 
-## Ручной логин и ручная подготовка экрана
+## Р СѓС‡РЅРѕР№ Р»РѕРіРёРЅ Рё СЂСѓС‡РЅР°СЏ РїРѕРґРіРѕС‚РѕРІРєР° СЌРєСЂР°РЅР°
 
-Если не хотите, чтобы скрипт автоматически открывал `AMO_ANALYTICS_URL`, используйте `--skip-open`:
+Р•СЃР»Рё РЅРµ С…РѕС‚РёС‚Рµ, С‡С‚РѕР±С‹ СЃРєСЂРёРїС‚ Р°РІС‚РѕРјР°С‚РёС‡РµСЃРєРё РѕС‚РєСЂС‹РІР°Р» `AMO_ANALYTICS_URL`, РёСЃРїРѕР»СЊР·СѓР№С‚Рµ `--skip-open`:
 
 `python -m src.run_read_analytics --source-kind tag --filter-id manual --tab-mode all --skip-open --wait-for-enter`
 
-## Рекомендуемый практический режим (manual all-tab-modes)
+## Р РµРєРѕРјРµРЅРґСѓРµРјС‹Р№ РїСЂР°РєС‚РёС‡РµСЃРєРёР№ СЂРµР¶РёРј (manual all-tab-modes)
 
-Для ближайшей стабильной работы используйте полуавтоматический режим:
+Р”Р»СЏ Р±Р»РёР¶Р°Р№С€РµР№ СЃС‚Р°Р±РёР»СЊРЅРѕР№ СЂР°Р±РѕС‚С‹ РёСЃРїРѕР»СЊР·СѓР№С‚Рµ РїРѕР»СѓР°РІС‚РѕРјР°С‚РёС‡РµСЃРєРёР№ СЂРµР¶РёРј:
 
 `python -m src.run_read_analytics --source-kind tag --filter-id manual --skip-open --wait-for-enter --all-tab-modes-manual`
 
-Как это работает:
+РљР°Рє СЌС‚Рѕ СЂР°Р±РѕС‚Р°РµС‚:
 
-- после первого Enter reader читает текущий экран как `all` и сразу сохраняет export;
-- затем просит вручную переключить вкладку на `АКТИВНЫЕ` и нажать Enter;
-- читает `active` и сразу сохраняет export;
-- затем просит вручную переключить вкладку на `ЗАКРЫТЫЕ` и нажать Enter;
-- читает `closed` и сразу сохраняет export.
+- РїРѕСЃР»Рµ РїРµСЂРІРѕРіРѕ Enter reader С‡РёС‚Р°РµС‚ С‚РµРєСѓС‰РёР№ СЌРєСЂР°РЅ РєР°Рє `all` Рё СЃСЂР°Р·Сѓ СЃРѕС…СЂР°РЅСЏРµС‚ export;
+- Р·Р°С‚РµРј РїСЂРѕСЃРёС‚ РІСЂСѓС‡РЅСѓСЋ РїРµСЂРµРєР»СЋС‡РёС‚СЊ РІРєР»Р°РґРєСѓ РЅР° `РђРљРўРР’РќР«Р•` Рё РЅР°Р¶Р°С‚СЊ Enter;
+- С‡РёС‚Р°РµС‚ `active` Рё СЃСЂР°Р·Сѓ СЃРѕС…СЂР°РЅСЏРµС‚ export;
+- Р·Р°С‚РµРј РїСЂРѕСЃРёС‚ РІСЂСѓС‡РЅСѓСЋ РїРµСЂРµРєР»СЋС‡РёС‚СЊ РІРєР»Р°РґРєСѓ РЅР° `Р—РђРљР Р«РўР«Р•` Рё РЅР°Р¶Р°С‚СЊ Enter;
+- С‡РёС‚Р°РµС‚ `closed` Рё СЃСЂР°Р·Сѓ СЃРѕС…СЂР°РЅСЏРµС‚ export.
 
-В этом режиме нет автокликов по вкладкам, поэтому он надежнее как workaround, пока auto-switching еще дорабатывается.
+Р’ СЌС‚РѕРј СЂРµР¶РёРјРµ РЅРµС‚ Р°РІС‚РѕРєР»РёРєРѕРІ РїРѕ РІРєР»Р°РґРєР°Рј, РїРѕСЌС‚РѕРјСѓ РѕРЅ РЅР°РґРµР¶РЅРµРµ РєР°Рє workaround, РїРѕРєР° auto-switching РµС‰Рµ РґРѕСЂР°Р±Р°С‚С‹РІР°РµС‚СЃСЏ.
 
-## Profile-driven analytics flow (новый шаг)
+## Profile-driven analytics flow (РЅРѕРІС‹Р№ С€Р°Рі)
 
-Добавлен первый profile-driven режим:
+Р”РѕР±Р°РІР»РµРЅ РїРµСЂРІС‹Р№ profile-driven СЂРµР¶РёРј:
 
 `python -m src.run_profile_analytics --report-id analytics_tag_single_example`
 
-Что делает режим:
+Р§С‚Рѕ РґРµР»Р°РµС‚ СЂРµР¶РёРј:
 
-- загружает report profile из `config/report_profiles.yaml`;
-- открывает `analytics_sales` экран;
-- пытается открыть фильтр и выставить `filter_source` (`tag` или `utm_source`) + `filter_values`;
-- нажимает `Применить`;
-- запускает capture вкладок по URL `deals_type=all/active/closed`;
-- сохраняет JSON/CSV по каждой вкладке.
+- Р·Р°РіСЂСѓР¶Р°РµС‚ report profile РёР· `config/report_profiles.yaml`;
+- РѕС‚РєСЂС‹РІР°РµС‚ `analytics_sales` СЌРєСЂР°РЅ;
+- РїС‹С‚Р°РµС‚СЃСЏ РѕС‚РєСЂС‹С‚СЊ С„РёР»СЊС‚СЂ Рё РІС‹СЃС‚Р°РІРёС‚СЊ `filter_source` (`tag` РёР»Рё `utm_source`) + `filter_values`;
+- РЅР°Р¶РёРјР°РµС‚ `РџСЂРёРјРµРЅРёС‚СЊ`;
+- Р·Р°РїСѓСЃРєР°РµС‚ capture РІРєР»Р°РґРѕРє РїРѕ URL `deals_type=all/active/closed`;
+- СЃРѕС…СЂР°РЅСЏРµС‚ JSON/CSV РїРѕ РєР°Р¶РґРѕР№ РІРєР»Р°РґРєРµ.
 
-На этом этапе это первый шаг к полному automation flow: `profile -> filter -> all/active/closed capture`.
-Если automation фильтра не сработал из-за селекторов, смотрите debug screenshots в `workspace/screenshots` и debug dumps панели фильтра в `exports/debug/` (`*_filter_panel_visible_text_*.txt`, `*_filter_panel_selectors_*.json`).
+РќР° СЌС‚РѕРј СЌС‚Р°РїРµ СЌС‚Рѕ РїРµСЂРІС‹Р№ С€Р°Рі Рє РїРѕР»РЅРѕРјСѓ automation flow: `profile -> filter -> all/active/closed capture`.
+Р•СЃР»Рё automation С„РёР»СЊС‚СЂР° РЅРµ СЃСЂР°Р±РѕС‚Р°Р» РёР·-Р·Р° СЃРµР»РµРєС‚РѕСЂРѕРІ, СЃРјРѕС‚СЂРёС‚Рµ debug screenshots РІ `workspace/screenshots` Рё debug dumps РїР°РЅРµР»Рё С„РёР»СЊС‚СЂР° РІ `exports/debug/` (`*_filter_panel_visible_text_*.txt`, `*_filter_panel_selectors_*.json`).
 
-Дополнительно включен scroll-debug панели фильтра: создаются пошаговые файлы `*_filter_panel_scroll_step_XX.txt` и объединенный `*_filter_panel_scroll_merged.txt`, чтобы увидеть полный список фильтров после прокрутки.
-## Compile верхнего блока (первый writer шаг)
+Р”РѕРїРѕР»РЅРёС‚РµР»СЊРЅРѕ РІРєР»СЋС‡РµРЅ scroll-debug РїР°РЅРµР»Рё С„РёР»СЊС‚СЂР°: СЃРѕР·РґР°СЋС‚СЃСЏ РїРѕС€Р°РіРѕРІС‹Рµ С„Р°Р№Р»С‹ `*_filter_panel_scroll_step_XX.txt` Рё РѕР±СЉРµРґРёРЅРµРЅРЅС‹Р№ `*_filter_panel_scroll_merged.txt`, С‡С‚РѕР±С‹ СѓРІРёРґРµС‚СЊ РїРѕР»РЅС‹Р№ СЃРїРёСЃРѕРє С„РёР»СЊС‚СЂРѕРІ РїРѕСЃР»Рµ РїСЂРѕРєСЂСѓС‚РєРё.
+## Compile РІРµСЂС…РЅРµРіРѕ Р±Р»РѕРєР° (РїРµСЂРІС‹Р№ writer С€Р°Рі)
 
-После сбора трех JSON (`all/active/closed`) можно собрать готовый compiled CSV для верхнего блока:
+РџРѕСЃР»Рµ СЃР±РѕСЂР° С‚СЂРµС… JSON (`all/active/closed`) РјРѕР¶РЅРѕ СЃРѕР±СЂР°С‚СЊ РіРѕС‚РѕРІС‹Р№ compiled CSV РґР»СЏ РІРµСЂС…РЅРµРіРѕ Р±Р»РѕРєР°:
 
 `python -m src.run_compile_top_block`
 
-Что делает этот шаг:
+Р§С‚Рѕ РґРµР»Р°РµС‚ СЌС‚РѕС‚ С€Р°Рі:
 
-- читает snapshot JSON для `all`, `active`, `closed` (автоматически берет последние из `exports/`);
-- использует `top_cards` как основной источник;
-- формирует плоский CSV в `exports/compiled/`:
+- С‡РёС‚Р°РµС‚ snapshot JSON РґР»СЏ `all`, `active`, `closed` (Р°РІС‚РѕРјР°С‚РёС‡РµСЃРєРё Р±РµСЂРµС‚ РїРѕСЃР»РµРґРЅРёРµ РёР· `exports/`);
+- РёСЃРїРѕР»СЊР·СѓРµС‚ `top_cards` РєР°Рє РѕСЃРЅРѕРІРЅРѕР№ РёСЃС‚РѕС‡РЅРёРє;
+- С„РѕСЂРјРёСЂСѓРµС‚ РїР»РѕСЃРєРёР№ CSV РІ `exports/compiled/`:
   - `stage_name`
   - `all_count`
   - `active_count`
   - `closed_count`
-- если этап отсутствует в одной из вкладок, ставит `0`.
+- РµСЃР»Рё СЌС‚Р°Рї РѕС‚СЃСѓС‚СЃС‚РІСѓРµС‚ РІ РѕРґРЅРѕР№ РёР· РІРєР»Р°РґРѕРє, СЃС‚Р°РІРёС‚ `0`.
 
-Это промежуточный практический шаг перед записью в реальную таблицу (Google Sheets write пока не выполняется).
+Р­С‚Рѕ РїСЂРѕРјРµР¶СѓС‚РѕС‡РЅС‹Р№ РїСЂР°РєС‚РёС‡РµСЃРєРёР№ С€Р°Рі РїРµСЂРµРґ Р·Р°РїРёСЃСЊСЋ РІ СЂРµР°Р»СЊРЅСѓСЋ С‚Р°Р±Р»РёС†Сѓ (Google Sheets write РїРѕРєР° РЅРµ РІС‹РїРѕР»РЅСЏРµС‚СЃСЏ).
 
-## Авто-прогон всех вкладок (URL-based)
+## РђРІС‚Рѕ-РїСЂРѕРіРѕРЅ РІСЃРµС… РІРєР»Р°РґРѕРє (URL-based)
 
-Можно подготовить экран один раз вручную и запустить автоматическое переключение вкладок:
+РњРѕР¶РЅРѕ РїРѕРґРіРѕС‚РѕРІРёС‚СЊ СЌРєСЂР°РЅ РѕРґРёРЅ СЂР°Р· РІСЂСѓС‡РЅСѓСЋ Рё Р·Р°РїСѓСЃС‚РёС‚СЊ Р°РІС‚РѕРјР°С‚РёС‡РµСЃРєРѕРµ РїРµСЂРµРєР»СЋС‡РµРЅРёРµ РІРєР»Р°РґРѕРє:
 
 `python -m src.run_read_analytics --source-kind tag --filter-id manual --skip-open --wait-for-enter --all-tab-modes`
 
-В этом режиме reader переключает вкладки через URL-параметр `deals_type`, без UI-кликов по вкладкам:
+Р’ СЌС‚РѕРј СЂРµР¶РёРјРµ reader РїРµСЂРµРєР»СЋС‡Р°РµС‚ РІРєР»Р°РґРєРё С‡РµСЂРµР· URL-РїР°СЂР°РјРµС‚СЂ `deals_type`, Р±РµР· UI-РєР»РёРєРѕРІ РїРѕ РІРєР»Р°РґРєР°Рј:
 
 - `deals_type=all`
 - `deals_type=active`
 - `deals_type=closed`
 
-Каждая успешно прочитанная вкладка экспортируется сразу (JSON + CSV).
-Если чтение следующей вкладки не удалось, уже сохраненные файлы остаются в `exports/` и не теряются.
+РљР°Р¶РґР°СЏ СѓСЃРїРµС€РЅРѕ РїСЂРѕС‡РёС‚Р°РЅРЅР°СЏ РІРєР»Р°РґРєР° СЌРєСЃРїРѕСЂС‚РёСЂСѓРµС‚СЃСЏ СЃСЂР°Р·Сѓ (JSON + CSV).
+Р•СЃР»Рё С‡С‚РµРЅРёРµ СЃР»РµРґСѓСЋС‰РµР№ РІРєР»Р°РґРєРё РЅРµ СѓРґР°Р»РѕСЃСЊ, СѓР¶Рµ СЃРѕС…СЂР°РЅРµРЅРЅС‹Рµ С„Р°Р№Р»С‹ РѕСЃС‚Р°СЋС‚СЃСЏ РІ `exports/` Рё РЅРµ С‚РµСЂСЏСЋС‚СЃСЏ.
 
-`--all-tab-modes-manual` остается запасным режимом: пользователь вручную переключает вкладки и подтверждает шаги Enter.
+`--all-tab-modes-manual` РѕСЃС‚Р°РµС‚СЃСЏ Р·Р°РїР°СЃРЅС‹Рј СЂРµР¶РёРјРѕРј: РїРѕР»СЊР·РѕРІР°С‚РµР»СЊ РІСЂСѓС‡РЅСѓСЋ РїРµСЂРµРєР»СЋС‡Р°РµС‚ РІРєР»Р°РґРєРё Рё РїРѕРґС‚РІРµСЂР¶РґР°РµС‚ С€Р°РіРё Enter.
 
-## Расширяемая конфигурация
+## Р Р°СЃС€РёСЂСЏРµРјР°СЏ РєРѕРЅС„РёРіСѓСЂР°С†РёСЏ
 
-Идея простая:
+РРґРµСЏ РїСЂРѕСЃС‚Р°СЏ:
 
-- код = движок чтения/обработки;
-- config = что именно запускать и куда складывать результат.
+- РєРѕРґ = РґРІРёР¶РѕРє С‡С‚РµРЅРёСЏ/РѕР±СЂР°Р±РѕС‚РєРё;
+- config = С‡С‚Рѕ РёРјРµРЅРЅРѕ Р·Р°РїСѓСЃРєР°С‚СЊ Рё РєСѓРґР° СЃРєР»Р°РґС‹РІР°С‚СЊ СЂРµР·СѓР»СЊС‚Р°С‚.
 
-Для ручного редактирования используются YAML-файлы в `config/`:
+Р”Р»СЏ СЂСѓС‡РЅРѕРіРѕ СЂРµРґР°РєС‚РёСЂРѕРІР°РЅРёСЏ РёСЃРїРѕР»СЊР·СѓСЋС‚СЃСЏ YAML-С„Р°Р№Р»С‹ РІ `config/`:
 
-- `page_profiles.yaml` — какие типы страниц amoCRM есть в проекте;
-- `report_profiles.yaml` — какие отчеты запускать, с какими фильтрами/вкладками/источниками;
-- `table_mappings.yaml` — куда писать результат (целевые блоки/режимы записи) на следующих этапах.
+- `page_profiles.yaml` вЂ” РєР°РєРёРµ С‚РёРїС‹ СЃС‚СЂР°РЅРёС† amoCRM РµСЃС‚СЊ РІ РїСЂРѕРµРєС‚Рµ;
+- `report_profiles.yaml` вЂ” РєР°РєРёРµ РѕС‚С‡РµС‚С‹ Р·Р°РїСѓСЃРєР°С‚СЊ, СЃ РєР°РєРёРјРё С„РёР»СЊС‚СЂР°РјРё/РІРєР»Р°РґРєР°РјРё/РёСЃС‚РѕС‡РЅРёРєР°РјРё;
+- `table_mappings.yaml` вЂ” РєСѓРґР° РїРёСЃР°С‚СЊ СЂРµР·СѓР»СЊС‚Р°С‚ (С†РµР»РµРІС‹Рµ Р±Р»РѕРєРё/СЂРµР¶РёРјС‹ Р·Р°РїРёСЃРё) РЅР° СЃР»РµРґСѓСЋС‰РёС… СЌС‚Р°РїР°С….
 
-В будущем новые теги, новые отчеты, новые страницы amoCRM (`analytics`, `deals`, `events`) можно будет добавлять через config без переписывания ядра.
+Р’ Р±СѓРґСѓС‰РµРј РЅРѕРІС‹Рµ С‚РµРіРё, РЅРѕРІС‹Рµ РѕС‚С‡РµС‚С‹, РЅРѕРІС‹Рµ СЃС‚СЂР°РЅРёС†С‹ amoCRM (`analytics`, `deals`, `events`) РјРѕР¶РЅРѕ Р±СѓРґРµС‚ РґРѕР±Р°РІР»СЏС‚СЊ С‡РµСЂРµР· config Р±РµР· РїРµСЂРµРїРёСЃС‹РІР°РЅРёСЏ СЏРґСЂР°.
 
-## Важно про ограничения MVP
+## Р’Р°Р¶РЅРѕ РїСЂРѕ РѕРіСЂР°РЅРёС‡РµРЅРёСЏ MVP
 
-- Read-only поведение: никаких действий `save/submit/delete`.
-- На этом шаге фильтры выставляются вручную в amoCRM UI.
+- Read-only РїРѕРІРµРґРµРЅРёРµ: РЅРёРєР°РєРёС… РґРµР№СЃС‚РІРёР№ `save/submit/delete`.
+- РќР° СЌС‚РѕРј С€Р°РіРµ С„РёР»СЊС‚СЂС‹ РІС‹СЃС‚Р°РІР»СЏСЋС‚СЃСЏ РІСЂСѓС‡РЅСѓСЋ РІ amoCRM UI.
 
 
 
@@ -467,3 +543,126 @@ Success confirmation for apply uses existing runtime signals:
 - Removed placeholder/mojibake-style `????????` value from `config/report_profiles.yaml` (`analytics_tag_layout_example`).
 - Current profile config should no longer emit `suspicious_entries=['????????']` warning from config loader.
 - Added regression test to guard report profile config against `???` placeholders.
+
+## Batch DSL Execution Update (2026-04-10)
+
+- Fixed batch scenario execution regression where `AnalyticsFlow` missed `_choose_option_text`.
+- `utm_source^=` is now propagated as primary operator in scenario execution and routed through `utm_prefix` handler in browser flow.
+- Non-primary filters in batch execution (`pipeline`, `date`, `manager`, secondary `tag`) are now strict:
+  - if handler apply fails, scenario fails with controlled error (`Scenario filter apply failed: field=...`).
+- Unsupported DSL fields now fail explicitly with controlled error (`Unsupported DSL filter for scenario execution: field=...`).
+
+This removes silent/partial filter application in batch mode.
+
+## Pipeline Batch Diagnostics (2026-04-10)
+
+- Pipeline handler now uses row-scoped deterministic selection with explicit diagnostics.
+- On failure, diagnostics include:
+  - row container payload,
+  - click target payload,
+  - visible option texts,
+  - option nodes count/payload,
+  - selected value reflection status,
+  - panel apply-button state.
+- Batch scenario remains strict: pipeline apply failure causes controlled scenario failure.
+
+
+
+## Weekly Refusals MVP (Events List)
+
+Added separate runtime path for `source.page_type=events_list`.
+
+- Browser flow: `src/browser/events_flow.py`
+- Parser: `src/parsers/weekly_refusals_parser.py`
+- Writer: `src/writers/weekly_refusals_block_writer.py`
+
+This flow is independent from `analytics_sales` and does not reuse top-block parser logic.
+
+### Profiles
+- `weekly_refusals_weekly_2m`
+- `weekly_refusals_weekly_long`
+- `weekly_refusals_cumulative_2m`
+- `weekly_refusals_cumulative_long`
+
+### Dry-run command
+```bash
+python -m src.run_profile_analytics --report-id weekly_refusals_weekly_2m --writer-layout-api-dry-run --browser-backend openclaw_cdp
+```
+
+### Runtime command
+```bash
+python -m src.run_profile_analytics --report-id weekly_refusals_weekly_2m --browser-backend openclaw_cdp
+```
+
+Artifacts:
+- `exports/compiled/weekly_refusals_<report_id>_<timestamp>.json`
+- `exports/debug/weekly_refusals_write_summary_<timestamp>.json`
+
+## Weekly Refusals Profile IDs (Source of Truth)
+
+Use these real report IDs:
+- `weekly_refusals_weekly_2m`
+- `weekly_refusals_weekly_long`
+- `weekly_refusals_cumulative_2m`
+- `weekly_refusals_cumulative_long`
+- `weekly_refusals_example` (alias/smoke profile, equivalent to `weekly_refusals_weekly_2m`)
+
+### Smoke Dry-run
+```bash
+python -m src.run_profile_analytics --report-id weekly_refusals_example --writer-layout-api-dry-run --browser-backend openclaw_cdp --tag-selection-mode script
+```
+
+## Weekly Refusals: `event_type` Search Control Notes
+
+- amoCRM field `Типы событий` is rendered as `checkboxes-search` (not standard select/dropdown).
+- Valid scope can be the control root itself (`filter__custom_settings__item checkboxes-search js-control-checkboxes-search`).
+- Primary search-kind selectors:
+  - open/check state: `.checkboxes-search__opening-list`, `.checkboxes-search__search-input`, `.checkboxes-search__section-common`, `.checkboxes-search__item-label`, `input[type='checkbox'][data-value]`
+  - option resolve: `.checkboxes-search__item-label:has-text(...)`, `label:has(input[data-value='...'])`, `input[type='checkbox'][data-value='...']`
+  - apply: `.js-checkboxes-search-list-apply` (including `.checkboxes-search__buttons-wrapper .button-input`) and `OK/ОК` variants.
+- Do not use page-wide `label/li/input[type='checkbox']` for this stage: it can click left preset panel instead of opened `Типы событий` widget.
+- On failure, inspect `exports/debug/weekly_refusals_event_type_search_failed_<timestamp>.*`.
+- Focus on JSON field `checkbox_search_debug_snapshot` (`active_element`, `control_scope_elements`, `ok_buttons`, `event_type_text_elements`).
+
+
+## Update (2026-04-15): Anchor-Only Layout Writing + Skip Contract
+
+### Analytics Layout Writer
+- Block positioning uses discovered DSL/block/header anchors only.
+- Runtime no longer hard-fails whole run when one block anchor is missing.
+- Missing block behavior: `skipped` with detailed log (`block_name`, `aliases`, `reason`, debug dump/screenshot paths).
+- If some blocks are found, they are processed independently.
+- `start_cell` is not used as operational positioning source for `google_sheets_layout_ui`.
+
+### Weekly Refusals Writer
+- Anchor-based section discovery remains primary path.
+- `allow_start_cell_fallback` still controls emergency fallback (default false for weekly blocks).
+- If anchor is missing and fallback is disabled, writer emits explicit anchor diagnostics.
+
+### Weekly Period Runtime Modes
+Config/runtime now supports:
+- `current_week`
+- `previous_week`
+- `auto_weekly` (mapped to monday-current-else-previous)
+- `manual_range`
+
+CLI overrides for weekly runs:
+- `--weekly-period-strategy`
+- `--weekly-period-mode`
+- `--weekly-date-from`
+- `--weekly-date-to`
+
+### DSL Filter Support Boundary
+Current scenario execution supports:
+- `tags`
+- `utm_source` (`=` and `^=`)
+- `pipeline`
+- `period`
+- `dates_mode`
+- `date_from`
+- `date_to`
+- `manager`
+
+Unsupported DSL fields are now logged explicitly as:
+`unsupported dsl filter field: ...`
+(ignored for execution, not silently hidden).

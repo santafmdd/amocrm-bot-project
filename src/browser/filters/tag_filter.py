@@ -585,6 +585,8 @@ class TagFilterHandler:
 
     def apply(self, flow: Any, page: Page, report_id: str, values: list[str], operator: str = "=") -> bool:
         panel = flow._find_filter_panel_container(page)
+        # We select each provided tag value as a chip in the same widget.
+        # OR/AND semantics are not explicitly controlled here and follow amoCRM filter behavior.
         return apply_tag_values_via_holder_popup(flow, page=page, panel=panel, report_id=report_id, values=values)
 
     def verify(self, flow: Any, page: Page, report_id: str, values: list[str], operator: str = "=") -> bool:

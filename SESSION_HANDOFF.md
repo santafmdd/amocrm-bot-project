@@ -1,3 +1,69 @@
+## Update (2026-04-13): Weekly Refusals Search-Kind Filter Contract
+
+- `Типы событий` uses `checkboxes-search` widget.
+- For search-kind, valid scope may be control self-root (`control_self_scope`), not only descendant node.
+- Search-kind core selectors:
+  - open-state: `.checkboxes-search__opening-list`, `.checkboxes-search__search-input`, `.checkboxes-search__section-common`, `.checkboxes-search__item-label`, `input[type='checkbox'][data-value]`
+  - option pick: `.checkboxes-search__item-label:has-text(...)`, `input[data-value='...']` + nearest label container
+  - apply: `.js-checkboxes-search-list-apply` / `.checkboxes-search__buttons-wrapper .button-input` / `OK/ОК`
+- Page-wide generic `label/checkbox` picking is unsafe for `event_type` (can hit left preset list).
+- Search-failure debug artifacts: `weekly_refusals_event_type_search_failed_<ts>.*` with fields `control_class`, `scope_reason`, `checkbox_kind`, `scoped_visible_texts`, `search_root_detected`, `checkbox_search_debug_snapshot`.
+
+
+## Update (2026-04-13): Weekly Refusals Search Widget Scope Fix
+
+- `entity` stage remains passing.
+- `event_type` blocker focus moved to `checkboxes-search` open/scope detection mismatch.
+- Implemented search-specific scope/open improvements:
+  - search scope can now resolve to control self-root (`control_self_scope`) when root classes indicate `checkboxes-search`.
+  - open-state checks now support scoped selectors for `checkboxes-search` internals.
+  - option resolution now prioritizes `checkboxes-search__item-label` and `input[data-value]` paths.
+  - search apply supports `js-checkboxes-search-list-apply` (including div-based button-like elements).
+- Added diagnostics fields on search failures: `control_class`, `scope_reason`, `checkbox_kind`, `scoped_visible_texts`, `search_root_detected`.
+
+## Update (2026-04-13): Weekly Refusals Event Type Search Diagnostics
+
+- `entity` stage currently passes on runtime.
+- Current blocker remains `event_type` (`kind=search`) when popup-open detection returns `popup_opened=false`.
+- Added targeted diagnostics for search-widget fail-path (`checkbox_popup_not_opened`):
+  - `document.activeElement` metadata,
+  - visible checkbox/search/dropdown class elements,
+  - visible `OK/ОК` buttons,
+  - visible elements containing event-type texts (`????????? ????? ???????`, `????? ??????`, `?????? ???????`),
+  - outerHTML snippets + class + text + bbox.
+- Next step: compare captured live DOM snapshot for `Типы событий` popup and align open/wait selectors to that shape.
+
+## Update (2026-04-13): Weekly Refusals Entity Regression After Checkbox Refactor
+
+- Runtime regression was confirmed again on `entity` (`??? ????????`) after generalized checkbox changes:
+  - option click succeeds (`??????`),
+  - strict immediate option re-check may fail (`found=false`) due to DOM rerender/collapse,
+  - stage failed too early.
+- Checkbox-like controls are now treated with explicit contracts:
+  - `dropdown` (`checkboxes_dropdown`) uses resilient verification (option state OR reflected control/input/chip OR checked snapshot, optional one-time reopen-check).
+  - `search` (`checkboxes-search`) keeps scoped selection and now finalizes via explicit `OK` click before close.
+- Weekly refusals remains on real `ui_controls` path (no forced preset fallback).
+- Next runtime chain after restoring stable entity/event_type: `pipeline -> status_before -> status_after -> apply -> parse rows`.
+
+## Update (2026-04-13): Weekly Refusals Event Type (`checkboxes-search`)
+
+- Entity stage (`??? ????????`) is stable via checkbox UI path.
+- Current blocker moved to `event_type` because `Типы событий` uses `checkboxes-search` widget, not `checkboxes_dropdown`.
+- Added generalized checkbox-like control handling with explicit kinds:
+  - `dropdown` (`checkboxes_dropdown`)
+  - `search` (`checkboxes-search`)
+- `checkboxes-search` now uses scoped selection/verification container; full-page option clicking is rejected for this path.
+- Saved preset remains optional only; weekly flow continues with real `ui_controls` path.
+- Next runtime chain after event_type: `pipeline -> status_before -> status_after -> apply -> parse rows`.
+
+## Update (2026-04-13): Weekly Refusals Checkbox Verification Contract
+
+- Runtime blocker moved from checkbox open to post-select verification (`??? ???????? -> ??????`).
+- Checkbox path now verifies selected state while dropdown is still open (checked/aria/class/data markers).
+- For checkbox controls, primary success is selected-state in dropdown; control text reflection after `Escape` is secondary.
+- Weekly profiles keep `filter_mode=ui_controls` as primary path; saved preset routing remains optional and is not promoted as default.
+- Next runtime target chain remains: `event_type -> pipeline -> status_before -> status_after -> apply -> parse rows`.
+
 ## Update (2026-04-13): Weekly Refusals Checkbox Dropdown Pragmatic Fix
 
 - Blocker moved from panel-open to entity selector apply (`??? ???????? -> ??????`) in amoCRM `checkboxes_dropdown` widget.
@@ -37,7 +103,7 @@
 - `events/list` filter opener remains fixed; current blocker moved into control resolution inside opened panel.
 - Fixed overmatch path in `EventsFlow._apply_control_values(...)`: no blind first-match from broad `*:has-text(...)`.
 - Added `_resolve_filter_control(panel, control_label)` with candidate ranking and control-container promotion.
-- Added popup confirmation support for multi-select controls with `OK/??` buttons.
+- Added popup confirmation support for multi-select controls with `OK/ОК` buttons.
 - Added/updated diagnostics per stage (`entity/event_type/status_before/status_after/apply`) via `weekly_refusals_<stage>_failed_<ts>.*` artifacts.
 - Weekly period strategy is now explicit:
   - Sunday -> `?? ??? ??????`
@@ -706,7 +772,7 @@ with checked selectors, candidate payloads, marker visibility, URL and explanati
 - Events/list opener remained fixed; next blocker was control mapping in panel filters before apply.
 - Weekly refusals events flow now uses control-specific selection (not generic text input) for:
   - `??? ????????`
-  - `???? ???????`
+  - `Типы событий`
   - `???????`
   - `???????? ??` (multi-select)
   - `???????? ?????`
@@ -724,3 +790,27 @@ with checked selectors, candidate payloads, marker visibility, URL and explanati
   - `weekly_refusals_event_type_failed_<ts>.*`
   - `weekly_refusals_status_before_failed_<ts>.*`
   - `weekly_refusals_apply_failed_<ts>.*`
+
+## Update (2026-04-15): Runtime Contracts
+
+### Anchor-only writing (analytics layout)
+- `google_sheets_layout_ui_writer` now skips missing blocks instead of aborting full run.
+- Skip log includes block name, aliases, reason, and debug artifact paths.
+- Each block is processed independently.
+- `start_cell` is not used as operational block resolver for analytics layout writer.
+
+### Weekly refusals period control
+Runtime options were centralized and can be overridden without code edits:
+- `--weekly-period-strategy`
+- `--weekly-period-mode`
+- `--weekly-date-from`
+- `--weekly-date-to`
+
+Supported strategies:
+- `current_week`, `previous_week`, `auto_weekly`, `monday_current_else_previous`, `manual_range`.
+
+### Scenario DSL filters (current boundary)
+Supported fields:
+`tags`, `utm_source`, `pipeline`, `period`, `dates_mode`, `date_from`, `date_to`, `manager`.
+
+Unknown fields are logged as explicit warnings (`unsupported dsl filter field`) and do not fail silently.

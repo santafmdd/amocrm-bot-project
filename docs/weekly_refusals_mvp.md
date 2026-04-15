@@ -1,0 +1,73 @@
+﻿# Weekly Refusals MVP
+
+## Scope
+- Separate flow from `analytics_sales`: uses amoCRM **Events list** (`events_list` page type).
+- No AI at this stage.
+- Goal: deterministic capture + structured dataset + aggregated refusal tables.
+
+## Runtime Flow
+1. Open `events/list` page.
+2. Open filter panel.
+3. Apply filters:
+   - date mode / period (or custom from-to)
+   - managers empty
+   - entity kind
+   - event type
+   - pipeline
+   - status before
+   - status after (`Закрыто и не реализовано`)
+4. Read event table rows.
+5. Parse and aggregate:
+   - counts by `status_before`
+   - counts by `status_after`
+   - preserve `deal_id` / `deal_url`
+6. Save compiled artifact in `exports/compiled/weekly_refusals_<report_id>_<ts>.json`.
+7. Write block through API writer (`src/writers/weekly_refusals_block_writer.py`) or dry-run plan only.
+
+## Profiles
+MVP includes 4 independent report profiles:
+- `weekly_refusals_weekly_2m`
+- `weekly_refusals_weekly_long`
+- `weekly_refusals_cumulative_2m`
+- `weekly_refusals_cumulative_long`
+
+`cumulative` is recalculated from source range each run (no additive merge with old sheet values).
+
+## Dry-run
+Use `--writer-layout-api-dry-run` or `--writer-layout-dry-run` with these profiles to prevent sheet updates while keeping capture + artifacts.
+
+## Current Limitations
+- UI selectors for events list are deterministic MVP-level and may require selector tuning per amoCRM UI changes.
+- No AI deal analysis yet.
+- No deep card crawling yet.
+
+## Report IDs (Current)
+
+Weekly refusals profiles available now:
+- `weekly_refusals_weekly_2m`
+- `weekly_refusals_weekly_long`
+- `weekly_refusals_cumulative_2m`
+- `weekly_refusals_cumulative_long`
+- `weekly_refusals_example` (alias for smoke validation; same routing as weekly_2m)
+
+### Smoke Dry-run Command
+```bash
+python -m src.run_profile_analytics --report-id weekly_refusals_example --writer-layout-api-dry-run --browser-backend openclaw_cdp --tag-selection-mode script
+```
+
+## Update (2026-04-15): Weekly Period Modes
+
+Weekly refusals runtime period can now be controlled by config or CLI without code edits.
+
+Config-level strategy (`filters.period_strategy`):
+- `current_week`
+- `previous_week`
+- `auto_weekly`
+- `monday_current_else_previous`
+- `manual_range`
+
+CLI overrides (current run only):
+- `--weekly-period-strategy`
+- `--weekly-period-mode`
+- `--weekly-date-from`
+- `--weekly-date-to`

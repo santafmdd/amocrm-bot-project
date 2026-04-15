@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,29 @@ from src.writers.layout_dsl_routing import execution_input_to_dict, parse_dsl_ex
 from src.writers.models import WriterDestinationConfig
 from src.parsers.weekly_refusals_parser import parse_weekly_refusals_rows
 from src.writers.weekly_refusals_block_writer import WeeklyRefusalsBlockWriter
+
+@dataclass(frozen=True)
+class RuntimeOptions:
+    google_auth_mode: str
+    weekly_period_strategy_override: str | None = None
+    weekly_period_mode_override: str | None = None
+    weekly_date_from_override: str | None = None
+    weekly_date_to_override: str | None = None
+
+
+def _clean_optional_text(value: str | None) -> str | None:
+    raw = str(value or "").strip()
+    return raw or None
+
+
+def _build_runtime_options(args: argparse.Namespace, effective_google_auth_mode: str) -> RuntimeOptions:
+    return RuntimeOptions(
+        google_auth_mode=effective_google_auth_mode,
+        weekly_period_strategy_override=_clean_optional_text(getattr(args, "weekly_period_strategy", None)),
+        weekly_period_mode_override=_clean_optional_text(getattr(args, "weekly_period_mode", None)),
+        weekly_date_from_override=_clean_optional_text(getattr(args, "weekly_date_from", None)),
+        weekly_date_to_override=_clean_optional_text(getattr(args, "weekly_date_to", None)),
+    )
 
 def _as_bool(value: Any) -> bool:
     if isinstance(value, bool):
@@ -239,6 +263,27 @@ def _build_parser() -> argparse.ArgumentParser:
             "Writer destination remains report.output.target_id."
         ),
     )
+    parser.add_argument(
+        "--weekly-period-strategy",
+        choices=["current_week", "previous_week", "auto_weekly", "monday_current_else_previous", "manual_range"],
+        default=None,
+        help="Override weekly refusals period strategy for this run.",
+    )
+    parser.add_argument(
+        "--weekly-period-mode",
+        default=None,
+        help="Direct period mode override for weekly refusals (for manual_range/runtime experiments).",
+    )
+    parser.add_argument(
+        "--weekly-date-from",
+        default=None,
+        help="Override weekly refusals date_from for current run.",
+    )
+    parser.add_argument(
+        "--weekly-date-to",
+        default=None,
+        help="Override weekly refusals date_to for current run.",
+    )
     return parser
 
 
@@ -435,9 +480,10 @@ def _resolve_weekly_period_mode(current_date: date | None = None) -> str:
     return "\u0417\u0430 \u044d\u0442\u0443 \u043d\u0435\u0434\u0435\u043b\u044e" if day.weekday() == 0 else "\u0417\u0430 \u043f\u0440\u043e\u0448\u043b\u0443\u044e \u043d\u0435\u0434\u0435\u043b\u044e"
 
 
-def _build_weekly_refusals_flow_input(report) -> EventsFlowInput:
+def _build_weekly_refusals_flow_input(report, runtime_options: RuntimeOptions | None = None) -> EventsFlowInput:
     filters = dict(getattr(report, "filters", {}) or {})
     date_cfg = dict(filters.get("date", {}) or {})
+    options = runtime_options or RuntimeOptions(google_auth_mode="auto")
 
     pipeline_name = str(filters.get("pipeline", "")).strip()
     if not pipeline_name:
@@ -449,9 +495,9 @@ def _build_weekly_refusals_flow_input(report) -> EventsFlowInput:
     status_before_values = [str(v).strip() for v in (status_before_values_raw or []) if str(v).strip()]
 
     date_mode = str(filters.get("date_mode", date_cfg.get("mode", "\u0421\u043e\u0437\u0434\u0430\u043d\u044b"))).strip() or "\u0421\u043e\u0437\u0434\u0430\u043d\u044b"
-    period_strategy_raw = str(filters.get("period_strategy", "monday_current_else_previous")).strip() or "monday_current_else_previous"
+    period_strategy_raw = str(options.weekly_period_strategy_override or filters.get("period_strategy", "monday_current_else_previous")).strip() or "monday_current_else_previous"
 
-    explicit_period_override = str(filters.get("period_mode_override", "")).strip()
+    explicit_period_override = str(options.weekly_period_mode_override or filters.get("period_mode_override", "")).strip()
     configured_period_mode = str(filters.get("period_mode", date_cfg.get("period", ""))).strip()
     mode = str(filters.get("mode", "")).strip().lower()
 
@@ -489,8 +535,8 @@ def _build_weekly_refusals_flow_input(report) -> EventsFlowInput:
             period_strategy_resolved = "profile_config"
             period_resolution = "profile_config"
 
-    date_from = str(filters.get("date_from", date_cfg.get("from", ""))).strip()
-    date_to = str(filters.get("date_to", date_cfg.get("to", ""))).strip()
+    date_from = str(options.weekly_date_from_override or filters.get("date_from", date_cfg.get("from", ""))).strip()
+    date_to = str(options.weekly_date_to_override or filters.get("date_to", date_cfg.get("to", ""))).strip()
 
     entity_kind = str(filters.get("entity_kind", "\u0421\u0434\u0435\u043b\u043a\u0438")).strip() or "\u0421\u0434\u0435\u043b\u043a\u0438"
     event_type = str(filters.get("event_type", "\u0418\u0437\u043c\u0435\u043d\u0435\u043d\u0438\u0435 \u044d\u0442\u0430\u043f\u0430 \u043f\u0440\u043e\u0434\u0430\u0436\u0438")).strip() or "\u0418\u0437\u043c\u0435\u043d\u0435\u043d\u0438\u0435 \u044d\u0442\u0430\u043f\u0430 \u043f\u0440\u043e\u0434\u0430\u0436\u0438"
@@ -531,10 +577,11 @@ def _run_weekly_refusals_profile(
     destination: WriterDestinationConfig,
     wait_for_enter: bool,
     weekly_dry_run: bool,
+    runtime_options: RuntimeOptions | None = None,
 ) -> None:
     logger.info("weekly refusals flow started: report_id=%s", report.id)
     logger.info("weekly_refusals_runner_version=parsed_to_dict_fix_v1")
-    flow_input = _build_weekly_refusals_flow_input(report)
+    flow_input = _build_weekly_refusals_flow_input(report, runtime_options=runtime_options)
     strategy_parts = str(flow_input.period_strategy or "").split("|")
     strategy_raw = ""
     strategy_resolved = ""
@@ -587,18 +634,25 @@ def _run_weekly_refusals_profile(
         exports_dir=config.exports_dir,
         logger=logger,
     )
-    write_result = writer.write_block(
-        destination=destination,
-        parsed_result=parsed_payload,
-        dry_run=bool(weekly_dry_run),
-    )
-    logger.info(
-        "weekly refusals write result: dry_run=%s planned_updates=%s updated_cells=%s summary=%s",
-        str(write_result.dry_run).lower(),
-        write_result.planned_updates,
-        write_result.updated_cells,
-        write_result.summary_path,
-    )
+    try:
+        write_result = writer.write_block(
+            destination=destination,
+            parsed_result=parsed_payload,
+            dry_run=bool(weekly_dry_run),
+        )
+        logger.info(
+            "weekly refusals write result: dry_run=%s planned_updates=%s updated_cells=%s summary=%s",
+            str(write_result.dry_run).lower(),
+            write_result.planned_updates,
+            write_result.updated_cells,
+            write_result.summary_path,
+        )
+    except RuntimeError as exc:
+        message = str(exc)
+        if "Weekly refusals anchor not found" in message:
+            logger.error("weekly refusals block skipped: report_id=%s reason=%s", report.id, message)
+            return
+        raise
 
 
 def _resolve_source_and_values(filters: dict[str, object]) -> tuple[SourceKind, list[str]]:
@@ -1201,6 +1255,7 @@ def main() -> None:
     args = parser.parse_args()
 
     effective_google_auth_mode = _apply_google_auth_mode_override(args.google_auth_mode)
+    runtime_options = _build_runtime_options(args, effective_google_auth_mode)
 
     config = load_config()
     ensure_inside_root(Path(os.getcwd()), config.project_root)
@@ -1208,6 +1263,7 @@ def main() -> None:
 
     logger = setup_logging(config.logs_dir, level=os.getenv("LOG_LEVEL", "INFO"))
     logger.info("google_auth_mode_effective=%s", effective_google_auth_mode)
+    logger.info("runtime_options=%s", runtime_options)
     settings = load_browser_settings(config, browser_backend_override=args.browser_backend)
 
     report_profiles = load_report_profiles(config)
@@ -1229,6 +1285,7 @@ def main() -> None:
             destination=destination,
             wait_for_enter=bool(args.wait_for_enter),
             weekly_dry_run=bool(args.writer_layout_api_dry_run or args.writer_layout_dry_run),
+            runtime_options=runtime_options,
         )
         return
 

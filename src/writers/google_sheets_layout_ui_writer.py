@@ -1,4 +1,4 @@
-"""Google Sheets layout writer (anchor-based, formatting-safe numeric updates)."""
+﻿"""Google Sheets layout writer (anchor-based, formatting-safe numeric updates)."""
 
 from __future__ import annotations
 
@@ -28,10 +28,10 @@ from src.writers.models import CompiledProfileAnalyticsResult, WriterDestination
 
 
 DEFAULT_HEADER_ALIASES = {
-    "stage": ["этап", "статус"],
-    "all": ["все", "все (шт)", "все шт", "все, шт", "все (кол-во)"],
-    "active": ["активные", "активные (шт)", "активные шт"],
-    "closed": ["закрытые", "закрытые (шт)", "закрытые шт"],
+    "stage": ["СЌС‚Р°Рї", "СЃС‚Р°С‚СѓСЃ"],
+    "all": ["РІСЃРµ", "РІСЃРµ (С€С‚)", "РІСЃРµ С€С‚", "РІСЃРµ, С€С‚", "РІСЃРµ (РєРѕР»-РІРѕ)"],
+    "active": ["Р°РєС‚РёРІРЅС‹Рµ", "Р°РєС‚РёРІРЅС‹Рµ (С€С‚)", "Р°РєС‚РёРІРЅС‹Рµ С€С‚"],
+    "closed": ["Р·Р°РєСЂС‹С‚С‹Рµ", "Р·Р°РєСЂС‹С‚С‹Рµ (С€С‚)", "Р·Р°РєСЂС‹С‚С‹Рµ С€С‚"],
 }
 
 
@@ -174,6 +174,7 @@ class GoogleSheetsUILayoutWriter:
         writes: dict[str, int] = {}
         missing: list[str] = []
         used_anchor_keys: set[tuple[int, int]] = set()
+        skipped_blocks: list[dict[str, Any]] = []
 
         for block_name, aliases in block_aliases.items():
             if "docs.google.com/spreadsheets" not in str(page.url).lower():
@@ -191,11 +192,34 @@ class GoogleSheetsUILayoutWriter:
                 used_anchor_keys=used_anchor_keys,
             )
             if anchor is None:
-                dump_path = self._dump_visible_text(page, prefix=f"layout_block_not_found_{block_name}")
-                screenshot = self.raw_helper._save_debug_screenshot(page, prefix=f"layout_block_not_found_{block_name}")
-                raise RuntimeError(
-                    f"Layout block not found: {block_name}. aliases={aliases}. dump={dump_path} screenshot={screenshot}"
+                dump_path = ""
+                screenshot = ""
+                try:
+                    dump_path = str(self._dump_visible_text(page, prefix=f"layout_block_not_found_{block_name}"))
+                except Exception as exc:
+                    self.logger.warning("layout block not-found text dump failed: block=%s error=%s", block_name, exc)
+                try:
+                    screenshot = str(self.raw_helper._save_debug_screenshot(page, prefix=f"layout_block_not_found_{block_name}"))
+                except Exception as exc:
+                    self.logger.warning("layout block not-found screenshot failed: block=%s error=%s", block_name, exc)
+
+                reason = "block_anchor_not_found"
+                skipped_blocks.append({
+                    "block_name": block_name,
+                    "aliases": list(aliases),
+                    "reason": reason,
+                    "dump_path": dump_path,
+                    "screenshot": screenshot,
+                })
+                self.logger.warning(
+                    "layout block skipped: block=%s aliases=%s reason=%s dump=%s screenshot=%s",
+                    block_name,
+                    aliases,
+                    reason,
+                    dump_path or "<none>",
+                    screenshot or "<none>",
                 )
+                continue
 
             self.logger.info(
                 "layout block found: block=%s title_cell=%s title=%s",
@@ -267,6 +291,8 @@ class GoogleSheetsUILayoutWriter:
         self.logger.info("layout planned writes sample: %s", list(writes.items())[:20])
         if missing:
             self.logger.warning("layout missing stages: %s", sorted(set(missing)))
+        if skipped_blocks:
+            self.logger.warning("layout skipped blocks count=%s details=%s", len(skipped_blocks), skipped_blocks)
 
         self.logger.info(
             "bounded scan finished: total_cell_reads=%s total_goto_cell_calls=%s hard_limit=%s limit_hit=%s source_snapshot=%s source_formula_reads=%s source_dom_fallback_reads=%s",
@@ -281,6 +307,10 @@ class GoogleSheetsUILayoutWriter:
 
         if dry_run:
             self.logger.info("layout dry-run mode: no sheet write performed")
+            return
+
+        if not writes:
+            self.logger.warning("layout writer: no writes planned; all blocks were skipped or no stage rows matched")
             return
 
         for cell_ref, value in writes.items():
@@ -603,10 +633,21 @@ class GoogleSheetsUILayoutWriter:
     def _resolve_block_aliases(self, compiled: CompiledProfileAnalyticsResult, layout: dict[str, Any]) -> dict[str, list[str]]:
         block_aliases: dict[str, list[str]] = {}
 
-        specific_aliases = [str(v).strip() for v in layout.get("tag_block_aliases", []) if str(v).strip()]
-        specific_aliases.extend([str(v).strip() for v in compiled.filter_values if str(v).strip()])
-        if specific_aliases:
-            block_aliases["tag_block"] = list(dict.fromkeys(specific_aliases))
+        generic_tag_aliases = [str(v).strip() for v in layout.get("tag_block_aliases", []) if str(v).strip()]
+        compiled_aliases = [str(v).strip() for v in compiled.filter_values if str(v).strip()]
+        allow_generic_fallback = bool(layout.get("allow_generic_tag_alias_fallback", True))
+
+        tag_aliases: list[str] = []
+        if compiled_aliases:
+            # Primary contract: current execution filter values must drive tag block targeting.
+            tag_aliases.extend(compiled_aliases)
+            if allow_generic_fallback:
+                tag_aliases.extend(generic_tag_aliases)
+        else:
+            tag_aliases.extend(generic_tag_aliases)
+
+        if tag_aliases:
+            block_aliases["tag_block"] = list(dict.fromkeys(tag_aliases))
 
         summary_aliases = [str(v).strip() for v in layout.get("summary_block_aliases", []) if str(v).strip()]
         if summary_aliases:
@@ -1356,7 +1397,7 @@ class GoogleSheetsUILayoutWriter:
                     break
                 continue
             empty_streak = 0
-            if norm in {"этап", "статус", "все", "активные", "закрытые"}:
+            if norm in {"СЌС‚Р°Рї", "СЃС‚Р°С‚СѓСЃ", "РІСЃРµ", "Р°РєС‚РёРІРЅС‹Рµ", "Р·Р°РєСЂС‹С‚С‹Рµ"}:
                 continue
             mapping.setdefault(norm, row)
         return mapping
@@ -1760,18 +1801,18 @@ class GoogleSheetsUILayoutWriter:
 
     def _canonical_field_label(self, field: str) -> str:
         mapping = {
-            "tags": "Теги",
+            "tags": "РўРµРіРё",
             "utm_source": "utm_source",
-            "pipeline": "Воронка",
-            "dates_mode": "Даты",
-            "period": "Период",
-            "date_from": "С",
-            "date_to": "По",
+            "pipeline": "Р’РѕСЂРѕРЅРєР°",
+            "dates_mode": "Р”Р°С‚С‹",
+            "period": "РџРµСЂРёРѕРґ",
+            "date_from": "РЎ",
+            "date_to": "РџРѕ",
         }
         return mapping.get(field, field)
 
     def _norm(self, text: str) -> str:
-        value = (text or "").strip().lower().replace("ё", "е")
+        value = (text or "").strip().lower().replace("С‘", "Рµ")
         value = re.sub(r"[\.;:,]+", " ", value)
         value = re.sub(r"\s+", " ", value)
         return value.strip()

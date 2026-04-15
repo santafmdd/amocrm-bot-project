@@ -7,7 +7,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, TYPE_CHECKING
+from typing import Any, Callable, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from playwright.sync_api import Page
@@ -72,6 +72,12 @@ class ScenarioExecutor:
         self.tabs = [t for t in tabs if t in {"all", "active", "closed"}] or ["all", "active", "closed"]
         self.report_id = report_id
         self.logger = logging.getLogger("project")
+        self._dsl_filter_handlers: dict[str, Callable[[Page, Any], None]] = {
+            "pipeline": self._handle_pipeline_filter,
+            "manager": self._handle_manager_filter,
+            "tag_as_secondary": self._handle_secondary_tag_filter,
+            "utm_as_secondary": self._handle_secondary_utm_filter,
+        }
 
     def execute_block_scenarios(
         self,
@@ -146,7 +152,11 @@ class ScenarioExecutor:
         normalized_filters = self._normalize_filters_for_log(scenario)
         try:
             source_kind = self._infer_source_kind_for_scenario(scenario)
-            values = self._extract_primary_values(scenario, source_kind)
+            primary_filter = self._extract_primary_filter(scenario, source_kind)
+            values = [str(v).strip() for v in primary_filter.values if str(v).strip()]
+            if not values:
+                raise RuntimeError(f"Scenario source filter {primary_filter.normalized_field_name} has empty values")
+            primary_operator = primary_filter.operator
 
             self._reset_to_clean_state(page)
             self.flow.reader.open_analytics_page(page)
@@ -156,7 +166,7 @@ class ScenarioExecutor:
             self._apply_non_primary_filters(page, scenario, source_kind)
 
             self.flow._select_filter_kind(page, source_kind, self.report_id)
-            self.flow._apply_filter_values(page, self.report_id, source_kind, values)
+            self.flow._apply_filter_values(page, self.report_id, source_kind, values, operator=primary_operator)
             self.flow._click_apply(page)
             self.flow._wait_after_apply(page)
 
@@ -267,21 +277,27 @@ class ScenarioExecutor:
         raise RuntimeError("Scenario has no source filter (tags or utm_source).")
 
     def _extract_primary_values(self, scenario: LayoutScenario, source_kind: SourceKind) -> list[str]:
+        primary = self._extract_primary_filter(scenario, source_kind)
+        values = [str(v).strip() for v in primary.values if str(v).strip()]
+        if not values:
+            raise RuntimeError(f"Scenario source filter {primary.normalized_field_name} has empty values")
+        return values
+
+    def _extract_primary_filter(self, scenario: LayoutScenario, source_kind: SourceKind):
         key = "tags" if source_kind == "tag" else "utm_source"
         for f in scenario.filters:
             if f.normalized_field_name == key:
-                values = [str(v).strip() for v in f.values if str(v).strip()]
-                if not values:
-                    raise RuntimeError(f"Scenario source filter {key} has empty values")
-                return values
+                return f
         raise RuntimeError(f"Scenario source filter not found: {key}")
 
     def _apply_non_primary_filters(self, page: Page, scenario: LayoutScenario, primary_kind: SourceKind) -> None:
         # Apply additional supported filters before primary source filter.
-        combined_dates_mode: list[str] = []
-        combined_period: list[str] = []
-        combined_date_from: list[str] = []
-        combined_date_to: list[str] = []
+        deferred_date_fields: dict[str, list[str]] = {
+            "dates_mode": [],
+            "period": [],
+            "date_from": [],
+            "date_to": [],
+        }
 
         for f in scenario.filters:
             field = normalize_field_name(f.normalized_field_name)
@@ -289,60 +305,136 @@ class ScenarioExecutor:
                 continue
             if field == "utm_source" and primary_kind == "utm_source":
                 continue
-            if field == "utm_source" and primary_kind == "tag":
-                op = "^=" if f.operator == "^=" else "="
-                key = "utm_prefix" if op == "^=" else "utm_source"
-                ok = self.flow._apply_supported_filter(page, self.report_id, key, list(f.values), operator=op)
-                self.logger.info(
-                    "scenario ui control selected: field=utm_source strategy=handler key=%s ok=%s",
-                    key,
-                    str(bool(ok)).lower(),
+            if field in deferred_date_fields:
+                deferred_date_fields[field] = list(f.values)
+                continue
+
+            handler_key = self._resolve_secondary_handler_key(field=field, primary_kind=primary_kind)
+            handler = self._dsl_filter_handlers.get(handler_key)
+            if handler is None:
+                self.logger.warning(
+                    "unsupported dsl filter field: field=%s raw_field=%s operator=%s values=%s",
+                    field,
+                    f.raw_field_name,
+                    f.operator,
+                    list(f.values),
                 )
                 continue
+            handler(page, f)
 
-            if field == "pipeline":
-                self.flow._apply_supported_filter(page, self.report_id, "pipeline", list(f.values), operator=f.operator)
-                continue
-
-            if field == "dates_mode":
-                combined_dates_mode = list(f.values)
-                continue
-
-            if field == "period":
-                combined_period = list(f.values)
-                continue
-
-            if field == "date_from":
-                combined_date_from = list(f.values)
-                continue
-
-            if field == "date_to":
-                combined_date_to = list(f.values)
-                continue
-
-            if field == "manager":
-                self.flow._apply_supported_filter(page, self.report_id, "manager", list(f.values), operator=f.operator)
-                continue
-
-            if field == "tags" and primary_kind == "utm_source":
-                self.flow._apply_supported_filter(page, self.report_id, "tag", list(f.values), operator=f.operator)
-                continue
-
-            raise RuntimeError(
-                f"Unsupported DSL filter for scenario execution: field={field} raw_field={f.raw_field_name!r}"
+        if any(deferred_date_fields.values()):
+            raw_mode = str(deferred_date_fields["dates_mode"][0]) if deferred_date_fields["dates_mode"] else ""
+            raw_period = str(deferred_date_fields["period"][0]) if deferred_date_fields["period"] else ""
+            normalized_mode = self._canonical_date_mode(raw_mode)
+            normalized_period = self._canonical_period(raw_period)
+            self.logger.info(
+                "scenario date normalization: raw_mode=%s normalized_mode=%s raw_period=%s normalized_period=%s",
+                raw_mode or "<empty>",
+                normalized_mode or "<empty>",
+                raw_period or "<empty>",
+                normalized_period or "<empty>",
             )
 
-        if combined_dates_mode or combined_period or combined_date_from or combined_date_to:
             date_values: list[str] = []
-            if combined_dates_mode:
-                date_values.append(str(combined_dates_mode[0]))
-            if combined_period:
-                date_values.append(str(combined_period[0]))
-            if combined_date_from:
-                date_values.append(str(combined_date_from[0]))
-            if combined_date_to:
-                date_values.append(str(combined_date_to[0]))
-            self.flow._apply_supported_filter(page, self.report_id, "date", date_values, operator="=")
+            if deferred_date_fields["dates_mode"]:
+                date_values.append(normalized_mode or raw_mode)
+            if deferred_date_fields["period"]:
+                date_values.append(normalized_period or raw_period)
+            if deferred_date_fields["date_from"]:
+                date_values.append(str(deferred_date_fields["date_from"][0]))
+            if deferred_date_fields["date_to"]:
+                date_values.append(str(deferred_date_fields["date_to"][0]))
+            ok = self.flow._apply_supported_filter(page, self.report_id, "date", date_values, operator="=")
+            if not ok:
+                raise RuntimeError(f"Scenario filter apply failed: field=date values={date_values}")
+
+    def _resolve_secondary_handler_key(self, *, field: str, primary_kind: SourceKind) -> str:
+        if field == "utm_source" and primary_kind == "tag":
+            return "utm_as_secondary"
+        if field == "tags" and primary_kind == "utm_source":
+            return "tag_as_secondary"
+        return field
+
+    def _handle_pipeline_filter(self, page: Page, filter_item: Any) -> None:
+        values = list(getattr(filter_item, "values", []))
+        operator = str(getattr(filter_item, "operator", "=") or "=")
+        ok = self.flow._apply_supported_filter(page, self.report_id, "pipeline", values, operator=operator)
+        if not ok:
+            raise RuntimeError(f"Scenario filter apply failed: field=pipeline values={values}")
+
+    def _handle_manager_filter(self, page: Page, filter_item: Any) -> None:
+        values = list(getattr(filter_item, "values", []))
+        operator = str(getattr(filter_item, "operator", "=") or "=")
+        ok = self.flow._apply_supported_filter(page, self.report_id, "manager", values, operator=operator)
+        if not ok:
+            raise RuntimeError(f"Scenario filter apply failed: field=manager values={values}")
+
+    def _handle_secondary_tag_filter(self, page: Page, filter_item: Any) -> None:
+        values = list(getattr(filter_item, "values", []))
+        operator = str(getattr(filter_item, "operator", "=") or "=")
+        ok = self.flow._apply_supported_filter(page, self.report_id, "tag", values, operator=operator)
+        if not ok:
+            raise RuntimeError(f"Scenario filter apply failed: field=tags values={values}")
+
+    def _handle_secondary_utm_filter(self, page: Page, filter_item: Any) -> None:
+        values = list(getattr(filter_item, "values", []))
+        op = "^=" if str(getattr(filter_item, "operator", "=") or "=").strip() == "^=" else "="
+        key = "utm_prefix" if op == "^=" else "utm_source"
+        ok = self.flow._apply_supported_filter(page, self.report_id, key, values, operator=op)
+        self.logger.info(
+            "scenario ui control selected: field=utm_source strategy=handler key=%s ok=%s",
+            key,
+            str(bool(ok)).lower(),
+        )
+        if not ok:
+            raise RuntimeError(f"Scenario filter apply failed: field=utm_source values={values}")
+
+    def _canonical_date_mode(self, value: str) -> str:
+        norm = " ".join(str(value or "").strip().lower().replace("\u0451", "\u0435").replace("_", " ").split())
+        closed_tokens = {
+            "closed",
+            "close",
+            "\u0437\u0430\u043a\u0440\u044b\u0442\u044b",
+            "\u0437\u0430\u043a\u0440\u044b\u0442\u044b\u0435",
+        }
+        created_tokens = {
+            "created",
+            "\u0441\u043e\u0437\u0434\u0430\u043d\u044b",
+            "\u0441\u043e\u0437\u0434\u0430\u043d\u043e",
+            "\u0441\u043e\u0437\u0434\u0430\u043d\u043d\u044b\u0435",
+        }
+        if norm in closed_tokens or "\u0437\u0430\u043a\u0440\u044b" in norm:
+            return "closed"
+        if norm in created_tokens or "\u0441\u043e\u0437\u0434\u0430\u043d" in norm:
+            return "created"
+        return norm
+
+    def _canonical_period(self, value: str) -> str:
+        norm = " ".join(str(value or "").strip().lower().replace("\u0451", "\u0435").replace("_", " ").split())
+        mapping = {
+            "\u0437\u0430 \u0432\u0441\u0435 \u0432\u0440\u0435\u043c\u044f": "all_time",
+            "\u0437\u0430 \u0432\u0441\u0435 \u0432\u0440\u0435\u043c\u044f": "all_time",
+            "all time": "all_time",
+            "\u0437\u0430 \u0441\u0435\u0433\u043e\u0434\u043d\u044f": "current_day",
+            "today": "current_day",
+            "\u0437\u0430 \u0432\u0447\u0435\u0440\u0430": "previous_day",
+            "yesterday": "previous_day",
+            "\u0437\u0430 \u043f\u043e\u0441\u043b\u0435\u0434\u043d\u0438\u0435 30 \u0434\u043d\u0435\u0439": "last_30_days",
+            "last 30 days": "last_30_days",
+            "\u0437\u0430 \u044d\u0442\u0443 \u043d\u0435\u0434\u0435\u043b\u044e": "current_week",
+            "this week": "current_week",
+            "\u0437\u0430 \u043f\u0440\u043e\u0448\u043b\u0443\u044e \u043d\u0435\u0434\u0435\u043b\u044e": "previous_week",
+            "last week": "previous_week",
+            "\u0437\u0430 \u044d\u0442\u043e\u0442 \u043c\u0435\u0441\u044f\u0446": "current_month",
+            "this month": "current_month",
+            "\u0437\u0430 \u043f\u0440\u043e\u0448\u043b\u044b\u0439 \u043c\u0435\u0441\u044f\u0446": "previous_month",
+            "last month": "previous_month",
+            "\u0437\u0430 \u043a\u0432\u0430\u0440\u0442\u0430\u043b": "quarter",
+            "quarter": "quarter",
+            "\u0437\u0430 \u044d\u0442\u043e\u0442 \u0433\u043e\u0434": "current_year",
+            "this year": "current_year",
+        }
+        return mapping.get(norm, norm)
 
     def _apply_tags_before_primary(self, page: Page, values: list[str]) -> None:
         self.flow._select_filter_kind(page, "tag", self.report_id)
@@ -606,3 +698,4 @@ class ScenarioExecutor:
             "snapshots": [s.model_dump() for s in snapshots],
         }
         out.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+

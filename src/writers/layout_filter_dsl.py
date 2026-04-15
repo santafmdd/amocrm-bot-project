@@ -1,4 +1,4 @@
-"""DSL parser for yellow layout rows in Google Sheets."""
+﻿"""DSL parser for yellow layout rows in Google Sheets."""
 
 from __future__ import annotations
 
@@ -13,7 +13,6 @@ FIELD_ALIASES: dict[str, str] = {
     "тег": "tags",
     "tags": "tags",
     "tag": "tags",
-    "tags": "tags",
     "utm source": "utm_source",
     "utm_source": "utm_source",
     "utm": "utm_source",
@@ -26,6 +25,7 @@ FIELD_ALIASES: dict[str, str] = {
     "даты": "dates_mode",
     "дата": "dates_mode",
     "dates": "dates_mode",
+    "dates_mode": "dates_mode",
     "dates mode": "dates_mode",
     "date mode": "dates_mode",
     "с": "date_from",
@@ -35,7 +35,24 @@ FIELD_ALIASES: dict[str, str] = {
     "tabs": "tabs",
     "tab": "tabs",
     "tab mode": "tabs",
+    "????????": "manager",
+    "?????????": "manager",
+    "manager": "manager",
+    "managers": "manager",
 }
+
+SUPPORTED_EXECUTION_FIELDS: tuple[str, ...] = (
+    "tags",
+    "utm_source",
+    "pipeline",
+    "period",
+    "dates_mode",
+    "date_from",
+    "date_to",
+    "manager",
+    "tabs",
+)
+
 
 
 @dataclass(frozen=True)

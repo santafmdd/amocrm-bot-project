@@ -78,17 +78,11 @@ class _DummyFlowForApply:
         return True
 
 
-def test_unsupported_filter_field_raises_controlled_error():
-    cfg = parse_layout_row("????: UnknownField=abc; ????=????????")
+def test_unsupported_filter_field_logs_warning_and_does_not_crash(caplog):
+    cfg = parse_layout_row("X: UnknownField=abc; ????=????????")
     ex = ScenarioExecutor(flow=_DummyFlowForApply(), project_root=Path('.'), tabs=['all'], report_id='rid')
-    try:
-        ex._apply_non_primary_filters(page=None, scenario=cfg.scenarios[0], primary_kind='tag')
-        raised = False
-    except RuntimeError as exc:
-        raised = True
-        assert "Unsupported DSL filter for scenario execution" in str(exc)
-        assert "unknownfield" in str(exc)
-    assert raised
+    ex._apply_non_primary_filters(page=None, scenario=cfg.scenarios[0], primary_kind='tag')
+    assert "unsupported dsl filter field" in caplog.text.lower()
 
 
 
@@ -178,3 +172,10 @@ def test_apply_non_primary_filters_raises_when_pipeline_apply_fails():
         raised = True
         assert "Scenario filter apply failed: field=pipeline" in str(exc)
     assert raised
+
+
+def test_secondary_handler_key_resolution_keeps_primary_source_excluded():
+    ex = ScenarioExecutor(flow=_DummyFlowForApply(), project_root=Path('.'), tabs=['all'], report_id='rid')
+    assert ex._resolve_secondary_handler_key(field='utm_source', primary_kind='tag') == 'utm_as_secondary'
+    assert ex._resolve_secondary_handler_key(field='tags', primary_kind='utm_source') == 'tag_as_secondary'
+    assert ex._resolve_secondary_handler_key(field='pipeline', primary_kind='tag') == 'pipeline'

@@ -20,7 +20,7 @@ if "playwright" not in sys.modules:
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.run_profile_analytics import _build_weekly_refusals_flow_input, _resolve_weekly_period_mode, _run_weekly_refusals_profile, _resolve_google_auth_mode, _apply_google_auth_mode_override
+from src.run_profile_analytics import _build_weekly_refusals_flow_input, _resolve_weekly_period_mode, _run_weekly_refusals_profile, _resolve_google_auth_mode, _apply_google_auth_mode_override, RuntimeOptions
 
 
 def u(s: str) -> str:
@@ -361,3 +361,41 @@ def test_run_weekly_refusals_profile_propagates_cumulative_mode(monkeypatch) -> 
 
     assert captured["parsed_result"] is not None
     assert captured["parsed_result"].get("mode") == "cumulative"
+
+
+def test_build_weekly_refusals_flow_input_runtime_strategy_override() -> None:
+    report = SimpleNamespace(
+        id="weekly_refusals_weekly_2m",
+        filters={
+            "pipeline": "pipeline_2m",
+            "period_strategy": "previous_week",
+            "status_after": "closed_not_realized",
+        },
+    )
+    options = RuntimeOptions(
+        google_auth_mode="cache_only",
+        weekly_period_strategy_override="current_week",
+    )
+    flow_input = _build_weekly_refusals_flow_input(report, runtime_options=options)
+    assert "resolved=current_week" in flow_input.period_strategy
+
+
+def test_build_weekly_refusals_flow_input_runtime_manual_period_override() -> None:
+    report = SimpleNamespace(
+        id="weekly_refusals_weekly_2m",
+        filters={
+            "pipeline": "pipeline_2m",
+            "period_strategy": "auto_weekly",
+            "status_after": "closed_not_realized",
+        },
+    )
+    options = RuntimeOptions(
+        google_auth_mode="cache_only",
+        weekly_period_mode_override="?? ??????",
+        weekly_date_from_override="2026-04-01",
+        weekly_date_to_override="2026-04-07",
+    )
+    flow_input = _build_weekly_refusals_flow_input(report, runtime_options=options)
+    assert flow_input.period_mode == "?? ??????"
+    assert flow_input.date_from == "2026-04-01"
+    assert flow_input.date_to == "2026-04-07"
