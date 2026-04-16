@@ -666,3 +666,40 @@ Current scenario execution supports:
 Unsupported DSL fields are now logged explicitly as:
 `unsupported dsl filter field: ...`
 (ignored for execution, not silently hidden).
+
+## Боевой запуск без UI
+
+Минимальный операционный запуск теперь делается через PowerShell launcher:
+
+1. Открыть терминал в корне проекта:
+   - `D:\AI_Automation\amocrm_bot\project`
+2. Активировать venv (пример для Windows PowerShell):
+   - `.\.venv\Scripts\Activate.ps1`
+3. Запустить launcher:
+   - `.\scripts\run_reports.ps1`
+4. Выбрать пункт меню:
+   - `1` Analytics dry-run batch from sheet DSL
+   - `2` Analytics live write block A1
+   - `3` Analytics live write block F1
+   - `4` Weekly refusals dry-run 2m
+   - `5` Weekly refusals live 2m
+   - `6` Weekly refusals live cumulative long
+
+Launcher перед каждым запуском выставляет:
+- `GOOGLE_API_AUTH_MODE=cache_only`
+
+Это исключает неожиданный интерактивный OAuth popup в обычном runtime.
+
+### Dry-run vs Live write
+
+- `dry-run`: discovery/compute/debug artifacts без фактической записи значений в таблицу.
+- `live write`: фактическое обновление целевых блоков в Google Sheets.
+
+Операционный порядок:
+1. Сначала всегда гоняем на тестовый лист.
+2. Проверяем debug/compiled artifacts.
+3. Только потом запускаем live write.
+
+Пути артефактов:
+- debug: `D:\AI_Automation\amocrm_bot\project\exports\debug`
+- compiled: `D:\AI_Automation\amocrm_bot\project\exports\compiled`
