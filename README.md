@@ -703,3 +703,7 @@ Launcher перед каждым запуском выставляет:
 Пути артефактов:
 - debug: `D:\AI_Automation\amocrm_bot\project\exports\debug`
 - compiled: `D:\AI_Automation\amocrm_bot\project\exports\compiled`
+
+## amoCRM API Bootstrap
+Minimal external integration OAuth bootstrap is documented in [docs/amocrm_auth_bootstrap.md](docs/amocrm_auth_bootstrap.md).
+
