@@ -1,4 +1,4 @@
-﻿## Update (2026-04-12): Google OAuth Auth Modes
+## Update (2026-04-12): Google OAuth Auth Modes
 
 Why system browser opens:
 - Google OAuth desktop flow uses `InstalledAppFlow.run_local_server(...)`.
@@ -707,3 +707,37 @@ Launcher перед каждым запуском выставляет:
 ## amoCRM API Bootstrap
 Minimal external integration OAuth bootstrap is documented in [docs/amocrm_auth_bootstrap.md](docs/amocrm_auth_bootstrap.md).
 
+
+## Update (2026-04-18): Deal Analyzer Enrichment MVP (Read-only)
+
+Фактическое состояние на этом этапе:
+- существующие analytics / weekly_refusals / Google Sheets writer flows не менялись;
+- в `deal_analyzer` добавлен read-only enrich pipeline для внешних таблиц и KPI-контекста;
+- запись обратно в Google Sheets из enrich pipeline не выполняется.
+
+Новые CLI-команды:
+- `python -m src.deal_analyzer.cli enrich-deal --config ... --input ...`
+- `python -m src.deal_analyzer.cli enrich-period --config ... --input ...`
+- `python -m src.deal_analyzer.cli roks-snapshot --config ... --manager "Илья"`
+- `python -m src.deal_analyzer.cli roks-snapshot --config ... --team`
+
+Ключевые output-поля по сделке:
+- `enrichment_match_status`
+- `enrichment_match_source`
+- `enrichment_confidence`
+- `matched_client_row_ref`
+- `matched_appointment_row_ref`
+- `manager_summary`
+- `employee_coaching`
+- `employee_fix_tasks`
+
+Детали контракта и ограничений см. в:
+- `docs/deal_analyzer_enrichment_mvp.md`
+
+## Update (2026-04-18): Deal Analyzer Call Evidence + Transcription MVP
+
+- Added read-only call evidence layer (API-first, raw fallback, normalized fallback).
+- Added transcription adapter layer with cache (`disabled/mock/local_placeholder/cloud_placeholder`).
+- Added operator CLI commands: `collect-calls`, `transcribe-deal`, `transcribe-period`, `build-call-snapshot`.
+- No changes in analytics / weekly_refusals / Google Sheets writer flows.
+- Details: `docs/deal_analyzer_calls_mvp.md`.

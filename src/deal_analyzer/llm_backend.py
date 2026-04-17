@@ -16,6 +16,7 @@ class LlmAnalysisOutcome:
     backend_used: str
     llm_error: bool
     error_message: str | None
+    repaired: bool = False
 
 
 def analyze_deal_with_ollama(
@@ -44,22 +45,34 @@ def analyze_deal_with_ollama_outcome(
 
     first_error: OllamaClientError | None = None
     try:
-        llm_payload = ollama.chat_json(messages=base_messages)
-        merged = _merge_with_baseline(baseline.to_dict(), llm_payload)
+        parsed = ollama.chat_json(messages=base_messages)
+        merged = _merge_with_baseline(baseline.to_dict(), parsed.payload)
+        merged["analysis_backend_requested"] = config.analyzer_backend
         merged["analysis_backend_used"] = "ollama"
+        merged["llm_repair_applied"] = bool(parsed.repair_applied)
         return LlmAnalysisOutcome(
-            analysis=DealAnalysis(**merged), backend_used="ollama", llm_error=False, error_message=None
+            analysis=DealAnalysis(**merged),
+            backend_used="ollama",
+            llm_error=False,
+            error_message=None,
+            repaired=bool(parsed.repair_applied),
         )
     except OllamaClientError as exc:
         first_error = exc
 
     repair_messages = append_json_repair_instruction(base_messages)
     try:
-        llm_payload = ollama.chat_json(messages=repair_messages)
-        merged = _merge_with_baseline(baseline.to_dict(), llm_payload)
+        parsed = ollama.chat_json(messages=repair_messages)
+        merged = _merge_with_baseline(baseline.to_dict(), parsed.payload)
+        merged["analysis_backend_requested"] = config.analyzer_backend
         merged["analysis_backend_used"] = "ollama"
+        merged["llm_repair_applied"] = True
         return LlmAnalysisOutcome(
-            analysis=DealAnalysis(**merged), backend_used="ollama", llm_error=False, error_message=None
+            analysis=DealAnalysis(**merged),
+            backend_used="ollama",
+            llm_error=False,
+            error_message=None,
+            repaired=True,
         )
     except OllamaClientError as second:
         message = (
@@ -67,12 +80,15 @@ def analyze_deal_with_ollama_outcome(
             f"first={first_error}; second={second}"
         )
         fallback = baseline.to_dict()
+        fallback["analysis_backend_requested"] = config.analyzer_backend
         fallback["analysis_backend_used"] = "rules_fallback"
+        fallback["llm_repair_applied"] = False
         return LlmAnalysisOutcome(
             analysis=DealAnalysis(**fallback),
             backend_used="rules_fallback",
             llm_error=True,
             error_message=message,
+            repaired=False,
         )
 
 

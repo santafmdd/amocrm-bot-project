@@ -3,15 +3,16 @@ from unittest.mock import patch
 
 from src.deal_analyzer.config import DealAnalyzerConfig
 from src.deal_analyzer.llm_backend import analyze_deal_with_ollama_outcome
-from src.deal_analyzer.llm_client import OllamaClientError
+from src.deal_analyzer.llm_client import OllamaClientError, ParsedJsonResponse
 
 
 class _FakeClient:
-    def __init__(self, payload):
+    def __init__(self, payload, repair_applied: bool = False):
         self.payload = payload
+        self.repair_applied = repair_applied
 
     def chat_json(self, *, messages):
-        return self.payload
+        return ParsedJsonResponse(payload=self.payload, repair_applied=self.repair_applied)
 
 
 class _RetryThenSuccessClient:
@@ -22,7 +23,7 @@ class _RetryThenSuccessClient:
         self.calls += 1
         if self.calls == 1:
             raise OllamaClientError("bad json")
-        return {"score_0_100": 66, "strong_sides": ["Есть контакт"]}
+        return ParsedJsonResponse(payload={"score_0_100": 66, "strong_sides": ["Есть контакт"]}, repair_applied=True)
 
 
 class _AlwaysFailClient:
@@ -75,6 +76,7 @@ def test_llm_backend_merges_llm_payload_into_baseline_contract():
     assert out.backend_used == "ollama"
     assert out.llm_error is False
     assert out.analysis.analysis_backend_used == "ollama"
+    assert out.analysis.llm_repair_applied is False
 
 
 def test_llm_backend_retries_and_succeeds_on_second_attempt():
@@ -84,6 +86,8 @@ def test_llm_backend_retries_and_succeeds_on_second_attempt():
     assert out.backend_used == "ollama"
     assert out.llm_error is False
     assert out.analysis.analysis_backend_used == "ollama"
+    assert out.analysis.llm_repair_applied is True
+    assert out.repaired is True
 
 
 def test_llm_backend_falls_back_to_rules_after_failed_retry():
@@ -94,6 +98,7 @@ def test_llm_backend_falls_back_to_rules_after_failed_retry():
     assert out.llm_error is True
     assert out.error_message is not None
     assert out.analysis.analysis_backend_used == "rules_fallback"
+    assert out.analysis.llm_repair_applied is False
 
 
 def test_llm_backend_uses_timeout_from_config_when_creating_client():
@@ -109,7 +114,7 @@ def test_llm_backend_uses_timeout_from_config_when_creating_client():
             captured["timeout_seconds"] = timeout_seconds
 
         def chat_json(self, *, messages):
-            return {"score_0_100": 70}
+            return ParsedJsonResponse(payload={"score_0_100": 70}, repair_applied=False)
 
     with patch("src.deal_analyzer.llm_backend.OllamaClient", _ConstructedClient):
         out = analyze_deal_with_ollama_outcome(normalized_deal={"deal_id": 4}, config=cfg, client=None)

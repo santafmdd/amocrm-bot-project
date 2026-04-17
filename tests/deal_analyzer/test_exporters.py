@@ -36,7 +36,7 @@ def test_write_analysis_csv_calls_csv_writer_for_timestamped_and_latest():
     assert files.latest is not None and str(files.latest).endswith("_latest.csv")
 
 
-def test_build_markdown_report_contains_metadata_and_score_line():
+def test_build_markdown_report_contains_metadata_and_operator_blocks():
     md = build_markdown_report(
         title="T",
         report_metadata={
@@ -44,12 +44,26 @@ def test_build_markdown_report_contains_metadata_and_score_line():
             "period_end": "2026-04-10",
             "public_period_label": "2026-04-06..2026-04-10",
             "period_mode_resolved": "previous_workweek",
+            "backend_requested": "ollama",
+            "backend_effective_summary": "ollama_with_partial_rules_fallback",
+            "llm_success": 20,
+            "llm_success_repaired": 3,
+            "llm_fallback": 2,
+            "llm_error": 2,
         },
         analyses=[
             {
                 "deal_id": 1,
                 "deal_name": "Deal",
+                "analysis_backend_requested": "ollama",
                 "analysis_backend_used": "ollama",
+                "llm_repair_applied": True,
+                "enrichment_match_status": "partial",
+                "enrichment_match_source": "client_list",
+                "enrichment_confidence": 0.9,
+                "manager_summary": "Summary",
+                "employee_coaching": "Coach",
+                "employee_fix_tasks": ["A", "B"],
                 "score_0_100": 77,
                 "presentation_quality_flag": "ok",
                 "followup_quality_flag": "ok",
@@ -63,5 +77,12 @@ def test_build_markdown_report_contains_metadata_and_score_line():
     assert "Deal 1" in md
     assert "Score: 77" in md
     assert "Period:" in md
+    assert "Analysis backend requested: ollama" in md
     assert "Analysis backend used: ollama" in md
+    assert "LLM repair applied: True" in md
+    assert "Backend effective:" in md
+    assert "LLM success repaired:" in md
+    assert "Manager summary:" in md
+    assert "Employee coaching:" in md
+    assert "Employee fix tasks:" in md
     assert "2026-04-06..2026-04-10" in md

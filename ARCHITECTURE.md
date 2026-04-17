@@ -1,4 +1,4 @@
-﻿# Архитектура проекта
+# Архитектура проекта
 
 ## Слои системы
 
@@ -176,3 +176,47 @@ UI-oriented future integration points:
 - ?????? analytics ?? tag/utm_source,
 - ????????? ???????????,
 - ????????? ?????????/??????? ?????????? ??? ???????????.
+
+## Update (2026-04-18): Analyzer Read-only Enrichment/Data Pipeline
+
+Добавлены изолированные модули analyzer-слоя:
+- `src/deal_analyzer/enrichment.py`
+- `src/deal_analyzer/roks_extractor.py`
+- `src/deal_analyzer/snapshot_builder.py`
+
+Архитектурный принцип:
+- LLM/rules backend получает уже собранный нормализованный snapshot;
+- прямой доступ модели к внешним источникам не используется;
+- enrich/ROKS слой работает read-only и не выполняет write-back.
+
+Источник enrich данных:
+- client list Google Sheet;
+- appointment table Google Sheet (в т.ч. tab `2026`, если задан в конфиге);
+- ROKS workbook как KPI/conversion context (header/marker extraction, не фиксированный единственный лист).
+
+Matching priority (deterministic):
+1. deal_id
+2. phone
+3. email
+4. company + contact
+5. company only
+
+Новый контракт snapshot:
+- CRM normalized deal/deal batch
+- enrichment context + match metadata
+- ROKS manager/team KPI context
+- readiness для следующего reasoning шага без изменений writer/storage слоя.
+
+## Update (2026-04-18): Call Evidence + Transcription Layer (Analyzer)
+
+Added isolated analyzer modules:
+- `src/deal_analyzer/call_evidence.py`
+- `src/deal_analyzer/call_downloader.py`
+- `src/deal_analyzer/transcription.py`
+- `src/deal_analyzer/transcription_backends.py`
+- `src/deal_analyzer/transcript_cache.py`
+
+Contract:
+- call evidence is collected API-first and deduplicated before snapshot integration;
+- transcription is backend-routed and cached by deterministic key;
+- analyzer consumes prepared snapshot (`CRM + enrich + call evidence + transcripts + ROKS`) and does not query sources directly.

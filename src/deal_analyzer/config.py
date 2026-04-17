@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 from dataclasses import dataclass
@@ -41,6 +41,25 @@ class DealAnalyzerConfig:
     appointment_list_enrich_enabled: bool = False
     client_list_source_name: str = ""
     appointment_list_source_name: str = ""
+    client_list_source_url: str = ""
+    appointment_list_source_url: str = ""
+    client_list_sheet_name: str = ""
+    appointment_list_sheet_name: str = ""
+    matching_strategy: str = "priority_v1"
+    fields_mapping: dict[str, dict[str, str]] | None = None
+    operator_outputs_enabled: bool = True
+    roks_source_url: str = ""
+    roks_sheet_name: str = ""
+    roks_sheet_candidates: tuple[str, ...] = ()
+    transcription_backend: str = "disabled"
+    transcription_base_url: str = ""
+    transcription_model: str = ""
+    transcription_timeout_seconds: int = 60
+    transcription_cache_dir: str = "workspace/deal_analyzer/transcripts_cache"
+    call_collection_mode: str = "disabled"
+    call_backend: str = "amocrm_api"
+    amocrm_auth_config_path: str = ""
+    call_base_domain: str = ""
 
 
 @dataclass(frozen=True)
@@ -139,6 +158,51 @@ def load_deal_analyzer_config(config_path: str | None = None) -> DealAnalyzerCon
     client_list_source_name = str(raw.get("client_list_source_name", "")).strip()
     appointment_list_source_name = str(raw.get("appointment_list_source_name", "")).strip()
 
+    client_list_source_url = str(raw.get("client_list_source_url", "")).strip()
+    appointment_list_source_url = str(raw.get("appointment_list_source_url", "")).strip()
+    client_list_sheet_name = str(raw.get("client_list_sheet_name", "")).strip()
+    appointment_list_sheet_name = str(raw.get("appointment_list_sheet_name", "")).strip()
+
+    matching_strategy = str(raw.get("matching_strategy", "priority_v1")).strip().lower() or "priority_v1"
+    if matching_strategy not in {"priority_v1"}:
+        raise RuntimeError("Unsupported matching_strategy. Allowed values: ['priority_v1']")
+
+    operator_outputs_enabled = bool(raw.get("operator_outputs_enabled", True))
+
+    transcription_backend = str(raw.get("transcription_backend", "disabled")).strip().lower() or "disabled"
+    if transcription_backend not in {"disabled", "mock", "local_placeholder", "cloud_placeholder"}:
+        raise RuntimeError(
+            "Unsupported transcription_backend="
+            f"{transcription_backend!r}. Allowed values: ['disabled', 'mock', 'local_placeholder', 'cloud_placeholder']"
+        )
+
+    transcription_base_url = str(raw.get("transcription_base_url", "")).strip()
+    transcription_model = str(raw.get("transcription_model", "")).strip()
+    try:
+        transcription_timeout_seconds = max(1, int(raw.get("transcription_timeout_seconds", 60)))
+    except (TypeError, ValueError):
+        transcription_timeout_seconds = 60
+    transcription_cache_dir = str(
+        raw.get("transcription_cache_dir", "workspace/deal_analyzer/transcripts_cache")
+    ).strip() or "workspace/deal_analyzer/transcripts_cache"
+
+    call_collection_mode = str(raw.get("call_collection_mode", "disabled")).strip().lower() or "disabled"
+    if call_collection_mode not in {"disabled", "api_first", "api_only", "raw_fallback", "raw_only"}:
+        raise RuntimeError(
+            "Unsupported call_collection_mode="
+            f"{call_collection_mode!r}. Allowed values: ['disabled', 'api_first', 'api_only', 'raw_fallback', 'raw_only']"
+        )
+
+    call_backend = str(raw.get("call_backend", "amocrm_api")).strip().lower() or "amocrm_api"
+    amocrm_auth_config_path = str(raw.get("amocrm_auth_config_path", "")).strip()
+    call_base_domain = str(raw.get("call_base_domain", "")).strip()
+
+    roks_source_url = str(raw.get("roks_source_url", "")).strip()
+    roks_sheet_name = str(raw.get("roks_sheet_name", "")).strip()
+    roks_sheet_candidates = _parse_str_list(raw.get("roks_sheet_candidates"))
+
+    fields_mapping = _parse_fields_mapping(raw.get("fields_mapping"))
+
     return DealAnalyzerConfig(
         config_path=cfg_path,
         output_dir=output_dir,
@@ -158,6 +222,25 @@ def load_deal_analyzer_config(config_path: str | None = None) -> DealAnalyzerCon
         appointment_list_enrich_enabled=appointment_list_enrich_enabled,
         client_list_source_name=client_list_source_name,
         appointment_list_source_name=appointment_list_source_name,
+        client_list_source_url=client_list_source_url,
+        appointment_list_source_url=appointment_list_source_url,
+        client_list_sheet_name=client_list_sheet_name,
+        appointment_list_sheet_name=appointment_list_sheet_name,
+        matching_strategy=matching_strategy,
+        fields_mapping=fields_mapping,
+        operator_outputs_enabled=operator_outputs_enabled,
+        roks_source_url=roks_source_url,
+        roks_sheet_name=roks_sheet_name,
+        roks_sheet_candidates=tuple(roks_sheet_candidates),
+        transcription_backend=transcription_backend,
+        transcription_base_url=transcription_base_url,
+        transcription_model=transcription_model,
+        transcription_timeout_seconds=transcription_timeout_seconds,
+        transcription_cache_dir=transcription_cache_dir,
+        call_collection_mode=call_collection_mode,
+        call_backend=call_backend,
+        amocrm_auth_config_path=amocrm_auth_config_path,
+        call_base_domain=call_base_domain,
     )
 
 
@@ -176,7 +259,6 @@ def resolve_period(
 
     resolved_mode = mode
     if mode == "smart_manager_default":
-        # Saturday/Sunday -> current week to date, weekdays -> previous workweek.
         resolved_mode = "current_week_to_date" if as_of.weekday() >= 5 else "previous_workweek"
 
     if resolved_mode == "current_week_to_date":
@@ -210,6 +292,35 @@ def resolve_period(
     raise RuntimeError(f"Unsupported resolved period mode={resolved_mode!r}")
 
 
+def _parse_fields_mapping(raw: Any) -> dict[str, dict[str, str]]:
+    if not isinstance(raw, dict):
+        return {"client_list": {}, "appointment_list": {}}
+
+    parsed: dict[str, dict[str, str]] = {"client_list": {}, "appointment_list": {}}
+    for source in ("client_list", "appointment_list"):
+        node = raw.get(source)
+        if not isinstance(node, dict):
+            continue
+        for k, v in node.items():
+            key = str(k or "").strip()
+            val = str(v or "").strip()
+            if key:
+                parsed[source][key] = val
+    return parsed
+
+
+
+
+def _parse_str_list(raw: Any) -> list[str]:
+    if not isinstance(raw, list):
+        return []
+    items: list[str] = []
+    for value in raw:
+        text = str(value or "").strip()
+        if text:
+            items.append(text)
+    return items
+
 def _parse_date(value: str, field_name: str) -> date:
     try:
         return datetime.strptime(value, "%Y-%m-%d").date()
@@ -220,4 +331,3 @@ def _parse_date(value: str, field_name: str) -> date:
 def _opt_str(value: Any) -> str | None:
     text = str(value).strip() if value is not None else ""
     return text or None
-

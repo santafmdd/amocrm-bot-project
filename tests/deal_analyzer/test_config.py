@@ -20,10 +20,28 @@ def _cfg_payload(extra: str = "") -> str:
   "period_label_mode": "period_only",
   "hide_executed_at_from_public_exports": true,
   "executed_at_visibility": "internal_only",
-  "client_list_enrich_enabled": false,
+  "client_list_enrich_enabled": true,
   "appointment_list_enrich_enabled": false,
-  "client_list_source_name": "",
-  "appointment_list_source_name": ""
+  "client_list_source_name": "clients",
+  "appointment_list_source_name": "appointments",
+  "client_list_source_url": "https://docs.google.com/spreadsheets/d/abc123/edit#gid=0",
+  "appointment_list_source_url": "",
+  "client_list_sheet_name": "Клиенты",
+  "appointment_list_sheet_name": "",
+  "matching_strategy": "priority_v1",
+  "operator_outputs_enabled": true,
+  "roks_source_url": "https://docs.google.com/spreadsheets/d/roks123/edit#gid=0",
+  "roks_sheet_name": "???? 2026",
+  "roks_sheet_candidates": ["???? 2026", "???? 2025"],
+  "fields_mapping": {
+    "client_list": {
+      "deal_id": "ID сделки",
+      "phone": "Телефон"
+    },
+    "appointment_list": {
+      "deal_id": "ID сделки"
+    }
+  }
 }
 """.strip()
     return base if not extra else extra
@@ -41,6 +59,12 @@ def test_load_deal_analyzer_config_with_ollama_backend_and_period_fields():
     assert cfg.style_profile_name == "manager_ru_v2"
     assert cfg.period_mode == "smart_manager_default"
     assert cfg.hide_executed_at_from_public_exports is True
+    assert cfg.client_list_enrich_enabled is True
+    assert cfg.client_list_source_url.startswith("https://docs.google.com/spreadsheets/d/")
+    assert cfg.client_list_sheet_name == "Клиенты"
+    assert cfg.matching_strategy == "priority_v1"
+    assert cfg.operator_outputs_enabled is True
+    assert cfg.fields_mapping["client_list"]["deal_id"] == "ID сделки"
 
 
 def test_load_deal_analyzer_config_rejects_unknown_backend():
@@ -99,6 +123,7 @@ def test_resolve_period_custom_range_from_cli_override():
     )
     assert resolved.period_start.isoformat() == "2026-04-01"
     assert resolved.period_end.isoformat() == "2026-04-07"
+
 
 def test_resolve_period_custom_range_requires_dates():
     cfg_path = Path("d:/AI_Automation/amocrm_bot/project/config/deal_analyzer.local.json")

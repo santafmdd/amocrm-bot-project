@@ -1,9 +1,10 @@
 ﻿from pathlib import Path
 from unittest.mock import patch
 
-from src.deal_analyzer.cli import _analyze_one_with_isolation, _analyze_period_rows
+from src.deal_analyzer.cli import _analyze_one_with_isolation, _analyze_period_rows, _run_ollama_preflight
 from src.deal_analyzer.config import DealAnalyzerConfig
 from src.deal_analyzer.llm_backend import LlmAnalysisOutcome
+from src.deal_analyzer.llm_client import OllamaPreflightResult
 from src.deal_analyzer.models import DealAnalysis
 
 
@@ -42,7 +43,7 @@ def _cfg(timeout_seconds: int = 60) -> DealAnalyzerConfig:
     )
 
 
-def _analysis(deal_id: int, backend_used: str) -> DealAnalysis:
+def _analysis(deal_id: int, backend_used: str, repaired: bool = False) -> DealAnalysis:
     return DealAnalysis(
         deal_id=deal_id,
         amo_lead_id=deal_id,
@@ -59,24 +60,26 @@ def _analysis(deal_id: int, backend_used: str) -> DealAnalysis:
         manager_message_draft="",
         employee_training_message_draft="",
         analysis_backend_used=backend_used,
+        llm_repair_applied=repaired,
     )
 
 
-def test_analyze_period_continues_when_one_deal_falls_back():
+def test_analyze_period_continues_when_one_deal_falls_back_and_counts_repaired():
     rows = [{"deal_id": 1}, {"deal_id": 2}, {"deal_id": 3}]
     logger = _Logger()
 
     side_effects = [
-        LlmAnalysisOutcome(_analysis(1, "ollama"), "ollama", False, None),
-        LlmAnalysisOutcome(_analysis(2, "rules_fallback"), "rules_fallback", True, "bad json"),
-        LlmAnalysisOutcome(_analysis(3, "ollama"), "ollama", False, None),
+        LlmAnalysisOutcome(_analysis(1, "ollama"), "ollama", False, None, False),
+        LlmAnalysisOutcome(_analysis(2, "rules_fallback"), "rules_fallback", True, "bad json", False),
+        LlmAnalysisOutcome(_analysis(3, "ollama", repaired=True), "ollama", False, None, True),
     ]
 
     with patch("src.deal_analyzer.cli.analyze_deal_with_ollama_outcome", side_effect=side_effects):
-        analyses, counts = _analyze_period_rows(rows, _cfg(), logger)
+        analyses, counts = _analyze_period_rows(rows, _cfg(), logger, backend_override="ollama")
 
     assert len(analyses) == 3
     assert counts["llm_success_count"] == 2
+    assert counts["llm_success_repaired_count"] == 1
     assert counts["llm_fallback_count"] == 1
     assert counts["llm_error_count"] == 1
 
@@ -89,10 +92,44 @@ def test_analyze_deal_and_period_pass_same_timeout_via_config_object():
     def _capture(*, normalized_deal, config):
         seen_timeouts.append(config.ollama_timeout_seconds)
         deal_id = int(normalized_deal.get("deal_id") or 0)
-        return LlmAnalysisOutcome(_analysis(deal_id, "ollama"), "ollama", False, None)
+        return LlmAnalysisOutcome(_analysis(deal_id, "ollama"), "ollama", False, None, False)
 
     with patch("src.deal_analyzer.cli.analyze_deal_with_ollama_outcome", side_effect=_capture):
-        _analyze_one_with_isolation({"deal_id": 10}, cfg, logger, deal_hint="10")
-        _analyze_period_rows([{"deal_id": 11}, {"deal_id": 12}], cfg, logger)
+        _analyze_one_with_isolation({"deal_id": 10}, cfg, logger, deal_hint="10", backend_override="ollama")
+        _analyze_period_rows([{"deal_id": 11}, {"deal_id": 12}], cfg, logger, backend_override="ollama")
 
     assert seen_timeouts == [42, 42, 42]
+
+
+def test_preflight_success_path():
+    logger = _Logger()
+
+    class _Client:
+        def __init__(self, *, base_url, model, timeout_seconds):
+            pass
+
+        def preflight(self, *, probe_timeout_seconds):
+            return OllamaPreflightResult(ok=True, error=None)
+
+    with patch("src.deal_analyzer.cli.OllamaClient", _Client):
+        forced_rules = _run_ollama_preflight(_cfg(), logger)
+
+    assert forced_rules is False
+    assert any("preflight success" in msg for msg in logger.infos)
+
+
+def test_preflight_fail_path_switches_to_rules():
+    logger = _Logger()
+
+    class _Client:
+        def __init__(self, *, base_url, model, timeout_seconds):
+            pass
+
+        def preflight(self, *, probe_timeout_seconds):
+            return OllamaPreflightResult(ok=False, error="connect failed")
+
+    with patch("src.deal_analyzer.cli.OllamaClient", _Client):
+        forced_rules = _run_ollama_preflight(_cfg(), logger)
+
+    assert forced_rules is True
+    assert any("preflight failed" in msg for msg in logger.warnings)

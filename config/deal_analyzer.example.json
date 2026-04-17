@@ -1,4 +1,4 @@
-﻿{
+{
   "output_dir": "workspace/deal_analyzer",
   "analyzer_backend": "rules",
   "ollama_base_url": "http://127.0.0.1:11434",
@@ -15,6 +15,37 @@
   "appointment_list_enrich_enabled": false,
   "client_list_source_name": "client_list_v1",
   "appointment_list_source_name": "appointments_v1",
+  "client_list_source_url": "",
+  "appointment_list_source_url": "",
+  "client_list_sheet_name": "",
+  "appointment_list_sheet_name": "",
+  "matching_strategy": "priority_v1",
+  "operator_outputs_enabled": true,
+  "fields_mapping": {
+    "client_list": {
+      "deal_id": "ID сделки",
+      "phone": "Телефон",
+      "email": "Email",
+      "company_name": "Компания",
+      "contact_name": "Контакт",
+      "test_started": "Тест начат",
+      "test_completed": "Тест завершен",
+      "test_status": "Статус теста",
+      "test_comments": "Комментарии по тесту"
+    },
+    "appointment_list": {
+      "deal_id": "ID сделки",
+      "phone": "Телефон",
+      "email": "Email",
+      "company_name": "Компания",
+      "contact_name": "Контакт",
+      "appointment_date": "Дата назначения",
+      "assigned_by": "Кто назначил",
+      "conducted_by": "Кто проводил",
+      "meeting_status": "Статус встречи",
+      "transfer_cancel_flag": "Перенос/Отмена"
+    }
+  },
   "score_weights": {
     "presentation": 20,
     "brief": 10,
@@ -25,5 +56,19 @@
     "product_fit": 15,
     "probability": 5,
     "data_completeness": 10
-  }
+  },
+  "roks_source_url": "",
+  "roks_sheet_name": "",
+  "roks_sheet_candidates": [
+    "???? 2026"
+  ],
+  "transcription_backend": "disabled",
+  "transcription_base_url": "",
+  "transcription_model": "",
+  "transcription_timeout_seconds": 60,
+  "transcription_cache_dir": "workspace/deal_analyzer/transcripts_cache",
+  "call_collection_mode": "disabled",
+  "call_backend": "amocrm_api",
+  "amocrm_auth_config_path": "config/amocrm_auth.local.json",
+  "call_base_domain": ""
 }

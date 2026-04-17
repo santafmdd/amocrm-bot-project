@@ -1,4 +1,4 @@
-﻿# ROADMAP
+# ROADMAP
 
 ## Active Stage
 
@@ -124,3 +124,32 @@ Near-term ops note:
 ?????????? ?? ??????????????:
 - ??????????? ????? ? Google Sheets ???? ?? ????????,
 - runtime/state ???????? ? ????????? ?????? ? ????????.
+
+## Update (2026-04-18): Next Delivered Step (Analyzer Enrichment)
+
+Сделано:
+- реализован read-only enrich/data pipeline в `deal_analyzer`;
+- подключены внешние источники (client list, appointment table, ROKS context);
+- добавлены operator outputs (`manager_summary`, `employee_coaching`, `employee_fix_tasks`);
+- добавлены новые operator CLI команды (`enrich-deal`, `enrich-period`, `roks-snapshot`).
+
+Не входит в этот шаг:
+- write-back enrich результатов в Google Sheets;
+- изменения в analytics/weekly_refusals writer paths;
+- direct LLM data fetching from source systems.
+
+Следующий логичный шаг:
+1. стабилизировать field mapping для конкретных боевых вкладок client/appointment/ROKS;
+2. подключить controlled writer layer для enriched operator outputs (отдельным этапом, без ломки текущих отчетов).
+
+## Update (2026-04-18): Deal Analyzer Calls MVP
+
+Delivered:
+1. Call evidence layer (API-first + fallback)
+2. Transcript adapter + cache
+3. Snapshot integration with call-derived context
+4. Operator CLI for call collection/transcription
+
+Next:
+- plug first production STT backend into transcription adapter
+- add episode-level call segmentation on top of cached transcripts

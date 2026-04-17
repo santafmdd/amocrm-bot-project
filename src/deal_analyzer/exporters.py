@@ -113,7 +113,15 @@ def _flatten(row: dict[str, Any], fieldnames: list[str]) -> dict[str, Any]:
 def _csv_fields(*, include_executed_at: bool) -> list[str]:
     fields = [
         "backend",
+        "analysis_backend_requested",
         "analysis_backend_used",
+        "llm_repair_applied",
+        "backend_requested",
+        "backend_effective_summary",
+        "llm_success",
+        "llm_success_repaired",
+        "llm_fallback",
+        "llm_error",
         "period_mode_resolved",
         "period_start",
         "period_end",
@@ -123,6 +131,31 @@ def _csv_fields(*, include_executed_at: bool) -> list[str]:
         "amo_lead_id",
         "deal_name",
         "score_0_100",
+        "enrichment_match_status",
+        "enrichment_match_source",
+        "enrichment_confidence",
+        "matched_client_list_row_id",
+        "matched_appointment_row_id",
+        "call_source",
+        "calls_total",
+        "missing_recording_calls",
+        "longest_call_duration_seconds",
+        "call_warnings",
+        "transcription_backend",
+        "call_collection_mode",
+        "transcripts_total",
+        "enriched_test_started",
+        "enriched_test_completed",
+        "enriched_test_status",
+        "enriched_test_comments",
+        "enriched_appointment_date",
+        "enriched_assigned_by",
+        "enriched_conducted_by",
+        "enriched_meeting_status",
+        "enriched_transfer_cancel_flag",
+        "manager_summary",
+        "employee_coaching",
+        "employee_fix_tasks",
         "presentation_quality_flag",
         "followup_quality_flag",
         "data_completeness_flag",
@@ -158,12 +191,18 @@ def build_markdown_report(
             lines.append(f"- As of: {report_metadata.get('as_of_date')}")
         if report_metadata.get("executed_at"):
             lines.append(f"- Executed at: {report_metadata.get('executed_at')}")
-        if report_metadata.get("llm_success_count") is not None:
-            lines.append(f"- LLM success: {report_metadata.get('llm_success_count')}")
-        if report_metadata.get("llm_fallback_count") is not None:
-            lines.append(f"- LLM fallback: {report_metadata.get('llm_fallback_count')}")
-        if report_metadata.get("llm_error_count") is not None:
-            lines.append(f"- LLM errors: {report_metadata.get('llm_error_count')}")
+        if report_metadata.get("backend_requested"):
+            lines.append(f"- Backend requested: {report_metadata.get('backend_requested')}")
+        if report_metadata.get("backend_effective_summary"):
+            lines.append(f"- Backend effective: {report_metadata.get('backend_effective_summary')}")
+        if report_metadata.get("llm_success") is not None:
+            lines.append(f"- LLM success: {report_metadata.get('llm_success')}")
+        if report_metadata.get("llm_success_repaired") is not None:
+            lines.append(f"- LLM success repaired: {report_metadata.get('llm_success_repaired')}")
+        if report_metadata.get("llm_fallback") is not None:
+            lines.append(f"- LLM fallback: {report_metadata.get('llm_fallback')}")
+        if report_metadata.get("llm_error") is not None:
+            lines.append(f"- LLM errors: {report_metadata.get('llm_error')}")
         lines.append("")
 
     lines.extend([f"Deals in report: {len(analyses)}", ""])
@@ -171,12 +210,28 @@ def build_markdown_report(
         lines.append(f"## Deal {row.get('deal_id')}: {row.get('deal_name') or '-'}")
         if row.get("backend"):
             lines.append(f"- Backend: {row.get('backend')}")
+        if row.get("analysis_backend_requested"):
+            lines.append(f"- Analysis backend requested: {row.get('analysis_backend_requested')}")
         if row.get("analysis_backend_used"):
             lines.append(f"- Analysis backend used: {row.get('analysis_backend_used')}")
+        lines.append(f"- LLM repair applied: {row.get('llm_repair_applied', False)}")
+        lines.append(
+            "- Enrichment: status={status}, source={source}, confidence={conf}".format(
+                status=row.get("enrichment_match_status", ""),
+                source=row.get("enrichment_match_source", ""),
+                conf=row.get("enrichment_confidence", ""),
+            )
+        )
         lines.append(f"- Score: {row.get('score_0_100')}")
         lines.append(f"- Presentation flag: {row.get('presentation_quality_flag')}")
         lines.append(f"- Follow-up flag: {row.get('followup_quality_flag')}")
         lines.append(f"- Completeness flag: {row.get('data_completeness_flag')}")
+        if row.get("manager_summary"):
+            lines.append(f"- Manager summary: {row.get('manager_summary')}")
+        if row.get("employee_coaching"):
+            lines.append(f"- Employee coaching: {row.get('employee_coaching')}")
+        if isinstance(row.get("employee_fix_tasks"), list) and row.get("employee_fix_tasks"):
+            lines.append(f"- Employee fix tasks: {'; '.join(str(x) for x in row.get('employee_fix_tasks'))}")
         strong = ", ".join(row.get("strong_sides", [])) if isinstance(row.get("strong_sides"), list) else ""
         growth = ", ".join(row.get("growth_zones", [])) if isinstance(row.get("growth_zones"), list) else ""
         risks = ", ".join(row.get("risk_flags", [])) if isinstance(row.get("risk_flags"), list) else ""

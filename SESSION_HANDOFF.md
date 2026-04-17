@@ -917,3 +917,45 @@ UI backlog (???????????? ??????? controls):
 - ?????? ????????? ?? tag/utm_source,
 - ????????? ???????????,
 - ????????? ?????????? ??? ???????????.
+
+## Update (2026-04-18): Deal Analyzer Enrichment MVP Delivered
+
+Delivered (read-only):
+- external enrich from client list and appointment table via Google Sheets API read path;
+- deterministic matching priority (`deal_id -> phone -> email -> company+contact -> company`);
+- ROKS context extractor for manager/team KPI snapshot with sanitization of formula-noise values;
+- unified snapshot builder for analyzer input;
+- operator CLI commands:
+  - `enrich-deal`
+  - `enrich-period`
+  - `roks-snapshot`
+
+Guaranteed unchanged:
+- analytics flow;
+- weekly_refusals flow;
+- existing Google Sheets writer flows.
+
+Current limitations (explicit):
+- no write-back from enrich pipeline;
+- ROKS extraction is marker/header-driven and may require per-sheet mapping hardening for full KPI precision.
+
+Reference doc:
+- `docs/deal_analyzer_enrichment_mvp.md`.
+
+## Update (2026-04-18): Analyzer Call Evidence + Transcription MVP
+
+Done:
+- read-only call evidence for deal/period (`call_id`, `duration`, `direction`, recording refs, quality flags);
+- deterministic call dedup;
+- transcription adapter backends (`disabled/mock/local_placeholder/cloud_placeholder`);
+- transcript cache with deterministic key;
+- snapshot now includes `call_evidence`, `transcripts`, `call_derived_summary`;
+- new CLI commands: `collect-calls`, `transcribe-deal`, `transcribe-period`, `build-call-snapshot`.
+
+No regressions introduced into:
+- analytics flow
+- weekly_refusals flow
+- existing Google Sheets writers
+
+Reference doc:
+- `docs/deal_analyzer_calls_mvp.md`
