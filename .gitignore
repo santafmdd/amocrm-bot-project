@@ -40,3 +40,5 @@ config/amocrm_collector.local.json
 pytest-tmp/
 pytest_tmp_env/
 config/deal_analyzer.local.json
+config/deal_analyzer.ollama.local.json
+config/deal_analyzer.rules.local.json
