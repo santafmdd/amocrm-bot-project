@@ -1,0 +1,14 @@
+{
+  "output_dir": "workspace/deal_analyzer",
+  "score_weights": {
+    "presentation": 20,
+    "brief": 10,
+    "demo_result": 10,
+    "pain": 10,
+    "business_tasks": 10,
+    "followup_tasks": 10,
+    "product_fit": 15,
+    "probability": 5,
+    "data_completeness": 10
+  }
+}

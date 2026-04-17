@@ -39,3 +39,4 @@ workspace/amocrm_auth/state.json
 config/amocrm_collector.local.json
 pytest-tmp/
 pytest_tmp_env/
+config/deal_analyzer.local.json
