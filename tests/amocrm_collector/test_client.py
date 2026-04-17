@@ -54,6 +54,44 @@ class _ProbeTasksClient(_ProbeClient):
         )
 
 
+class _ProbeNotes204Client(_ProbeClient):
+    def get_notes_by_lead(self, lead_id: int, limit: int = 250):
+        raise ApiRequestError(
+            path=f"/api/v4/leads/{lead_id}/notes",
+            message="amoCRM response is not JSON",
+            status=204,
+            content_type="text/html; charset=UTF-8",
+            body_preview="",
+        )
+
+
+class _ProbeTasks204Client(_ProbeClient):
+    def get_notes_by_lead(self, lead_id: int, limit: int = 250):
+        return []
+
+    def get_tasks_by_lead(self, lead_id: int, limit: int = 250):
+        raise ApiRequestError(
+            path=f"/api/v4/tasks?filter[entity_id]={lead_id}",
+            message="amoCRM response is not JSON",
+            status=204,
+            content_type="text/html; charset=UTF-8",
+            body_preview="",
+        )
+
+
+class _ProbeDebug204Client(_ProbeClient):
+    def _probe_embedded_with_retries(self, **kwargs):
+        return {
+            "endpoint": kwargs.get("path", ""),
+            "status": 204,
+            "content_type": "text/html; charset=UTF-8",
+            "item_count": 0,
+            "body_preview": "",
+            "ok": True,
+            "response_kind": "empty_no_content",
+        }
+
+
 def _collector_cfg() -> AmoCollectorConfig:
     return AmoCollectorConfig(
         config_path=Path("config/amocrm_collector.local.json"),
@@ -124,6 +162,24 @@ def test_collect_lead_bundle_non_json_tasks_fallback_without_crash():
     assert "proxy" in issue["body_preview"]
 
 
+def test_collect_lead_bundle_notes_204_empty_is_not_warning():
+    client = _ProbeNotes204Client()
+    bundle = client.collect_lead_bundle(31913530)
+
+    assert bundle["notes"] == []
+    warnings = [x for x in bundle.get("warnings", []) if x.get("section") == "notes"]
+    assert warnings == []
+
+
+def test_collect_lead_bundle_tasks_204_empty_is_not_warning():
+    client = _ProbeTasks204Client()
+    bundle = client.collect_lead_bundle(31913530)
+
+    assert bundle["tasks"] == []
+    warnings = [x for x in bundle.get("warnings", []) if x.get("section") == "tasks"]
+    assert warnings == []
+
+
 def test_schema_check_payload_includes_config_summary():
     captured: dict[str, object] = {}
 
@@ -163,9 +219,33 @@ def test_debug_deal_sections_command_exports_expected_structure():
             return {
                 "deal_id": lead_id,
                 "sections": {
-                    "lead": {"endpoint": "/api/v4/leads/1", "status": 200, "content_type": "application/json", "item_count": 1, "body_preview": "", "ok": True},
-                    "notes": {"endpoint": "/api/v4/leads/1/notes", "status": 200, "content_type": "application/json", "item_count": 0, "body_preview": "", "ok": True},
-                    "tasks": {"endpoint": "/api/v4/tasks", "status": 502, "content_type": "text/html", "item_count": 0, "body_preview": "<html>", "ok": False},
+                    "lead": {
+                        "endpoint": "/api/v4/leads/1",
+                        "status": 200,
+                        "content_type": "application/json",
+                        "item_count": 1,
+                        "body_preview": "",
+                        "ok": True,
+                        "response_kind": "json_items",
+                    },
+                    "notes": {
+                        "endpoint": "/api/v4/leads/1/notes",
+                        "status": 204,
+                        "content_type": "text/html; charset=UTF-8",
+                        "item_count": 0,
+                        "body_preview": "",
+                        "ok": True,
+                        "response_kind": "empty_no_content",
+                    },
+                    "tasks": {
+                        "endpoint": "/api/v4/tasks",
+                        "status": 502,
+                        "content_type": "text/html",
+                        "item_count": 0,
+                        "body_preview": "<html>",
+                        "ok": False,
+                        "response_kind": "error",
+                    },
                 },
             }
 
@@ -193,9 +273,18 @@ def test_debug_deal_sections_command_exports_expected_structure():
     assert payload.get("command") == "debug-deal-sections"
     sections = payload.get("sections", {})
     assert isinstance(sections, dict)
-    assert sections.get("lead", {}).get("endpoint")
-    assert sections.get("tasks", {}).get("status") == 502
+    assert sections.get("notes", {}).get("response_kind") == "empty_no_content"
+    assert sections.get("tasks", {}).get("response_kind") == "error"
     assert logger.info_calls
+
+
+def test_debug_deal_sections_runtime_marks_empty_no_content():
+    client = _ProbeDebug204Client()
+    payload = client.debug_deal_sections(31913530)
+
+    sections = payload.get("sections", {})
+    assert sections.get("notes", {}).get("response_kind") == "empty_no_content"
+    assert sections.get("tasks", {}).get("response_kind") == "empty_no_content"
 
 
 def test_collect_period_summary_contains_section_warning_counters():
@@ -209,7 +298,7 @@ def test_collect_period_summary_contains_section_warning_counters():
         def get_leads_by_period(self, **kwargs):
             self._page_calls += 1
             if self._page_calls == 1:
-                return [{"id": 1}, {"id": 2}, {"id": 3}]
+                return [{"id": 1}, {"id": 2}, {"id": 3}, {"id": 4}]
             return []
 
         def collect_lead_bundle(self, lead_id: int):
@@ -218,6 +307,9 @@ def test_collect_period_summary_contains_section_warning_counters():
                 warnings.append({"deal_id": 1, "section": "notes", "endpoint_path": "/api/v4/leads/1/notes"})
             if lead_id == 2:
                 warnings.append({"deal_id": 2, "section": "tasks", "endpoint_path": "/api/v4/tasks"})
+            if lead_id == 3:
+                # Mimic 204 empty behavior: no warning should be produced.
+                warnings.extend([])
             return {
                 "lead": {"id": lead_id, "responsible_user_id": 7},
                 "notes": [],

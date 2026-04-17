@@ -301,13 +301,14 @@ def _run_debug_deal_sections(
         if not isinstance(section_data, dict):
             continue
         logger.info(
-            "debug deal section: deal_id=%s section=%s endpoint=%s status=%s content_type=%s count=%s body=%s",
+            "debug deal section: deal_id=%s section=%s endpoint=%s status=%s content_type=%s count=%s response_kind=%s body=%s",
             deal_id,
             section_name,
             section_data.get("endpoint"),
             section_data.get("status"),
             section_data.get("content_type"),
             section_data.get("item_count"),
+            section_data.get("response_kind"),
             str(section_data.get("body_preview", ""))[:400],
         )
 

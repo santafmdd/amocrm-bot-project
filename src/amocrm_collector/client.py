@@ -296,6 +296,8 @@ class AmoCollectorClient:
                 return [x for x in payload if isinstance(x, dict)]
             return []
         except ApiRequestError as exc:
+            if _is_empty_no_content_error(exc) and (section.startswith("notes") or section.startswith("tasks")):
+                return []
             warnings.append(
                 {
                     "deal_id": lead_id,
@@ -374,12 +376,16 @@ class AmoCollectorClient:
         try:
             return self._collect_embedded_items(path=path, embedded_key=embedded_key, limit=limit, params=primary_params)
         except ApiRequestError as first_error:
+            if _is_empty_no_content_error(first_error):
+                return []
             last_error = first_error
             for params in fallback_params:
                 try:
                     payload = self._get(path, params=params)
                     return _embedded_list(payload, embedded_key)
                 except ApiRequestError as retry_error:
+                    if _is_empty_no_content_error(retry_error):
+                        return []
                     last_error = retry_error
                     continue
             raise last_error
@@ -457,8 +463,19 @@ class AmoCollectorClient:
                     "item_count": len(items),
                     "body_preview": "",
                     "ok": True,
+                    "response_kind": "json_items",
                 }
             except ApiRequestError as exc:
+                if _is_empty_no_content_error(exc):
+                    return {
+                        "endpoint": request_path,
+                        "status": exc.status,
+                        "content_type": exc.content_type,
+                        "item_count": 0,
+                        "body_preview": "",
+                        "ok": True,
+                        "response_kind": "empty_no_content",
+                    }
                 last_error = exc
 
         return {
@@ -469,6 +486,7 @@ class AmoCollectorClient:
             "body_preview": (last_error.body_preview if last_error else "")[:400],
             "ok": False,
             "error": last_error.message if last_error else "unknown_error",
+            "response_kind": "error",
         }
 
     def _probe_related_entities(self, *, entity: str, ids: list[int]) -> dict[str, Any]:
@@ -576,3 +594,8 @@ def _open_json(req: Request, *, path: str) -> tuple[dict[str, Any], ApiResponseM
         )
 
     return payload, ApiResponseMeta(path=path, status=status, content_type=content_type)
+
+
+def _is_empty_no_content_error(exc: ApiRequestError) -> bool:
+    body = str(exc.body_preview or "").strip()
+    return exc.status == 204 and body == ""
