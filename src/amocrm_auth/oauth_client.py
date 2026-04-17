@@ -81,7 +81,25 @@ class AmoOAuthClient:
             raise RuntimeError("amoCRM access token is empty")
 
         req = Request(
-            f"https://{host}/api/v4/account?with=users",
+            f"https://{host}/api/v4/account",
+            method="GET",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Accept": "application/json",
+            },
+        )
+        return _open_json(req)
+
+    def smoke_test_users(self, *, base_domain: str, access_token: str, limit: int = 5) -> dict[str, Any]:
+        host = str(base_domain or "").strip()
+        if not host:
+            raise RuntimeError("amoCRM base_domain is required for smoke test")
+        if not access_token.strip():
+            raise RuntimeError("amoCRM access token is empty")
+
+        safe_limit = max(1, min(int(limit), 250))
+        req = Request(
+            f"https://{host}/api/v4/users?limit={safe_limit}",
             method="GET",
             headers={
                 "Authorization": f"Bearer {access_token}",

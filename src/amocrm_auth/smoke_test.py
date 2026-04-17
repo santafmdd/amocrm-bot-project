@@ -50,15 +50,22 @@ def main() -> None:
         access_token = state.access_token
         logger.info("Access token refreshed and saved: %s", cfg.state_path)
 
-    payload = oauth.smoke_test_account(base_domain=base_domain, access_token=access_token)
-    account_id = payload.get("id", "")
-    account_name = payload.get("name", "")
-    users = payload.get("_embedded", {}).get("users", []) if isinstance(payload.get("_embedded", {}), dict) else []
+    account_payload = oauth.smoke_test_account(base_domain=base_domain, access_token=access_token)
+    account_id = account_payload.get("id", "")
+    account_name = account_payload.get("name", "")
     logger.info(
-        "amoCRM API smoke test success: base_domain=%s account_id=%s account_name=%s users_count=%s",
+        "account smoke test success: base_domain=%s account_id=%s account_name=%s",
         base_domain,
         account_id,
         account_name,
+    )
+
+    users_payload = oauth.smoke_test_users(base_domain=base_domain, access_token=access_token, limit=5)
+    embedded = users_payload.get("_embedded", {}) if isinstance(users_payload, dict) else {}
+    users = embedded.get("users", []) if isinstance(embedded, dict) else []
+    logger.info(
+        "users smoke test success: base_domain=%s users_count=%s",
+        base_domain,
         len(users) if isinstance(users, list) else 0,
     )
 
