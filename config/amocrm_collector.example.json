@@ -7,6 +7,10 @@
     0,
     0
   ],
+  "manager_names_exclude": [
+    "Антон Коломоец",
+    "Гордиенко Кирилл"
+  ],
   "pipeline_ids_include": [],
   "product_field_id": 0,
   "source_field_id": 0,
@@ -19,7 +23,7 @@
   "company_comment_field_id": 0,
   "contact_comment_field_id": 0,
   "presentation_link_search": {
-    "scan_lead_custom_fields_url": true,
+    "scan_deal_custom_fields_url": true,
     "scan_notes_common_text": true,
     "scan_company_comment": true,
     "scan_contact_comment": true,

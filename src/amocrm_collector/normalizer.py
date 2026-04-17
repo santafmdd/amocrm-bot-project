@@ -11,6 +11,17 @@ from .config import AmoCollectorConfig
 _URL_RE = re.compile(r"https?://[^\s<>'\"]+", re.IGNORECASE)
 _MEETING_TASK_RE = re.compile(r"(встреч|демо|презент|созвон)", re.IGNORECASE)
 
+_DEFAULT_FIELD_NAME_HINTS: dict[str, list[str]] = {
+    "product": ["продукт", "товар", "услуг"],
+    "source": ["источник", "канал", "utm"],
+    "pain": ["боль", "проблем"],
+    "business_tasks": ["бизнес", "задач", "business"],
+    "brief": ["бриф", "brief"],
+    "demo_result": ["демо", "встреч", "презентац"],
+    "test_result": ["тест"],
+    "probability": ["вероятност", "probab"],
+}
+
 
 @dataclass(frozen=True)
 class DealScopeDecision:
@@ -29,8 +40,9 @@ class AmoDealNormalizer:
     def __init__(self, config: AmoCollectorConfig) -> None:
         self.config = config
         self._link_patterns = [re.compile(x, re.IGNORECASE) for x in config.presentation_link_search.regexes if str(x).strip()]
+        self._manager_names_exclude_norm = {_norm_name(x) for x in config.manager_names_exclude if _norm_name(x)}
 
-    def is_manager_allowed(self, responsible_user_id: int | None) -> DealScopeDecision:
+    def is_manager_allowed(self, responsible_user_id: int | None, responsible_user_name: str = "") -> DealScopeDecision:
         if not isinstance(responsible_user_id, int):
             return DealScopeDecision(allowed=False, reason="responsible_user_missing")
 
@@ -41,6 +53,11 @@ class AmoDealNormalizer:
             return DealScopeDecision(allowed=False, reason="not_in_include")
         if responsible_user_id in exclude:
             return DealScopeDecision(allowed=False, reason="in_exclude")
+
+        name_norm = _norm_name(responsible_user_name)
+        if name_norm and name_norm in self._manager_names_exclude_norm:
+            return DealScopeDecision(allowed=False, reason="name_in_exclude")
+
         return DealScopeDecision(allowed=True, reason="allowed")
 
     def normalize_bundle(self, bundle: dict[str, Any]) -> dict[str, Any]:
@@ -53,27 +70,31 @@ class AmoDealNormalizer:
         pipeline_name, status_name = self._resolve_pipeline_status_names(lead, bundle)
 
         responsible_user_id = _as_opt_int(lead.get("responsible_user_id"))
-        scope = self.is_manager_allowed(responsible_user_id)
+        responsible_user_name = ""
+        if isinstance(responsible_user_id, int):
+            user = users_cache.get(responsible_user_id, {})
+            responsible_user_name = _clean_text(user.get("name"))
+        scope = self.is_manager_allowed(responsible_user_id, responsible_user_name)
 
-        lead_cfv = _as_list(lead.get("custom_fields_values"))
+        deal_cfv = _as_list(lead.get("custom_fields_values"))
         contact = contacts[0] if contacts else {}
         company = companies[0] if companies else {}
         contact_cfv = _as_list(contact.get("custom_fields_values"))
         company_cfv = _as_list(company.get("custom_fields_values"))
 
-        product_values = self._read_values_from_field_id(lead_cfv, self.config.product_field_id)
-        source_values = self._read_values_from_field_id(lead_cfv, self.config.source_field_id)
-        pain_text = self._read_text_from_field_id(lead_cfv, self.config.pain_field_id)
-        business_tasks_text = self._read_text_from_field_id(lead_cfv, self.config.tasks_field_id)
-        demo_result_text = self._read_text_from_field_id(lead_cfv, self.config.demo_result_field_id)
-        test_result_text = self._read_text_from_field_id(lead_cfv, self.config.test_result_field_id)
-        probability_value = self._read_scalar_from_field_id(lead_cfv, self.config.probability_field_id)
+        product_values = self._read_values_from_field(deal_cfv, self.config.product_field_id, _DEFAULT_FIELD_NAME_HINTS["product"])
+        source_values = self._read_values_from_field(deal_cfv, self.config.source_field_id, _DEFAULT_FIELD_NAME_HINTS["source"])
+        pain_text = self._read_text_from_field(deal_cfv, self.config.pain_field_id, _DEFAULT_FIELD_NAME_HINTS["pain"])
+        business_tasks_text = self._read_text_from_field(deal_cfv, self.config.tasks_field_id, _DEFAULT_FIELD_NAME_HINTS["business_tasks"])
+        demo_result_text = self._read_text_from_field(deal_cfv, self.config.demo_result_field_id, _DEFAULT_FIELD_NAME_HINTS["demo_result"])
+        test_result_text = self._read_text_from_field(deal_cfv, self.config.test_result_field_id, _DEFAULT_FIELD_NAME_HINTS["test_result"])
+        probability_value = self._read_scalar_from_field(deal_cfv, self.config.probability_field_id, _DEFAULT_FIELD_NAME_HINTS["probability"])
 
-        brief_url_candidates = self._read_values_from_field_id(lead_cfv, self.config.brief_field_id)
+        brief_url_candidates = self._read_values_from_field(deal_cfv, self.config.brief_field_id, _DEFAULT_FIELD_NAME_HINTS["brief"])
         brief_url = brief_url_candidates[0] if brief_url_candidates else ""
 
-        company_comment = self._read_text_from_field_id(company_cfv, self.config.company_comment_field_id)
-        contact_comment = self._read_text_from_field_id(contact_cfv, self.config.contact_comment_field_id)
+        company_comment = self._read_text_from_field(company_cfv, self.config.company_comment_field_id, ["коммент", "comment"])
+        contact_comment = self._read_text_from_field(contact_cfv, self.config.contact_comment_field_id, ["коммент", "comment"])
 
         company_name = _clean_text(company.get("name"))
         company_inn = self._extract_company_inn(company_cfv)
@@ -86,7 +107,7 @@ class AmoDealNormalizer:
         tasks_summary_raw = self._summarize_tasks(tasks)
 
         links = self._collect_presentation_links(
-            lead_cfv=lead_cfv,
+            deal_cfv=deal_cfv,
             notes=notes,
             company_cfv=company_cfv,
             contact_cfv=contact_cfv,
@@ -124,11 +145,6 @@ class AmoDealNormalizer:
 
         required = self.config.presentation_detection.require_any_of
         presentation_detected = any(flags.get(key, False) for key in required) or bool(links.candidates)
-
-        responsible_user_name = ""
-        if isinstance(responsible_user_id, int):
-            user = users_cache.get(responsible_user_id, {})
-            responsible_user_name = _clean_text(user.get("name"))
 
         amo_lead_id = _as_opt_int(lead.get("id"))
 
@@ -170,6 +186,54 @@ class AmoDealNormalizer:
             "manager_scope_allowed": scope.allowed,
             "training_candidate_text": "",
         }
+
+    def _read_values_from_field(self, custom_fields_values: list[dict[str, Any]], field_id: int | None, fallback_name_hints: list[str]) -> list[str]:
+        by_id = self._read_values_by_id(custom_fields_values, field_id)
+        if by_id:
+            return by_id
+        return self._read_values_by_name_hints(custom_fields_values, fallback_name_hints)
+
+    def _read_text_from_field(self, custom_fields_values: list[dict[str, Any]], field_id: int | None, fallback_name_hints: list[str]) -> str:
+        values = self._read_values_from_field(custom_fields_values, field_id, fallback_name_hints)
+        return "\n".join(values) if values else ""
+
+    def _read_scalar_from_field(self, custom_fields_values: list[dict[str, Any]], field_id: int | None, fallback_name_hints: list[str]) -> int | float | str | None:
+        values = self._read_values_from_field(custom_fields_values, field_id, fallback_name_hints)
+        if not values:
+            return None
+        raw = values[0]
+        try:
+            if "." in raw:
+                return float(raw)
+            return int(raw)
+        except ValueError:
+            return raw
+
+    def _read_values_by_id(self, custom_fields_values: list[dict[str, Any]], field_id: int | None) -> list[str]:
+        if field_id is None:
+            return []
+        for field in custom_fields_values:
+            if _as_opt_int(field.get("field_id")) != field_id:
+                continue
+            values = _as_list(field.get("values"))
+            return _dedupe([_clean_text(item.get("value")) for item in values if _clean_text(item.get("value"))])
+        return []
+
+    def _read_values_by_name_hints(self, custom_fields_values: list[dict[str, Any]], hints: list[str]) -> list[str]:
+        if not hints:
+            return []
+        norm_hints = [_norm_name(x) for x in hints if _norm_name(x)]
+        for field in custom_fields_values:
+            field_name = _norm_name(field.get("field_name") or field.get("name"))
+            if not field_name:
+                continue
+            if not any(h in field_name for h in norm_hints):
+                continue
+            values = _as_list(field.get("values"))
+            cleaned = _dedupe([_clean_text(item.get("value")) for item in values if _clean_text(item.get("value"))])
+            if cleaned:
+                return cleaned
+        return []
 
     def _resolve_pipeline_status_names(self, lead: dict[str, Any], bundle: dict[str, Any]) -> tuple[str, str]:
         pipeline_id = _as_opt_int(lead.get("pipeline_id"))
@@ -240,36 +304,10 @@ class AmoDealNormalizer:
             )
         return out
 
-    def _read_values_from_field_id(self, custom_fields_values: list[dict[str, Any]], field_id: int | None) -> list[str]:
-        if field_id is None:
-            return []
-        for field in custom_fields_values:
-            if _as_opt_int(field.get("field_id")) != field_id:
-                continue
-            values = _as_list(field.get("values"))
-            return _dedupe([_clean_text(item.get("value")) for item in values if _clean_text(item.get("value"))])
-        return []
-
-    def _read_text_from_field_id(self, custom_fields_values: list[dict[str, Any]], field_id: int | None) -> str:
-        values = self._read_values_from_field_id(custom_fields_values, field_id)
-        return "\n".join(values) if values else ""
-
-    def _read_scalar_from_field_id(self, custom_fields_values: list[dict[str, Any]], field_id: int | None) -> int | float | str | None:
-        values = self._read_values_from_field_id(custom_fields_values, field_id)
-        if not values:
-            return None
-        raw = values[0]
-        try:
-            if "." in raw:
-                return float(raw)
-            return int(raw)
-        except ValueError:
-            return raw
-
     def _collect_presentation_links(
         self,
         *,
-        lead_cfv: list[dict[str, Any]],
+        deal_cfv: list[dict[str, Any]],
         notes: list[dict[str, Any]],
         company_cfv: list[dict[str, Any]],
         contact_cfv: list[dict[str, Any]],
@@ -280,8 +318,8 @@ class AmoDealNormalizer:
         from_company_comment = False
         from_contact_comment = False
 
-        if self.config.presentation_link_search.scan_lead_custom_fields_url:
-            for field in lead_cfv:
+        if self.config.presentation_link_search.scan_deal_custom_fields_url:
+            for field in deal_cfv:
                 for item in _as_list(field.get("values")):
                     candidates.extend(self._extract_links_from_text(_clean_text(item.get("value"))))
 
@@ -300,8 +338,8 @@ class AmoDealNormalizer:
                 candidates.extend(links)
             else:
                 for field in company_cfv:
-                    name = _clean_text(field.get("field_name")).lower()
-                    if "коммент" in name:
+                    name = _norm_name(field.get("field_name"))
+                    if "коммент" in name or "comment" in name:
                         for item in _as_list(field.get("values")):
                             links = self._extract_links_from_text(_clean_text(item.get("value")))
                             if links:
@@ -316,8 +354,8 @@ class AmoDealNormalizer:
                 candidates.extend(links)
             else:
                 for field in contact_cfv:
-                    name = _clean_text(field.get("field_name")).lower()
-                    if "коммент" in name:
+                    name = _norm_name(field.get("field_name"))
+                    if "коммент" in name or "comment" in name:
                         for item in _as_list(field.get("values")):
                             links = self._extract_links_from_text(_clean_text(item.get("value")))
                             if links:
@@ -377,7 +415,7 @@ class AmoDealNormalizer:
     @staticmethod
     def _extract_company_inn(company_cfv: list[dict[str, Any]]) -> str:
         for field in company_cfv:
-            name = _clean_text(field.get("field_name")).lower()
+            name = _norm_name(field.get("field_name"))
             if "инн" in name:
                 for item in _as_list(field.get("values")):
                     value = _clean_text(item.get("value"))
@@ -438,6 +476,12 @@ def _as_opt_int(value: Any) -> int | None:
 def _clean_text(value: Any) -> str:
     text = str(value or "").strip()
     return re.sub(r"\s+", " ", text)
+
+
+def _norm_name(value: Any) -> str:
+    text = _clean_text(value).lower().replace("ё", "е")
+    text = re.sub(r"\s+", " ", text)
+    return text
 
 
 def _dedupe(values: list[str]) -> list[str]:

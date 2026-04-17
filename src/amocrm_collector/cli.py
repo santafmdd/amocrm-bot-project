@@ -10,7 +10,12 @@ from src.config import load_config
 from src.logger import setup_logging
 
 from .client import AmoCollectorClient
-from .config import AmoCollectorConfig, load_collector_config
+from .config import (
+    AmoCollectorConfig,
+    build_collector_config_summary,
+    collect_collector_config_warnings,
+    load_collector_config,
+)
 from .exporters import collector_output_dir, write_json_export, write_normalized_csv, write_normalized_jsonl
 from .normalizer import AmoDealNormalizer
 
@@ -29,6 +34,9 @@ def _parse_args() -> argparse.Namespace:
     deal = sub.add_parser("collect-deal", help="Collect one deal bundle")
     deal.add_argument("--deal-id", type=int, required=True)
 
+    debug = sub.add_parser("debug-deal-sections", help="Debug raw API sections for a single deal")
+    debug.add_argument("--deal-id", type=int, required=True)
+
     sub.add_parser("schema-check", help="Export account schema snapshot")
 
     return parser.parse_args()
@@ -40,6 +48,9 @@ def main() -> None:
     logger = setup_logging(app.logs_dir)
 
     cfg = load_collector_config(args.config)
+    for msg in collect_collector_config_warnings(cfg):
+        logger.warning(msg)
+
     auth_cfg = load_amocrm_auth_config(str(cfg.auth_config_path))
     state = load_auth_state(auth_cfg.state_path)
 
@@ -56,7 +67,7 @@ def main() -> None:
     write_latest = not bool(args.no_latest)
 
     if args.command == "schema-check":
-        _run_schema_check(client, output_dir, base_domain, write_latest, logger)
+        _run_schema_check(client, cfg, output_dir, base_domain, write_latest, logger)
         return
 
     if args.command == "collect-deal":
@@ -67,10 +78,21 @@ def main() -> None:
         _run_collect_period(client, normalizer, cfg, output_dir, base_domain, args.date_from, args.date_to, write_latest, logger)
         return
 
+    if args.command == "debug-deal-sections":
+        _run_debug_deal_sections(client, output_dir, base_domain, int(args.deal_id), write_latest, logger)
+        return
+
     raise RuntimeError(f"Unsupported command: {args.command}")
 
 
-def _run_schema_check(client: AmoCollectorClient, output_dir, base_domain: str, write_latest: bool, logger) -> None:
+def _run_schema_check(
+    client: AmoCollectorClient,
+    cfg: AmoCollectorConfig,
+    output_dir,
+    base_domain: str,
+    write_latest: bool,
+    logger,
+) -> None:
     account = client.get_account()
     users = client.get_users_cache()
     pipelines = client.get_pipelines_cache()
@@ -78,9 +100,12 @@ def _run_schema_check(client: AmoCollectorClient, output_dir, base_domain: str, 
     contact_fields = client.get_custom_fields("contacts")
     company_fields = client.get_custom_fields("companies")
 
+    config_summary = build_collector_config_summary(cfg)
+
     payload: dict[str, Any] = {
         "command": "schema-check",
         "base_domain": base_domain,
+        "config_summary": config_summary,
         "counts": {
             "users": len(users),
             "pipelines": len(pipelines),
@@ -120,6 +145,7 @@ def _run_collect_deal(
     logger,
 ) -> None:
     bundle = client.collect_lead_bundle(deal_id)
+    _log_bundle_issues(bundle, logger)
     normalized = normalizer.normalize_bundle(bundle)
     payload = {
         "command": "collect-deal",
@@ -171,16 +197,42 @@ def _run_collect_period(
 
     normalized_rows: list[dict[str, Any]] = []
     skipped_by_scope = 0
+    deals_with_warnings = 0
+    deals_with_errors = 0
+
+    section_warning_deal_ids: dict[str, set[int]] = {"notes": set(), "tasks": set()}
+
+    total_deals_seen = 0
     for deal_short in raw_deals:
         deal_id = deal_short.get("id")
         if not isinstance(deal_id, int):
             continue
-        bundle = client.collect_lead_bundle(deal_id)
+
+        total_deals_seen += 1
+        try:
+            bundle = client.collect_lead_bundle(deal_id)
+        except Exception as exc:
+            deals_with_errors += 1
+            logger.error("collect-period deal failed: deal_id=%s error=%s", deal_id, exc)
+            continue
+
+        warnings = bundle.get("warnings", []) if isinstance(bundle.get("warnings"), list) else []
+        errors = bundle.get("errors", []) if isinstance(bundle.get("errors"), list) else []
+        if warnings:
+            deals_with_warnings += 1
+            _log_bundle_issues(bundle, logger)
+            _track_section_warning_ids(section_warning_deal_ids, warnings)
+        if errors:
+            deals_with_errors += 1
+            _log_bundle_issues(bundle, logger)
+
         normalized = normalizer.normalize_bundle(bundle)
         if not bool(normalized.get("manager_scope_allowed", False)):
             skipped_by_scope += 1
             continue
         normalized_rows.append(normalized)
+
+    warning_summary = _build_section_warning_summary(section_warning_deal_ids, top_n=50)
 
     payload = {
         "command": "collect-period",
@@ -191,7 +243,14 @@ def _run_collect_period(
             "raw_deals": len(raw_deals),
             "normalized": len(normalized_rows),
             "skipped_by_scope": skipped_by_scope,
+            "total_deals_seen": total_deals_seen,
+            "total_deals_exported": len(normalized_rows),
+            "deals_with_warnings": deals_with_warnings,
+            "deals_with_errors": deals_with_errors,
+            "deals_with_notes_warning": warning_summary["notes"]["deals_count"],
+            "deals_with_tasks_warning": warning_summary["tasks"]["deals_count"],
         },
+        "section_warning_summary": warning_summary,
         "normalized_deals": normalized_rows,
     }
 
@@ -201,14 +260,113 @@ def _run_collect_period(
     csv_export = write_normalized_csv(output_dir=output_dir, name=name, rows=normalized_rows, write_latest=write_latest)
 
     logger.info(
-        "collect-period success: raw_deals=%s normalized=%s skipped_by_scope=%s json=%s jsonl=%s csv=%s",
+        "collect-period success: raw_deals=%s exported=%s skipped_by_scope=%s warnings=%s errors=%s notes_warn=%s tasks_warn=%s json=%s jsonl=%s csv=%s",
         len(raw_deals),
         len(normalized_rows),
         skipped_by_scope,
+        deals_with_warnings,
+        deals_with_errors,
+        warning_summary["notes"]["deals_count"],
+        warning_summary["tasks"]["deals_count"],
         main_export.timestamped,
         jsonl_export.timestamped,
         csv_export.timestamped,
     )
+
+
+def _run_debug_deal_sections(
+    client: AmoCollectorClient,
+    output_dir,
+    base_domain: str,
+    deal_id: int,
+    write_latest: bool,
+    logger,
+) -> None:
+    result = client.debug_deal_sections(deal_id)
+    payload = {
+        "command": "debug-deal-sections",
+        "base_domain": base_domain,
+        **result,
+    }
+
+    exported = write_json_export(
+        output_dir=output_dir,
+        name=f"debug_deal_sections_{deal_id}",
+        payload=payload,
+        write_latest=write_latest,
+    )
+
+    sections = payload.get("sections", {}) if isinstance(payload.get("sections"), dict) else {}
+    for section_name, section_data in sections.items():
+        if not isinstance(section_data, dict):
+            continue
+        logger.info(
+            "debug deal section: deal_id=%s section=%s endpoint=%s status=%s content_type=%s count=%s body=%s",
+            deal_id,
+            section_name,
+            section_data.get("endpoint"),
+            section_data.get("status"),
+            section_data.get("content_type"),
+            section_data.get("item_count"),
+            str(section_data.get("body_preview", ""))[:400],
+        )
+
+    logger.info("debug-deal-sections exported: deal_id=%s path=%s latest=%s", deal_id, exported.timestamped, exported.latest)
+
+
+def _track_section_warning_ids(target: dict[str, set[int]], warnings: list[dict[str, Any]]) -> None:
+    for issue in warnings:
+        if not isinstance(issue, dict):
+            continue
+        section = str(issue.get("section", "") or "").lower()
+        deal_id = issue.get("deal_id")
+        if not isinstance(deal_id, int):
+            continue
+        if section.startswith("notes"):
+            target["notes"].add(deal_id)
+        if section.startswith("tasks"):
+            target["tasks"].add(deal_id)
+
+
+def _build_section_warning_summary(section_warning_deal_ids: dict[str, set[int]], top_n: int = 50) -> dict[str, dict[str, Any]]:
+    summary: dict[str, dict[str, Any]] = {}
+    for key in ("notes", "tasks"):
+        ids = sorted(section_warning_deal_ids.get(key, set()))
+        summary[key] = {
+            "deals_count": len(ids),
+            "affected_deal_ids": ids[: max(0, int(top_n))],
+        }
+    return summary
+
+
+def _log_bundle_issues(bundle: dict[str, Any], logger) -> None:
+    warnings = bundle.get("warnings", []) if isinstance(bundle.get("warnings"), list) else []
+    errors = bundle.get("errors", []) if isinstance(bundle.get("errors"), list) else []
+
+    for issue in warnings:
+        if not isinstance(issue, dict):
+            continue
+        logger.warning(
+            "deal section warning: deal_id=%s section=%s path=%s status=%s content_type=%s body=%s",
+            issue.get("deal_id"),
+            issue.get("section"),
+            issue.get("endpoint_path"),
+            issue.get("http_status"),
+            issue.get("content_type"),
+            str(issue.get("body_preview", ""))[:400],
+        )
+    for issue in errors:
+        if not isinstance(issue, dict):
+            continue
+        logger.error(
+            "deal section error: deal_id=%s section=%s path=%s status=%s content_type=%s body=%s",
+            issue.get("deal_id"),
+            issue.get("section"),
+            issue.get("endpoint_path"),
+            issue.get("http_status"),
+            issue.get("content_type"),
+            str(issue.get("body_preview", ""))[:400],
+        )
 
 
 def _parse_date_range(date_from: str, date_to: str) -> tuple[int, int]:

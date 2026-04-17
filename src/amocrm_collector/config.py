@@ -11,7 +11,7 @@ from src.safety import ensure_inside_root
 
 @dataclass(frozen=True)
 class PresentationLinkSearchConfig:
-    scan_lead_custom_fields_url: bool
+    scan_deal_custom_fields_url: bool
     scan_notes_common_text: bool
     scan_company_comment: bool
     scan_contact_comment: bool
@@ -33,6 +33,7 @@ class AmoCollectorConfig:
 
     manager_ids_include: list[int]
     manager_ids_exclude: list[int]
+    manager_names_exclude: list[str]
     pipeline_ids_include: list[int]
 
     product_field_id: int | None
@@ -48,6 +49,20 @@ class AmoCollectorConfig:
 
     presentation_link_search: PresentationLinkSearchConfig
     presentation_detection: PresentationDetectionConfig
+
+
+FIELD_ID_ATTRS: tuple[str, ...] = (
+    "product_field_id",
+    "source_field_id",
+    "pain_field_id",
+    "tasks_field_id",
+    "brief_field_id",
+    "demo_result_field_id",
+    "test_result_field_id",
+    "probability_field_id",
+    "company_comment_field_id",
+    "contact_comment_field_id",
+)
 
 
 def load_collector_config(config_path: str | None = None) -> AmoCollectorConfig:
@@ -76,13 +91,16 @@ def load_collector_config(config_path: str | None = None) -> AmoCollectorConfig:
     if not isinstance(detect_raw, dict):
         detect_raw = {}
 
+    manager_ids_exclude = _as_int_list_strict(raw.get("manager_ids_exclude"), field_name="manager_ids_exclude")
+
     return AmoCollectorConfig(
         config_path=cfg_path,
         auth_config_path=auth_path,
         output_dir=output_dir,
         base_domain=str(raw.get("base_domain", "") or "").strip(),
         manager_ids_include=_as_int_list(raw.get("manager_ids_include")),
-        manager_ids_exclude=_as_int_list(raw.get("manager_ids_exclude")),
+        manager_ids_exclude=manager_ids_exclude,
+        manager_names_exclude=_as_str_list(raw.get("manager_names_exclude")),
         pipeline_ids_include=_as_int_list(raw.get("pipeline_ids_include")),
         product_field_id=_as_opt_int(raw.get("product_field_id")),
         source_field_id=_as_opt_int(raw.get("source_field_id")),
@@ -95,7 +113,9 @@ def load_collector_config(config_path: str | None = None) -> AmoCollectorConfig:
         company_comment_field_id=_as_opt_int(raw.get("company_comment_field_id")),
         contact_comment_field_id=_as_opt_int(raw.get("contact_comment_field_id")),
         presentation_link_search=PresentationLinkSearchConfig(
-            scan_lead_custom_fields_url=bool(link_raw.get("scan_lead_custom_fields_url", True)),
+            scan_deal_custom_fields_url=bool(
+                link_raw.get("scan_deal_custom_fields_url", link_raw.get("scan_lead_custom_fields_url", True))
+            ),
             scan_notes_common_text=bool(link_raw.get("scan_notes_common_text", True)),
             scan_company_comment=bool(link_raw.get("scan_company_comment", True)),
             scan_contact_comment=bool(link_raw.get("scan_contact_comment", True)),
@@ -109,6 +129,38 @@ def load_collector_config(config_path: str | None = None) -> AmoCollectorConfig:
             ),
         ),
     )
+
+
+def build_collector_config_summary(cfg: AmoCollectorConfig) -> dict[str, Any]:
+    field_ids: dict[str, int | None] = {name: getattr(cfg, name) for name in FIELD_ID_ATTRS}
+    field_state = {
+        "set": [name for name, value in field_ids.items() if isinstance(value, int) and value > 0],
+        "zero": [name for name, value in field_ids.items() if value == 0],
+        "unset": [name for name, value in field_ids.items() if value is None],
+    }
+    return {
+        "config_path": str(cfg.config_path),
+        "auth_config_path": str(cfg.auth_config_path),
+        "output_dir": str(cfg.output_dir),
+        "base_domain": cfg.base_domain,
+        "manager_exclusions": {
+            "ids": list(cfg.manager_ids_exclude),
+            "names": list(cfg.manager_names_exclude),
+        },
+        "field_ids": field_ids,
+        "field_id_state": field_state,
+    }
+
+
+def collect_collector_config_warnings(cfg: AmoCollectorConfig) -> list[str]:
+    warnings: list[str] = []
+    for name in FIELD_ID_ATTRS:
+        value = getattr(cfg, name)
+        if value == 0:
+            warnings.append(
+                f"collector config: {name}=0, exact field_id mapping is disabled; fallback by field_name will be used"
+            )
+    return warnings
 
 
 def _as_opt_int(value: Any) -> int | None:
@@ -129,6 +181,26 @@ def _as_int_list(value: Any) -> list[int]:
             out.append(int(item))
         except (TypeError, ValueError):
             continue
+    return out
+
+
+def _as_int_list_strict(value: Any, *, field_name: str) -> list[int]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise RuntimeError(f"Invalid collector config: {field_name} must be a list of numeric ids")
+
+    out: list[int] = []
+    for item in value:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        try:
+            out.append(int(text))
+        except (TypeError, ValueError):
+            raise RuntimeError(
+                f"Invalid collector config: {field_name} must contain only numeric ids, got '{item}'"
+            )
     return out
 
 
