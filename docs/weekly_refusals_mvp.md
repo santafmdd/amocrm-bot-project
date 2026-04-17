@@ -71,3 +71,37 @@ CLI overrides (current run only):
 - `--weekly-period-mode`
 - `--weekly-date-from`
 - `--weekly-date-to`
+
+
+## Update (2026-04-16): Cumulative Write Semantics (Explicit)
+
+Cumulative profiles use **recompute from source** semantics:
+- parser aggregates rows from current source capture range,
+- writer overwrites target counts with recomputed totals,
+- writer does not read existing sheet numbers to add on top.
+
+So cumulative run is idempotent for the same source range (no double growth on repeated execution).
+
+Validation markers:
+- compiled artifact contains `mode` and `writer_mode_semantics=recompute_from_source`,
+- write summary contains `writer_mode` and `writer_mode_semantics`.
+
+
+## Update (2026-04-16): Cumulative Strategy Matrix
+
+Supported modes now:
+- `weekly`: overwrite target counts by current source slice.
+- `cumulative + recompute_from_source`: overwrite with recomputed source totals.
+- `cumulative + add_existing_values`: add incoming weekly counts to existing sheet counts by canonical key.
+
+For `add_existing_values` mode:
+- required deterministic `period_key`;
+- duplicate live apply for same period is blocked (idempotency guard);
+- repeated dry-run is safe and does not write guard state.
+
+Writer summary fields to inspect:
+- `writer_mode`
+- `writer_mode_semantics`
+- `cumulative_write_strategy`
+- `period_key`
+- `duplicate_period_guard`

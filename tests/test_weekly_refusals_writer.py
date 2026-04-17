@@ -144,6 +144,18 @@ def _parsed_payload() -> dict:
     }
 
 
+def test_summary_includes_recompute_semantics_marker() -> None:
+    base = _tmp_base("test_weekly_refusals_summary_semantics")
+    writer = WeeklyRefusalsBlockWriter(
+        project_root=base,
+        exports_dir=base,
+        client_factory=lambda root, logger=None: _AnchorClient(root, logger),
+    )
+    result = writer.write_block(destination=_make_destination(), parsed_result=_parsed_payload(), dry_run=True)
+    payload = result.summary_path.read_text(encoding="utf-8")
+    assert '"writer_mode_semantics": "weekly_overwrite_from_source"' in payload
+
+
 def test_weekly_refusals_writer_dry_run_does_not_update_sheet() -> None:
     base = _tmp_base("test_weekly_refusals_writer_dry")
     _FakeClient.called = 0
@@ -236,7 +248,9 @@ def test_new_before_status_inserts_row() -> None:
     payload = _parsed_payload()
     payload["aggregated_before_status_counts"].append({"status": "Привлечение(2 месяца) первый контакт. квалификация", "count": 3})
     writer.write_block(destination=_make_destination(), parsed_result=payload, dry_run=False)
-    assert fake.insert_calls
+    before_values = fake.last_updates[0]["values"]
+    statuses = [str(row[0]).strip().lower() for row in before_values if str(row[0]).strip()]
+    assert any("\u043f\u0435\u0440\u0432\u044b\u0439 \u043a\u043e\u043d\u0442\u0430\u043a\u0442. \u043a\u0432\u0430\u043b\u0438\u0444\u0438\u043a\u0430\u0446\u0438\u044f" in s for s in statuses)
 
 
 def test_new_after_item_inserts_row_inside_group() -> None:
@@ -250,7 +264,9 @@ def test_new_after_item_inserts_row_inside_group() -> None:
     payload = _parsed_payload()
     payload["aggregated_after_status_counts"].append({"status": "(Верификация) Перестал выходить на связь", "count": 2})
     writer.write_block(destination=_make_destination(), parsed_result=payload, dry_run=False)
-    assert fake.insert_calls
+    after_values = fake.last_updates[1]["values"]
+    statuses = [str(row[0]).strip().lower() for row in after_values if str(row[0]).strip()]
+    assert any("\u043f\u0435\u0440\u0435\u0441\u0442\u0430\u043b \u0432\u044b\u0445\u043e\u0434\u0438\u0442\u044c \u043d\u0430 \u0441\u0432\u044f\u0437\u044c" in s for s in statuses)
 
 
 def test_weekly_writer_uses_start_cell_fallback_when_anchor_not_found() -> None:
@@ -365,8 +381,8 @@ def test_weekly_mode_overwrites_counts_only() -> None:
     assert after_values[0][0] == "(Верификация) Не дозвониться"
 
 
-def test_cumulative_mode_adds_to_existing_counts() -> None:
-    base = _tmp_base("test_cumulative_mode_adds")
+def test_cumulative_mode_recomputes_from_source_without_adding_existing_sheet_values() -> None:
+    base = _tmp_base("test_cumulative_mode_recompute")
     fake = _AnchorClient(base)
     fake._grid[2][1] = "5"
     fake._grid[2][4] = "7"
@@ -380,8 +396,91 @@ def test_cumulative_mode_adds_to_existing_counts() -> None:
     writer.write_block(destination=_make_destination(), parsed_result=payload, dry_run=False)
     before_values = fake.last_updates[0]["values"]
     after_values = fake.last_updates[1]["values"]
-    assert before_values[0][1] == "7"
-    assert after_values[0][1] == "12"
+    assert before_values[0][1] == 2
+    assert after_values[0][1] == 5
+
+
+def test_cumulative_add_existing_values_sums_existing_and_incoming() -> None:
+    base = _tmp_base("test_cumulative_add_existing_values")
+    fake = _AnchorClient(base)
+    fake._grid[2][1] = "5"
+    fake._grid[2][4] = "7"
+    writer = WeeklyRefusalsBlockWriter(
+        project_root=base,
+        exports_dir=base,
+        client_factory=lambda _root, logger=None: fake,
+    )
+    guard_state = base / "debug" / "weekly_refusals_cumulative_guard_state.json"
+    if guard_state.exists():
+        guard_state.unlink()
+    payload = _parsed_payload()
+    payload["mode"] = "cumulative"
+    payload["cumulative_write_strategy"] = "add_existing_values"
+    payload["period_key"] = "weekly_refusals_cumulative_2m|period1"
+    writer.write_block(destination=_make_destination(), parsed_result=payload, dry_run=False)
+
+    before_values = fake.last_updates[0]["values"]
+    after_values = fake.last_updates[1]["values"]
+    assert before_values[0][1] == 7
+    assert after_values[0][1] == 12
+
+
+def test_cumulative_add_existing_values_blocks_duplicate_period() -> None:
+    base = _tmp_base("test_cumulative_add_existing_duplicate")
+    fake = _AnchorClient(base)
+    writer = WeeklyRefusalsBlockWriter(
+        project_root=base,
+        exports_dir=base,
+        client_factory=lambda _root, logger=None: fake,
+    )
+    guard_state = base / "debug" / "weekly_refusals_cumulative_guard_state.json"
+    if guard_state.exists():
+        guard_state.unlink()
+    payload = _parsed_payload()
+    payload["mode"] = "cumulative"
+    payload["cumulative_write_strategy"] = "add_existing_values"
+    payload["period_key"] = "weekly_refusals_cumulative_2m|period2"
+
+    writer.write_block(destination=_make_destination(), parsed_result=payload, dry_run=False)
+
+    raised = False
+    try:
+        writer.write_block(destination=_make_destination(), parsed_result=payload, dry_run=False)
+    except RuntimeError as exc:
+        raised = True
+        assert "Duplicate cumulative period apply blocked" in str(exc)
+    assert raised is True
+
+
+class _GapAfterClient(_AnchorClient):
+    def __init__(self, project_root, logger=None):
+        super().__init__(project_root, logger)
+        self._grid[2][3] = "(\u0412\u0435\u0440\u0438\u0444\u0438\u043a\u0430\u0446\u0438\u044f) \u041d\u0435 \u0434\u043e\u0437\u0432\u043e\u043d\u0438\u0442\u044c\u0441\u044f"
+        self._grid[3][3] = ""
+        self._grid[4][3] = "(\u0412\u0435\u0440\u0438\u0444\u0438\u043a\u0430\u0446\u0438\u044f) \u041d\u043e\u043c\u0435\u0440 \u043d\u0435\u043a\u043e\u0440\u0440\u0435\u043a\u0442\u043d\u044b\u0439"
+
+
+def test_after_layout_is_compact_and_tail_item_not_placed_into_internal_gap() -> None:
+    base = _tmp_base("test_after_layout_compact_tail")
+    fake = _GapAfterClient(base)
+    writer = WeeklyRefusalsBlockWriter(
+        project_root=base,
+        exports_dir=base,
+        client_factory=lambda _root, logger=None: fake,
+    )
+    payload = _parsed_payload()
+    payload["aggregated_after_status_counts"] = [
+        {"status": "(\u0412\u0435\u0440\u0438\u0444\u0438\u043a\u0430\u0446\u0438\u044f) \u041d\u0435 \u0434\u043e\u0437\u0432\u043e\u043d\u0438\u0442\u044c\u0441\u044f", "count": 2},
+        {"status": "(\u0412\u0435\u0440\u0438\u0444\u0438\u043a\u0430\u0446\u0438\u044f) \u041d\u043e\u043c\u0435\u0440 \u043d\u0435\u043a\u043e\u0440\u0440\u0435\u043a\u0442\u043d\u044b\u0439", "count": 1},
+        {"status": "\u0411\u0435\u0437 \u043f\u0440\u0438\u0447\u0438\u043d\u044b", "count": 4},
+    ]
+    writer.write_block(destination=_make_destination(), parsed_result=payload, dry_run=False)
+
+    after_values = fake.last_updates[1]["values"]
+    labels = [str(row[0]).strip() for row in after_values if str(row[0]).strip()]
+    assert labels[-1].lower() == "\u0431\u0435\u0437 \u043f\u0440\u0438\u0447\u0438\u043d\u044b"
+    non_empty_positions = [idx for idx, row in enumerate(after_values) if str(row[0]).strip()]
+    assert non_empty_positions == list(range(min(non_empty_positions), max(non_empty_positions) + 1))
 
 
 def test_header_row_not_included_in_data_updates() -> None:
@@ -417,4 +516,124 @@ def test_standalone_closed_not_inserted_when_granular_after_present() -> None:
     after_values = fake.last_updates[1]["values"]
     statuses = [row[0] for row in after_values]
     assert "закрыто и не реализовано" not in [str(s).strip().lower() for s in statuses]
+
+
+class _TightBlockClient(_AnchorClient):
+    def __init__(self, project_root, logger=None):
+        super().__init__(project_root, logger)
+        # next section title directly below short capacity window
+        self._grid[5][0] = "отказы привлечение (долгие) - накопительный свод"
+
+
+def test_numeric_counts_are_written_as_numbers_not_quoted_strings() -> None:
+    base = _tmp_base("test_weekly_refusals_numeric_counts")
+    fake = _AnchorClient(base)
+    fake._grid[2][1] = "'5"
+    writer = WeeklyRefusalsBlockWriter(
+        project_root=base,
+        exports_dir=base,
+        client_factory=lambda _root, logger=None: fake,
+    )
+    payload = _parsed_payload()
+    payload["mode"] = "cumulative"
+    payload["aggregated_before_status_counts"] = [{"status": "\u041f\u0440\u0438\u0432\u043b\u0435\u0447\u0435\u043d\u0438\u0435(2 \u043c\u0435\u0441\u044f\u0446\u0430) \u043d\u0435\u0440\u0430\u0437\u043e\u0431\u0440\u0430\u043d\u043d\u043e\u0435", "count": 2}]
+    writer.write_block(destination=_make_destination(), parsed_result=payload, dry_run=False)
+
+    before_values = fake.last_updates[0]["values"]
+    assert before_values[0][1] == 2
+    assert isinstance(before_values[0][1], int)
+
+
+def test_near_duplicate_after_reasons_compact_to_single_canonical_row() -> None:
+    base = _tmp_base("test_weekly_refusals_no_near_duplicates")
+    fake = _AnchorClient(base)
+    writer = WeeklyRefusalsBlockWriter(
+        project_root=base,
+        exports_dir=base,
+        client_factory=lambda _root, logger=None: fake,
+    )
+    payload = _parsed_payload()
+    payload["aggregated_after_status_counts"] = [
+        {"status": "(Верификация) Перестал выходить на свя", "count": 2},
+        {"status": "(Верификация) Перестал выходить на связь", "count": 3},
+    ]
+    writer.write_block(destination=_make_destination(), parsed_result=payload, dry_run=False)
+    after_values = fake.last_updates[1]["values"]
+    statuses = [str(row[0]).strip().lower() for row in after_values if str(row[0]).strip()]
+    counts = [str(row[1]).strip() for row in after_values if str(row[0]).strip()]
+    assert statuses.count("(верификация) перестал выходить на связь") == 1
+    assert "5" in counts
+
+
+def test_safe_row_expansion_inserts_rows_when_capacity_is_tight() -> None:
+    base = _tmp_base("test_weekly_refusals_safe_expansion")
+    fake = _TightBlockClient(base)
+    destination = _make_destination()
+    destination = WriterDestinationConfig(
+        sheet_url=destination.sheet_url,
+        tab_name=destination.tab_name,
+        start_cell=destination.start_cell,
+        write_mode=destination.write_mode,
+        kind=destination.kind,
+        target_id=destination.target_id,
+        layout_config={
+            **destination.layout_config,
+            "next_section_title_text_contains": "отказы привлечение (долгие) - накопительный свод",
+        },
+    )
+    writer = WeeklyRefusalsBlockWriter(
+        project_root=base,
+        exports_dir=base,
+        client_factory=lambda _root, logger=None: fake,
+    )
+    payload = _parsed_payload()
+    payload["aggregated_before_status_counts"] = [
+        {"status": "Привлечение(2 месяца) неразобранное", "count": 1},
+        {"status": "Привлечение(2 месяца) верификация", "count": 2},
+        {"status": "Привлечение(2 месяца) первый контакт. квалификация", "count": 3},
+        {"status": "Привлечение(2 месяца) есть интерес к продукту", "count": 4},
+    ]
+    writer.write_block(destination=destination, parsed_result=payload, dry_run=False)
+    assert fake.insert_calls, "writer must insert rows instead of risking overlap with next section"
+
+
+def test_canonical_display_label_is_used_in_final_write_plan() -> None:
+    base = _tmp_base("test_weekly_refusals_canonical_display")
+    fake = _AnchorClient(base)
+    fake._grid[2][3] = "(\u041f\u0440\u043e\u0432\u0435\u0434\u0435\u043d\u0430 \u0434\u0435\u043c\u043e\u043d\u0441\u0442\u0440\u0430\u0446\u0438\u044f) \u041f\u0435\u0440\u0435\u0441\u0442\u0430\u043b \u0432\u044b\u0445\u043e\u0434\u0438\u0442\u044c \u043d\u0430 \u0441\u0432\u044f\u0437"
+    writer = WeeklyRefusalsBlockWriter(
+        project_root=base,
+        exports_dir=base,
+        client_factory=lambda _root, logger=None: fake,
+    )
+    payload = _parsed_payload()
+    payload["aggregated_after_status_counts"] = [
+        {"status": "(\u041f\u0440\u043e\u0432\u0435\u0434\u0435\u043d\u0430 \u0434\u0435\u043c\u043e\u043d\u0441\u0442\u0440\u0430\u0446\u0438\u044f) \u041f\u0435\u0440\u0435\u0441\u0442\u0430\u043b \u0432\u044b\u0445\u043e\u0434\u0438\u0442\u044c \u043d\u0430 \u0441\u0432\u044f", "count": 1},
+    ]
+    writer.write_block(destination=_make_destination(), parsed_result=payload, dry_run=False)
+
+    after_values = fake.last_updates[1]["values"]
+    labels = [str(row[0]).strip() for row in after_values if str(row[0]).strip()]
+    assert "(\u041f\u0440\u043e\u0432\u0435\u0434\u0435\u043d\u0430 \u0434\u0435\u043c\u043e\u043d\u0441\u0442\u0440\u0430\u0446\u0438\u044f) \u041f\u0435\u0440\u0435\u0441\u0442\u0430\u043b \u0432\u044b\u0445\u043e\u0434\u0438\u0442\u044c \u043d\u0430 \u0441\u0432\u044f\u0437\u044c" in labels
+    assert "(\u041f\u0440\u043e\u0432\u0435\u0434\u0435\u043d\u0430 \u0434\u0435\u043c\u043e\u043d\u0441\u0442\u0440\u0430\u0446\u0438\u044f) \u041f\u0435\u0440\u0435\u0441\u0442\u0430\u043b \u0432\u044b\u0445\u043e\u0434\u0438\u0442\u044c \u043d\u0430 \u0441\u0432\u044f\u0437" not in labels
+
+
+def test_compact_layout_has_no_internal_empty_holes_between_filled_rows() -> None:
+    base = _tmp_base("test_weekly_refusals_compact_layout")
+    fake = _AnchorClient(base)
+    writer = WeeklyRefusalsBlockWriter(
+        project_root=base,
+        exports_dir=base,
+        client_factory=lambda _root, logger=None: fake,
+    )
+    payload = _parsed_payload()
+    payload["aggregated_before_status_counts"] = [
+        {"status": "Привлечение(2 месяца) неразобранное", "count": 1},
+        {"status": "Привлечение(2 месяца) первый контакт. квалификация", "count": 2},
+    ]
+    writer.write_block(destination=_make_destination(), parsed_result=payload, dry_run=False)
+    before_values = fake.last_updates[0]["values"]
+    non_empty_positions = [idx for idx, row in enumerate(before_values) if str(row[0]).strip()]
+    if non_empty_positions:
+        assert non_empty_positions == list(range(min(non_empty_positions), max(non_empty_positions) + 1))
 

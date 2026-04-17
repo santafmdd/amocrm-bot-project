@@ -626,8 +626,31 @@ def _run_weekly_refusals_profile(
     )
     parsed_payload = parsed.to_dict()
     parsed_payload["mode"] = str((report.filters or {}).get("mode", "weekly") or "weekly").strip().lower() or "weekly"
+    parsed_payload["cumulative_write_strategy"] = str(
+        (report.filters or {}).get("cumulative_write_strategy", "recompute_from_source") or "recompute_from_source"
+    ).strip().lower() or "recompute_from_source"
+    parsed_payload["period_mode"] = str(flow_input.period_mode or "")
+    parsed_payload["date_mode"] = str(flow_input.date_mode or "")
+    parsed_payload["date_from"] = str(flow_input.date_from or "")
+    parsed_payload["date_to"] = str(flow_input.date_to or "")
+    parsed_payload["period_key"] = (
+        f"{report.id}|{parsed_payload['period_mode']}|{parsed_payload['date_from']}|{parsed_payload['date_to']}"
+    )
+    parsed_payload["writer_mode_semantics"] = (
+        "cumulative_add_existing_values"
+        if parsed_payload["mode"] == "cumulative" and parsed_payload["cumulative_write_strategy"] in {"add", "add_existing_values"}
+        else "recompute_from_source"
+    )
     compiled_path.write_text(json.dumps(parsed_payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    logger.info("weekly refusals artifact saved: %s", compiled_path)
+    logger.info(
+        "weekly refusals artifact saved: %s mode=%s semantics=%s cumulative_strategy=%s period_mode=%s period_key=%s",
+        compiled_path,
+        parsed_payload["mode"],
+        parsed_payload["writer_mode_semantics"],
+        parsed_payload["cumulative_write_strategy"],
+        flow_input.period_mode,
+        parsed_payload["period_key"],
+    )
 
     writer = WeeklyRefusalsBlockWriter(
         project_root=config.project_root,

@@ -361,6 +361,112 @@ def test_run_weekly_refusals_profile_propagates_cumulative_mode(monkeypatch) -> 
 
     assert captured["parsed_result"] is not None
     assert captured["parsed_result"].get("mode") == "cumulative"
+    assert captured["parsed_result"].get("writer_mode_semantics") == "recompute_from_source"
+
+
+def test_run_weekly_refusals_profile_propagates_cumulative_add_existing_strategy(monkeypatch) -> None:
+    from src.writers.models import WriterDestinationConfig
+
+    base = Path("d:/AI_Automation/tmp_weekly_refusals_runner_cumulative_add")
+    base.mkdir(parents=True, exist_ok=True)
+
+    payload = {
+        "report_id": "weekly_refusals_cumulative_2m",
+        "display_name": "Weekly Cumulative",
+        "source_rows": [{"x": 1}],
+        "aggregated_before_status_counts": [{"status": "s1", "count": 2}],
+        "aggregated_after_status_counts": [{"status": "a1", "count": 3}],
+        "deal_refs": [],
+    }
+
+    class _Parsed:
+        def to_dict(self):
+            return dict(payload)
+
+    class _FakePage:
+        pass
+
+    class _FakeSession:
+        def __init__(self, _settings):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def new_page(self):
+            return _FakePage()
+
+    class _FakeEventsFlow:
+        def __init__(self, **_kwargs):
+            pass
+
+        def run_capture(self, **_kwargs):
+            return [{"row": 1}]
+
+    captured = {"parsed_result": None}
+
+    class _FakeWriteResult:
+        dry_run = True
+        planned_updates = 1
+        updated_cells = 0
+        summary_path = base / "summary.json"
+
+    class _FakeWriter:
+        def __init__(self, **_kwargs):
+            pass
+
+        def write_block(self, *, destination, parsed_result, dry_run):
+            captured["parsed_result"] = parsed_result
+            return _FakeWriteResult()
+
+    monkeypatch.setattr("src.run_profile_analytics.BrowserSession", _FakeSession)
+    monkeypatch.setattr("src.run_profile_analytics.EventsFlow", _FakeEventsFlow)
+    monkeypatch.setattr("src.run_profile_analytics.parse_weekly_refusals_rows", lambda **_kwargs: _Parsed())
+    monkeypatch.setattr("src.run_profile_analytics.WeeklyRefusalsBlockWriter", _FakeWriter)
+
+    report = SimpleNamespace(
+        id="weekly_refusals_cumulative_2m",
+        display_name="Weekly Cumulative",
+        filters={
+            "pipeline": "p1",
+            "status_after": "x",
+            "mode": "cumulative",
+            "period_mode": "?? ??? ??????",
+            "cumulative_write_strategy": "add_existing_values",
+        },
+    )
+    config = SimpleNamespace(project_root=base, exports_dir=base / "exports")
+    settings = SimpleNamespace()
+    logger = SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None, error=lambda *a, **k: None)
+
+    destination = WriterDestinationConfig(
+        sheet_url="https://docs.google.com/spreadsheets/d/test/edit",
+        tab_name="analytics_writer_test",
+        write_mode="weekly_refusals_block_update",
+        start_cell="A1",
+        kind="google_sheets_ui",
+        target_id="weekly_refusals_cumulative_2m_block",
+        layout_config={},
+    )
+
+    _run_weekly_refusals_profile(
+        config=config,
+        settings=settings,
+        logger=logger,
+        report=report,
+        destination=destination,
+        wait_for_enter=False,
+        weekly_dry_run=True,
+    )
+
+    assert captured["parsed_result"] is not None
+    assert captured["parsed_result"].get("mode") == "cumulative"
+    assert captured["parsed_result"].get("cumulative_write_strategy") == "add_existing_values"
+    assert captured["parsed_result"].get("writer_mode_semantics") == "cumulative_add_existing_values"
+    assert captured["parsed_result"].get("period_key")
 
 
 def test_build_weekly_refusals_flow_input_runtime_strategy_override() -> None:

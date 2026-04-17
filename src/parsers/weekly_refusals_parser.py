@@ -1,14 +1,15 @@
-﻿"""Parser for weekly refusals dataset from amoCRM events list rows."""
+"""Parser for weekly refusals dataset from amoCRM events list rows."""
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from src.domain.refusal_status_normalizer import canonicalize_after_status, canonicalize_before_status
+
 
 def normalize_status_text(value: str) -> str:
-    text = str(value or "").strip().lower().replace("ё", "е")
-    return " ".join(text.split())
+    return canonicalize_before_status(value)
 
 
 @dataclass(frozen=True)
@@ -47,10 +48,10 @@ def parse_weekly_refusals_rows(
         after_raw = str(row.get("status_after", "") or "")
         after_loss_raw = str(row.get("status_after_loss_reason", "") or "")
 
-        before = normalize_status_text(before_raw)
+        before = canonicalize_before_status(before_raw)
         # Right table should aggregate by granular loss reason when available.
         after_agg_source = after_loss_raw.strip() if after_loss_raw.strip() else after_raw
-        after = normalize_status_text(after_agg_source)
+        after = canonicalize_after_status(after_agg_source)
 
         if before:
             before_counter[before] = before_counter.get(before, 0) + 1

@@ -211,6 +211,7 @@ report_profiles:
     event_type: Изменение этапа продажи
     managers: []
     mode: cumulative
+    cumulative_write_strategy: add_existing_values
     filter_mode: ui_controls
     saved_preset_name: ''
     saved_preset_exact_match: false
@@ -236,6 +237,7 @@ report_profiles:
     event_type: Изменение этапа продажи
     managers: []
     mode: cumulative
+    cumulative_write_strategy: add_existing_values
     filter_mode: ui_controls
     saved_preset_name: ''
     saved_preset_exact_match: false
