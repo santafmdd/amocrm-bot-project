@@ -48,24 +48,16 @@ def load_amocrm_auth_config(config_path: str | None = None) -> AmoAuthConfig:
 
     file_cfg: dict[str, object] = {}
     if cfg_path.exists():
-        file_cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        # utf-8-sig keeps loading resilient for both BOM and non-BOM UTF-8 files.
+        file_cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
         if not isinstance(file_cfg, dict):
             raise RuntimeError(f"Invalid amoCRM auth config format: {cfg_path}")
 
-    redirect_uri = str(
-        os.getenv("AMOCRM_REDIRECT_URI")
-        or file_cfg.get("redirect_uri", "")
-    ).strip()
-    callback_host = str(
-        os.getenv("AMOCRM_CALLBACK_HOST")
-        or file_cfg.get("callback_host", "127.0.0.1")
-    ).strip() or "127.0.0.1"
+    redirect_uri = str(os.getenv("AMOCRM_REDIRECT_URI") or file_cfg.get("redirect_uri", "")).strip()
+    callback_host = str(os.getenv("AMOCRM_CALLBACK_HOST") or file_cfg.get("callback_host", "127.0.0.1")).strip() or "127.0.0.1"
     callback_port_raw = os.getenv("AMOCRM_CALLBACK_PORT") or file_cfg.get("callback_port", 18080)
     callback_port = int(callback_port_raw)
-    callback_path = str(
-        os.getenv("AMOCRM_CALLBACK_PATH")
-        or file_cfg.get("callback_path", "/oauth/callback")
-    ).strip() or "/oauth/callback"
+    callback_path = str(os.getenv("AMOCRM_CALLBACK_PATH") or file_cfg.get("callback_path", "/oauth/callback")).strip() or "/oauth/callback"
     if not callback_path.startswith("/"):
         callback_path = "/" + callback_path
 
@@ -75,10 +67,7 @@ def load_amocrm_auth_config(config_path: str | None = None) -> AmoAuthConfig:
     state_path_raw = os.getenv("AMOCRM_AUTH_STATE_FILE") or file_cfg.get("state_path", str(default_state_path))
     state_path = ensure_inside_root(Path(str(state_path_raw)).resolve(), project_root)
 
-    base_domain = _normalize_base_domain(
-        os.getenv("AMOCRM_BASE_DOMAIN")
-        or str(file_cfg.get("base_domain", ""))
-    )
+    base_domain = _normalize_base_domain(os.getenv("AMOCRM_BASE_DOMAIN") or str(file_cfg.get("base_domain", "")))
 
     client_id = str(os.getenv("AMOCRM_CLIENT_ID") or file_cfg.get("client_id", "")).strip()
     client_secret = str(os.getenv("AMOCRM_CLIENT_SECRET") or file_cfg.get("client_secret", "")).strip()
