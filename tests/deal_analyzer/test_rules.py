@@ -1,4 +1,4 @@
-from pathlib import Path
+﻿from pathlib import Path
 
 from src.deal_analyzer.config import DealAnalyzerConfig
 from src.deal_analyzer.rules import analyze_deal
@@ -19,6 +19,11 @@ def _cfg() -> DealAnalyzerConfig:
             "probability": 5,
             "data_completeness": 10,
         },
+        analyzer_backend="rules",
+        ollama_base_url="http://127.0.0.1:11434",
+        ollama_model="gemma4:e4b",
+        ollama_timeout_seconds=60,
+        style_profile_name="manager_ru_v1",
     )
 
 
@@ -67,5 +72,5 @@ def test_analyze_deal_adds_risk_flag_for_empty_context_with_movement():
     }
 
     analysis = analyze_deal(row, _cfg())
-    assert any("?????? notes/tasks/comments" in x for x in analysis.risk_flags)
+    assert any("notes/tasks/comments" in x for x in analysis.risk_flags)
     assert analysis.score_0_100 < 40

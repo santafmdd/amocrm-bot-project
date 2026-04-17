@@ -28,7 +28,7 @@ def test_write_analysis_csv_calls_csv_writer_for_timestamped_and_latest():
     rows = [{"deal_id": 1, "score_0_100": 80}]
     calls: list[Path] = []
 
-    with patch("src.deal_analyzer.exporters._write_csv", side_effect=lambda p, r: calls.append(p)):
+    with patch("src.deal_analyzer.exporters._write_csv", side_effect=lambda p, r, **k: calls.append(p)):
         files = write_analysis_csv(output_dir=out, name="analyze_period", rows=rows, write_latest=True)
 
     assert len(calls) == 2
@@ -36,13 +36,20 @@ def test_write_analysis_csv_calls_csv_writer_for_timestamped_and_latest():
     assert files.latest is not None and str(files.latest).endswith("_latest.csv")
 
 
-def test_build_markdown_report_contains_score_line():
+def test_build_markdown_report_contains_metadata_and_score_line():
     md = build_markdown_report(
         title="T",
+        report_metadata={
+            "period_start": "2026-04-06",
+            "period_end": "2026-04-10",
+            "public_period_label": "2026-04-06..2026-04-10",
+            "period_mode_resolved": "previous_workweek",
+        },
         analyses=[
             {
                 "deal_id": 1,
                 "deal_name": "Deal",
+                "analysis_backend_used": "ollama",
                 "score_0_100": 77,
                 "presentation_quality_flag": "ok",
                 "followup_quality_flag": "ok",
@@ -55,3 +62,6 @@ def test_build_markdown_report_contains_score_line():
     )
     assert "Deal 1" in md
     assert "Score: 77" in md
+    assert "Period:" in md
+    assert "Analysis backend used: ollama" in md
+    assert "2026-04-06..2026-04-10" in md

@@ -1,5 +1,20 @@
-{
+﻿{
   "output_dir": "workspace/deal_analyzer",
+  "analyzer_backend": "rules",
+  "ollama_base_url": "http://127.0.0.1:11434",
+  "ollama_model": "gemma4:e4b",
+  "ollama_timeout_seconds": 60,
+  "style_profile_name": "manager_ru_v1",
+  "period_mode": "smart_manager_default",
+  "custom_date_from": "",
+  "custom_date_to": "",
+  "period_label_mode": "period_only",
+  "hide_executed_at_from_public_exports": true,
+  "executed_at_visibility": "internal_only",
+  "client_list_enrich_enabled": false,
+  "appointment_list_enrich_enabled": false,
+  "client_list_source_name": "client_list_v1",
+  "appointment_list_source_name": "appointments_v1",
   "score_weights": {
     "presentation": 20,
     "brief": 10,

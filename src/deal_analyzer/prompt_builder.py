@@ -1,28 +1,146 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
+import json
+from typing import Any
+
+from .config import DealAnalyzerConfig
 from .models import DealAnalysis
 
 
+REPAIR_JSON_INSTRUCTION = (
+    "Верни только валидный JSON-объект без комментариев, markdown и пояснений. "
+    "Без текста до/после JSON, без тройных кавычек."
+)
+
+
 def build_manager_message_draft(analysis: DealAnalysis) -> str:
-    deal_label = analysis.deal_name or f"?????? {analysis.deal_id}"
-    positives = "; ".join(analysis.strong_sides) if analysis.strong_sides else "??????? ??????? ???? ?? ?????????????"
-    risks = "; ".join(analysis.risk_flags) if analysis.risk_flags else "????????? ?????? ?? ????????"
-    actions = "; ".join(analysis.recommended_actions_for_manager) if analysis.recommended_actions_for_manager else "???????? ?? ?????????"
+    deal_label = analysis.deal_name or f"Сделка {analysis.deal_id}"
+    positives = "; ".join(analysis.strong_sides) if analysis.strong_sides else "сильные стороны не зафиксированы"
+    risks = "; ".join(analysis.risk_flags) if analysis.risk_flags else "критичные риски не найдены"
+    actions = (
+        "; ".join(analysis.recommended_actions_for_manager)
+        if analysis.recommended_actions_for_manager
+        else "действия не указаны"
+    )
 
     return (
-        f"????????? ?? {deal_label}: ??????? ?????? {analysis.score_0_100}/100. "
-        f"??????? ???????: {positives}. "
-        f"?????: {risks}. "
-        f"????????????? ????????: {actions}."
+        f"Коротко по {deal_label}: итоговый балл {analysis.score_0_100}/100. "
+        f"Сильные стороны: {positives}. "
+        f"Риски: {risks}. "
+        f"Рекомендуемые шаги: {actions}."
     )
 
 
 def build_employee_training_message_draft(analysis: DealAnalysis) -> str:
-    deal_label = analysis.deal_name or f"?????? {analysis.deal_id}"
-    zones = "; ".join(analysis.growth_zones) if analysis.growth_zones else "??? ????? ???? ?? ????????"
-    tasks = "; ".join(analysis.recommended_training_tasks_for_employee) if analysis.recommended_training_tasks_for_employee else "????????? ??????? ?? ?????????"
-
-    return (
-        f"?????????? ?? {deal_label}: ????? ???????? ? {zones}. "
-        f"????????????? ??????????: {tasks}."
+    deal_label = analysis.deal_name or f"Сделка {analysis.deal_id}"
+    zones = "; ".join(analysis.growth_zones) if analysis.growth_zones else "критичных зон роста не выявлено"
+    tasks = (
+        "; ".join(analysis.recommended_training_tasks_for_employee)
+        if analysis.recommended_training_tasks_for_employee
+        else "задачи не назначены"
     )
+
+    return f"Разбор по {deal_label}: зона роста - {zones}. Учебные задачи: {tasks}."
+
+
+def build_ollama_chat_messages(*, normalized_deal: dict[str, Any], config: DealAnalyzerConfig) -> list[dict[str, str]]:
+    system_prompt = _build_system_prompt(config.style_profile_name)
+    user_prompt = _build_user_prompt(normalized_deal)
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+
+def append_json_repair_instruction(messages: list[dict[str, str]]) -> list[dict[str, str]]:
+    out = list(messages)
+    out.append({"role": "user", "content": REPAIR_JSON_INSTRUCTION})
+    return out
+
+
+def _build_system_prompt(style_profile_name: str) -> str:
+    return (
+        "Ты анализируешь качество ведения сделки. "
+        "Пиши по-русски, коротко, живым менеджерским языком без канцелярита. "
+        "Не выдумывай факты: используй только входные данные. "
+        "Если данных мало, явно укажи это в risk_flags или growth_zones. "
+        "Верни строго JSON-объект. Только JSON и ничего больше: "
+        "без markdown, без ``` блоков, без комментариев, без пояснений до и после JSON. "
+        "Ожидаемые поля: score_0_100, strong_sides, growth_zones, risk_flags, "
+        "recommended_actions_for_manager, recommended_training_tasks_for_employee, "
+        "manager_message_draft, employee_training_message_draft, "
+        "presentation_quality_flag, followup_quality_flag, data_completeness_flag. "
+        f"Профиль стиля: {style_profile_name}."
+    )
+
+
+def _build_user_prompt(normalized_deal: dict[str, Any]) -> str:
+    compact = _compact_payload_for_llm(normalized_deal)
+    payload_json = json.dumps(compact, ensure_ascii=False, indent=2)
+    return (
+        "Входные данные сделки (normalized payload, compact):\n"
+        f"{payload_json}\n\n"
+        "Сформируй анализ по указанному контракту. "
+        "score_0_100 должен быть целым от 0 до 100. "
+        "Списки должны быть массивами строк. "
+        "Если поле не подтверждается данными, не выдумывай детали."
+    )
+
+
+def _compact_payload_for_llm(normalized_deal: dict[str, Any]) -> dict[str, Any]:
+    keys = [
+        "deal_id",
+        "amo_lead_id",
+        "deal_name",
+        "responsible_user_name",
+        "pipeline_name",
+        "status_name",
+        "product_values",
+        "source_values",
+        "pain_text",
+        "business_tasks_text",
+        "brief_url",
+        "demo_result_text",
+        "test_result_text",
+        "probability_value",
+        "tags",
+        "presentation_detected",
+        "presentation_detect_reason",
+        "long_call_detected",
+        "longest_call_duration_seconds",
+        "manager_scope_allowed",
+    ]
+    out = {k: normalized_deal.get(k) for k in keys}
+    out["notes_summary_raw"] = _compact_list(normalized_deal.get("notes_summary_raw"), 5)
+    out["tasks_summary_raw"] = _compact_list(normalized_deal.get("tasks_summary_raw"), 5)
+    out["presentation_link_candidates"] = _compact_list(normalized_deal.get("presentation_link_candidates"), 5)
+    out["company_comment"] = _truncate_text(normalized_deal.get("company_comment"), 250)
+    out["contact_comment"] = _truncate_text(normalized_deal.get("contact_comment"), 250)
+    return out
+
+
+def _compact_list(value: Any, max_items: int) -> list[Any]:
+    if not isinstance(value, list):
+        return []
+    out: list[Any] = []
+    for item in value[:max_items]:
+        if isinstance(item, dict):
+            compact_item: dict[str, Any] = {}
+            for k, v in item.items():
+                if isinstance(v, str):
+                    compact_item[k] = _truncate_text(v, 180)
+                else:
+                    compact_item[k] = v
+            out.append(compact_item)
+        elif isinstance(item, str):
+            out.append(_truncate_text(item, 180))
+        else:
+            out.append(item)
+    return out
+
+
+def _truncate_text(value: Any, limit: int) -> str:
+    text = " ".join(str(value or "").strip().split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"

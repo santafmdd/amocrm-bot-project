@@ -71,22 +71,23 @@ def write_analysis_csv(
     name: str,
     rows: list[dict[str, Any]],
     write_latest: bool = True,
+    include_executed_at: bool = False,
 ) -> ExportFileSet:
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     base = _safe_name(name)
     timestamped = output_dir / f"{base}_{ts}.csv"
-    _write_csv(timestamped, rows)
+    _write_csv(timestamped, rows, include_executed_at=include_executed_at)
 
     latest: Path | None = None
     if write_latest:
         latest = output_dir / f"{base}_latest.csv"
-        _write_csv(latest, rows)
+        _write_csv(latest, rows, include_executed_at=include_executed_at)
 
     return ExportFileSet(timestamped=timestamped, latest=latest)
 
 
-def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
-    fieldnames = _csv_fields()
+def _write_csv(path: Path, rows: list[dict[str, Any]], *, include_executed_at: bool = False) -> None:
+    fieldnames = _csv_fields(include_executed_at=include_executed_at)
     with path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -109,8 +110,15 @@ def _flatten(row: dict[str, Any], fieldnames: list[str]) -> dict[str, Any]:
     return out
 
 
-def _csv_fields() -> list[str]:
-    return [
+def _csv_fields(*, include_executed_at: bool) -> list[str]:
+    fields = [
+        "backend",
+        "analysis_backend_used",
+        "period_mode_resolved",
+        "period_start",
+        "period_end",
+        "public_period_label",
+        "as_of_date",
         "deal_id",
         "amo_lead_id",
         "deal_name",
@@ -126,12 +134,45 @@ def _csv_fields() -> list[str]:
         "manager_message_draft",
         "employee_training_message_draft",
     ]
+    if include_executed_at:
+        fields.insert(1, "executed_at")
+    return fields
 
 
-def build_markdown_report(*, title: str, analyses: list[dict[str, Any]]) -> str:
-    lines = [f"# {title}", "", f"Deals in report: {len(analyses)}", ""]
+def build_markdown_report(
+    *,
+    title: str,
+    analyses: list[dict[str, Any]],
+    report_metadata: dict[str, Any] | None = None,
+) -> str:
+    lines = [f"# {title}", ""]
+    if report_metadata:
+        lines.append("## Report Metadata")
+        if report_metadata.get("public_period_label"):
+            lines.append(f"- Period: {report_metadata.get('public_period_label')}")
+        if report_metadata.get("period_start") and report_metadata.get("period_end"):
+            lines.append(f"- Range: {report_metadata.get('period_start')} .. {report_metadata.get('period_end')}")
+        if report_metadata.get("period_mode_resolved"):
+            lines.append(f"- Mode: {report_metadata.get('period_mode_resolved')}")
+        if report_metadata.get("as_of_date"):
+            lines.append(f"- As of: {report_metadata.get('as_of_date')}")
+        if report_metadata.get("executed_at"):
+            lines.append(f"- Executed at: {report_metadata.get('executed_at')}")
+        if report_metadata.get("llm_success_count") is not None:
+            lines.append(f"- LLM success: {report_metadata.get('llm_success_count')}")
+        if report_metadata.get("llm_fallback_count") is not None:
+            lines.append(f"- LLM fallback: {report_metadata.get('llm_fallback_count')}")
+        if report_metadata.get("llm_error_count") is not None:
+            lines.append(f"- LLM errors: {report_metadata.get('llm_error_count')}")
+        lines.append("")
+
+    lines.extend([f"Deals in report: {len(analyses)}", ""])
     for row in analyses:
         lines.append(f"## Deal {row.get('deal_id')}: {row.get('deal_name') or '-'}")
+        if row.get("backend"):
+            lines.append(f"- Backend: {row.get('backend')}")
+        if row.get("analysis_backend_used"):
+            lines.append(f"- Analysis backend used: {row.get('analysis_backend_used')}")
         lines.append(f"- Score: {row.get('score_0_100')}")
         lines.append(f"- Presentation flag: {row.get('presentation_quality_flag')}")
         lines.append(f"- Follow-up flag: {row.get('followup_quality_flag')}")
