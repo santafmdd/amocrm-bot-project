@@ -36,3 +36,6 @@ tests/tmp*
 *.pyc
 config/amocrm_auth.local.json
 workspace/amocrm_auth/state.json
+config/amocrm_collector.local.json
+pytest-tmp/
+pytest_tmp_env/
