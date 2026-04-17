@@ -1,0 +1,41 @@
+﻿{
+  "auth_config_path": "config/amocrm_auth.local.json",
+  "base_domain": "youraccount.amocrm.ru",
+  "output_dir": "workspace/amocrm_collector",
+  "manager_ids_include": [],
+  "manager_ids_exclude": [
+    0,
+    0
+  ],
+  "pipeline_ids_include": [],
+  "product_field_id": 0,
+  "source_field_id": 0,
+  "pain_field_id": 0,
+  "tasks_field_id": 0,
+  "brief_field_id": 0,
+  "demo_result_field_id": 0,
+  "test_result_field_id": 0,
+  "probability_field_id": 0,
+  "company_comment_field_id": 0,
+  "contact_comment_field_id": 0,
+  "presentation_link_search": {
+    "scan_lead_custom_fields_url": true,
+    "scan_notes_common_text": true,
+    "scan_company_comment": true,
+    "scan_contact_comment": true,
+    "regexes": [
+      "docs.google.com",
+      "drive.google.com"
+    ]
+  },
+  "presentation_detection": {
+    "min_call_duration_seconds": 900,
+    "require_any_of": [
+      "demo_result_present",
+      "brief_present",
+      "completed_meeting_task",
+      "long_call",
+      "comment_link_present"
+    ]
+  }
+}
