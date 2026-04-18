@@ -2,6 +2,7 @@
 
 import argparse
 import json
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -65,6 +66,7 @@ def _parse_args() -> argparse.Namespace:
     )
     period.add_argument("--date-from", default=None, help="YYYY-MM-DD (required for custom_range)")
     period.add_argument("--date-to", default=None, help="YYYY-MM-DD (required for custom_range)")
+    period.add_argument("--limit", type=int, default=None, help="Optional max deals to analyze from period payload")
 
     enrich_one = sub.add_parser("enrich-deal", help="Build read-only enriched snapshot for one deal")
     enrich_one.add_argument("--input", required=True, help="Path to collector deal JSON")
@@ -156,6 +158,7 @@ def main() -> None:
             period_mode=args.period_mode,
             date_from=args.date_from,
             date_to=args.date_to,
+            limit=args.limit,
         )
         return
 
@@ -640,6 +643,7 @@ def _run_analyze_period(
     period_mode: str | None,
     date_from: str | None,
     date_to: str | None,
+    limit: int | None = None,
 ) -> None:
     resolved = resolve_period(
         config=cfg,
@@ -664,9 +668,75 @@ def _run_analyze_period(
         if preflight_forced_rules:
             effective_backend = "rules"
 
-    normalized_rows = _extract_period_normalized(payload)
-    normalized_rows = _maybe_enrich_rows(normalized_rows, cfg, logger)
-    analyses, llm_counts = _analyze_period_rows(normalized_rows, cfg, logger, backend_override=effective_backend)
+    normalized_rows_all = _extract_period_normalized(payload)
+    normalized_rows = normalized_rows_all[: max(0, int(limit))] if isinstance(limit, int) and limit >= 0 else normalized_rows_all
+    raw_bundles_by_deal = _extract_raw_bundles_map(payload)
+
+    run_started_at = datetime.now(timezone.utc)
+    run_dir, deals_dir = _prepare_period_run_dirs(output_dir=output_dir, run_started_at=run_started_at)
+
+    analyses: list[dict[str, Any]] = []
+    llm_counts = {
+        "llm_success_count": 0,
+        "llm_success_repaired_count": 0,
+        "llm_fallback_count": 0,
+        "llm_error_count": 0,
+    }
+    deals_failed = 0
+    deal_artifact_paths: list[str] = []
+
+    for idx, row in enumerate(normalized_rows):
+        deal_hint = str(row.get("deal_id") or row.get("amo_lead_id") or idx)
+        try:
+            snapshot = build_deal_snapshot(
+                normalized_deal=row,
+                config=cfg,
+                logger=logger,
+                raw_bundle=raw_bundles_by_deal.get(deal_hint),
+            )
+            crm = snapshot.get("crm") if isinstance(snapshot.get("crm"), dict) else row
+            analysis, row_counts = _analyze_one_with_isolation(
+                crm,
+                cfg,
+                logger,
+                deal_hint=deal_hint,
+                backend_override=effective_backend,
+            )
+            analyses.append(analysis)
+            llm_counts["llm_success_count"] += row_counts["llm_success_count"]
+            llm_counts["llm_success_repaired_count"] += row_counts["llm_success_repaired_count"]
+            llm_counts["llm_fallback_count"] += row_counts["llm_fallback_count"]
+            llm_counts["llm_error_count"] += row_counts["llm_error_count"]
+
+            per_deal_payload = {
+                "run_timestamp": run_started_at.isoformat(),
+                "source": source_name,
+                "backend_requested": cfg.analyzer_backend,
+                "backend_used": analysis.get("analysis_backend_used", ""),
+                "deal_id": analysis.get("deal_id") or crm.get("deal_id"),
+                "amo_lead_id": analysis.get("amo_lead_id") or crm.get("amo_lead_id"),
+                "snapshot_warnings": snapshot.get("warnings", []) if isinstance(snapshot.get("warnings"), list) else [],
+                "snapshot": snapshot,
+                "analysis": analysis,
+            }
+            deal_artifact = deals_dir / _deal_artifact_filename(analysis=analysis, index=idx)
+            _write_json_path(deal_artifact, per_deal_payload)
+            deal_artifact_paths.append(str(deal_artifact))
+        except Exception as exc:
+            deals_failed += 1
+            logger.warning("analyze-period per-deal failed: deal=%s error=%s", deal_hint, exc)
+            failed_artifact = deals_dir / f"deal_{idx + 1}_failed.json"
+            _write_json_path(
+                failed_artifact,
+                {
+                    "run_timestamp": run_started_at.isoformat(),
+                    "source": source_name,
+                    "backend_requested": cfg.analyzer_backend,
+                    "deal_hint": deal_hint,
+                    "error": str(exc),
+                },
+            )
+            deal_artifact_paths.append(str(failed_artifact))
 
     effective_summary = _build_backend_effective_summary(llm_counts, cfg.analyzer_backend, preflight_forced_rules)
     metadata = AnalysisRunMetadata(
@@ -707,10 +777,25 @@ def _run_analyze_period(
         include_executed_at="executed_at" in public_meta,
     )
 
+    summary_payload = _build_period_run_summary(
+        run_started_at=run_started_at,
+        backend_requested=cfg.analyzer_backend,
+        analyses=analyses,
+        deal_artifact_paths=deal_artifact_paths,
+        total_deals_seen=len(normalized_rows_all),
+        total_deals_analyzed=len(analyses),
+        deals_failed=deals_failed,
+        limit=limit,
+    )
+    summary_path = run_dir / "summary.json"
+    _write_json_path(summary_path, summary_payload)
+
     logger.info(
-        "analyze-period success: backend=%s deals=%s llm_success=%s llm_success_repaired=%s llm_fallback=%s llm_error=%s effective=%s json=%s md=%s csv=%s",
+        "analyze-period success: backend=%s deals_seen=%s deals_analyzed=%s deals_failed=%s llm_success=%s llm_success_repaired=%s llm_fallback=%s llm_error=%s effective=%s json=%s md=%s csv=%s run_summary=%s",
         cfg.analyzer_backend,
+        len(normalized_rows_all),
         len(analyses),
+        deals_failed,
         llm_counts["llm_success_count"],
         llm_counts["llm_success_repaired_count"],
         llm_counts["llm_fallback_count"],
@@ -719,6 +804,7 @@ def _run_analyze_period(
         json_out.timestamped,
         md_out.timestamped,
         csv_out.timestamped,
+        summary_path,
     )
 
 
@@ -1003,6 +1089,73 @@ def _extract_raw_bundles_map(payload: dict[str, Any] | list[Any]) -> dict[str, d
     if isinstance(candidates, dict):
         return {str(k): v for k, v in candidates.items() if isinstance(v, dict)}
     return {}
+
+
+def _prepare_period_run_dirs(*, output_dir: Path, run_started_at: datetime) -> tuple[Path, Path]:
+    run_id = run_started_at.strftime("%Y%m%d_%H%M%S")
+    run_dir = output_dir / "period_runs" / run_id
+    deals_dir = run_dir / "deals"
+    deals_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir, deals_dir
+
+
+def _deal_artifact_filename(*, analysis: dict[str, Any], index: int) -> str:
+    deal_raw = analysis.get("deal_id") or analysis.get("amo_lead_id") or f"idx_{index + 1}"
+    deal_text = "".join(ch if ch.isalnum() else "_" for ch in str(deal_raw))
+    deal_text = deal_text.strip("_") or f"idx_{index + 1}"
+    return f"deal_{deal_text}.json"
+
+
+def _write_json_path(path: Path, payload: dict[str, Any] | list[Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _build_period_run_summary(
+    *,
+    run_started_at: datetime,
+    backend_requested: str,
+    analyses: list[dict[str, Any]],
+    deal_artifact_paths: list[str],
+    total_deals_seen: int,
+    total_deals_analyzed: int,
+    deals_failed: int,
+    limit: int | None,
+) -> dict[str, Any]:
+    backend_used_counts = Counter(str(item.get("analysis_backend_used") or "unknown") for item in analyses)
+    score_values = [int(item.get("score_0_100")) for item in analyses if isinstance(item.get("score_0_100"), int)]
+    risk_counter: Counter[str] = Counter()
+    for item in analyses:
+        flags = item.get("risk_flags")
+        if isinstance(flags, list):
+            for flag in flags:
+                text = str(flag).strip()
+                if text:
+                    risk_counter[text] += 1
+
+    avg_score = round(sum(score_values) / len(score_values), 2) if score_values else None
+    analysis_backend_used = (
+        next(iter(backend_used_counts))
+        if len(backend_used_counts) == 1
+        else "mixed"
+    )
+    return {
+        "run_timestamp": run_started_at.isoformat(),
+        "backend_requested": backend_requested,
+        "analysis_backend_used": analysis_backend_used,
+        "analysis_backend_used_counts": dict(backend_used_counts),
+        "total_deals_seen": total_deals_seen,
+        "total_deals_analyzed": total_deals_analyzed,
+        "deals_failed": deals_failed,
+        "limit": limit,
+        "artifact_paths": deal_artifact_paths,
+        "score_aggregates": {
+            "min": min(score_values) if score_values else None,
+            "max": max(score_values) if score_values else None,
+            "avg": avg_score,
+        },
+        "risk_flags_counts": dict(risk_counter),
+    }
 
 
 def _build_calls_markdown(*, results: list[dict[str, Any]], title: str) -> str:

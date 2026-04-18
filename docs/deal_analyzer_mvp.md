@@ -131,6 +131,30 @@ Analyze period:
 python -m src.deal_analyzer.cli --config config/deal_analyzer.local.json analyze-period --period-mode previous_workweek --input workspace/amocrm_collector/collect_period_2026-04-01_2026-04-07_latest.json
 ```
 
+Опционально можно ограничить размер батча:
+
+```powershell
+python -m src.deal_analyzer.cli --config config/deal_analyzer.local.json analyze-period --input workspace/amocrm_collector/collect_period_2026-04-01_2026-04-07_latest.json --limit 20
+```
+
+### Period artifacts
+`analyze-period` теперь дополнительно создает batch run-папку:
+- `workspace/deal_analyzer/period_runs/<run_timestamp>/deals/deal_<id>.json` — per-deal snapshot+analysis artifacts;
+- `workspace/deal_analyzer/period_runs/<run_timestamp>/summary.json` — агрегированный итог запуска.
+
+`summary.json` включает:
+- `run_timestamp`
+- `backend_requested`
+- `analysis_backend_used` (+ counts по backend used)
+- `total_deals_seen`
+- `total_deals_analyzed`
+- `deals_failed`
+- `artifact_paths`
+- `score_aggregates` (`min/max/avg`)
+- `risk_flags_counts`
+
+Это технический batch slice для analyzer и snapshot pipeline, не weekly layer и не writer layer.
+
 ## Vertical Slice: Snapshot -> Analysis -> JSON
 Минимальный сценарий для одной сделки/снапшота:
 

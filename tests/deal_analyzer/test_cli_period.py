@@ -133,3 +133,24 @@ def test_preflight_fail_path_switches_to_rules():
 
     assert forced_rules is True
     assert any("preflight failed" in msg for msg in logger.warnings)
+
+
+def test_cli_analyze_period_parses_limit():
+    import sys
+    from unittest.mock import patch as _patch
+    from src.deal_analyzer.cli import _parse_args as _parse
+
+    argv = [
+        "prog",
+        "--config",
+        "config/deal_analyzer.local.json",
+        "analyze-period",
+        "--input",
+        "workspace/amocrm_collector/collect_period_latest.json",
+        "--limit",
+        "7",
+    ]
+    with _patch.object(sys, "argv", argv):
+        args = _parse()
+    assert args.command == "analyze-period"
+    assert args.limit == 7
