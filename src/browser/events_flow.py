@@ -3534,6 +3534,9 @@ class EventsFlow:
             '.js-filter-apply',
         )
         initial_url = str(getattr(page, 'url', '') or '')
+        button_found = False
+        disabled_found = False
+
         for selector in selectors:
             loc = panel.locator(selector)
             try:
@@ -3542,6 +3545,21 @@ class EventsFlow:
                 button = loc.first
             except Exception:
                 continue
+
+            button_found = True
+            try:
+                disabled_now = bool(button.evaluate("""el => {
+                    const attrDisabled = el.hasAttribute('disabled') || String(el.getAttribute('aria-disabled') || '').toLowerCase() === 'true';
+                    const cls = String(el.className || '').toLowerCase();
+                    return attrDisabled || cls.includes('disabled') || cls.includes('button-input-disabled');
+                }"""))
+            except Exception:
+                disabled_now = False
+
+            if disabled_now:
+                disabled_found = True
+                continue
+
             for mode in ('normal', 'force', 'js'):
                 try:
                     if mode == 'normal':
@@ -3567,12 +3585,31 @@ class EventsFlow:
                 )
                 if bool(wait_info.get('confirmed')):
                     return
+
+        if button_found and disabled_found:
+            state = self._collect_results_area_state(page)
+            rows_visible = any(int(v) > 0 for v in state.get('row_visible_counts', {}).values())
+            empty_visible = any(int(v) > 0 for v in state.get('empty_visible_counts', {}).values())
+            if rows_visible or empty_visible:
+                self.logger.info(
+                    'weekly apply skipped: button_disabled=true rows_visible=%s empty_visible=%s; proceeding with current filtered results',
+                    str(rows_visible).lower(),
+                    str(empty_visible).lower(),
+                )
+                try:
+                    page.keyboard.press('Escape')
+                except Exception:
+                    pass
+                return
+
         artifacts = self._dump_stage_failure_artifacts(
             page=page,
             stage='apply',
             summary={
                 'reason': 'apply_button_not_confirmed',
                 'selectors': list(selectors),
+                'button_found': button_found,
+                'disabled_found': disabled_found,
                 'results_state': self._collect_results_area_state(page),
             },
         )
@@ -3826,6 +3863,8 @@ class EventsFlow:
             page.screenshot(path=str(ensure_inside_root(debug_dir / f"{prefix}.png", self.project_root)), full_page=True)
         except Exception as exc:
             self.logger.warning("weekly save_events_debug screenshot failed: prefix=%s error=%s", prefix, str(exc))
+
+
 
 
 

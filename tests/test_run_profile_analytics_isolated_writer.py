@@ -125,7 +125,7 @@ class _DummyApiWriterSuccess:
 
     def write_profile_analytics_result(self, **kwargs):
         _DummyApiWriterSuccess.called = True
-        return {"ok": True}
+        return {"totalUpdatedCells": 12, "ok": True}
 
 
 class _DummyApiWriterFail:
@@ -147,7 +147,7 @@ class _DummyUiWriter:
 
     def write_profile_analytics_result(self, **kwargs):
         _DummyUiWriter.called = True
-        return None
+        return {"written_cells": 9}
 
 
 def _reset_writer_flags() -> None:
@@ -163,7 +163,7 @@ def test_layout_writer_routing_api_preferred_dry_run_path() -> None:
     flow = object()
     report = SimpleNamespace(id="analytics_tag_single_example")
 
-    mode, fallback_used = _run_layout_writer_with_routing(
+    mode, fallback_used, stats = _run_layout_writer_with_routing(
         logger=logger,
         config=config,
         page=object(),
@@ -188,6 +188,7 @@ def test_layout_writer_routing_api_preferred_dry_run_path() -> None:
     assert fallback_used is False
     assert _DummyApiWriterSuccess.called is True
     assert _DummyUiWriter.called is False
+    assert int(stats.get("totalUpdatedCells", 0)) == 12
 
 
 def test_layout_writer_routing_fallback_to_ui_on_api_failure() -> None:
@@ -197,7 +198,7 @@ def test_layout_writer_routing_fallback_to_ui_on_api_failure() -> None:
     flow = object()
     report = SimpleNamespace(id="analytics_tag_single_example")
 
-    mode, fallback_used = _run_layout_writer_with_routing(
+    mode, fallback_used, stats = _run_layout_writer_with_routing(
         logger=logger,
         config=config,
         page=object(),
@@ -222,6 +223,7 @@ def test_layout_writer_routing_fallback_to_ui_on_api_failure() -> None:
     assert fallback_used is True
     assert _DummyApiWriterFail.called is True
     assert _DummyUiWriter.called is True
+    assert int(stats.get("written_cells", 0)) == 9
 
 
 
@@ -272,4 +274,45 @@ def test_select_execution_anchor_from_discovery_by_cell_same_row() -> None:
 
 
 
+
+
+def test_layout_writer_routing_raises_on_zero_updates() -> None:
+    class _ApiZero:
+        def __init__(self, project_root, logger=None):
+            self.project_root = project_root
+
+        def write_profile_analytics_result(self, **kwargs):
+            return {"totalUpdatedCells": 0}
+
+    logger = SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None, error=lambda *a, **k: None)
+    config = SimpleNamespace(project_root=Path("d:/any"))
+    flow = object()
+    report = SimpleNamespace(id="analytics_tag_single_example")
+
+    raised = False
+    try:
+        _run_layout_writer_with_routing(
+            logger=logger,
+            config=config,
+            page=object(),
+            flow=flow,
+            tabs=["all", "active", "closed"],
+            report=report,
+            compiled_result=object(),
+            destination=_make_destination(),
+            layout_dry_run=False,
+            api_write_enabled=True,
+            api_preferred=False,
+            api_dry_run=False,
+            api_fallback_to_ui=False,
+            target_dsl_row=None,
+            target_dsl_text_contains=None,
+            target_dsl_cell=None,
+            api_writer_factory=_ApiZero,
+            ui_writer_factory=_DummyUiWriter,
+        )
+    except RuntimeError as exc:
+        raised = True
+        assert "without sheet updates" in str(exc)
+    assert raised is True
 

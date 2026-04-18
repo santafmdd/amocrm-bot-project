@@ -611,6 +611,12 @@ def _run_weekly_refusals_profile(
         events_flow = EventsFlow(settings=settings, project_root=config.project_root)
         rows = events_flow.run_capture(page=page, flow_input=flow_input)
 
+    is_zero_result = len(rows) == 0
+    if is_zero_result:
+        logger.info("weekly zero result detected: report_id=%s parsed_rows=0", report.id)
+    else:
+        logger.info("weekly source rows captured: report_id=%s parsed_rows=%s", report.id, len(rows))
+
     parsed = parse_weekly_refusals_rows(
         report_id=report.id,
         display_name=report.display_name,
@@ -625,6 +631,11 @@ def _run_weekly_refusals_profile(
         config.project_root,
     )
     parsed_payload = parsed.to_dict()
+    logger.info("weekly parser payload stats: source_rows=%s before_rows=%s after_rows=%s",
+        len(parsed_payload.get("source_rows", []) or []),
+        len(parsed_payload.get("aggregated_before_status_counts", []) or []),
+        len(parsed_payload.get("aggregated_after_status_counts", []) or []),
+    )
     parsed_payload["mode"] = str((report.filters or {}).get("mode", "weekly") or "weekly").strip().lower() or "weekly"
     parsed_payload["cumulative_write_strategy"] = str(
         (report.filters or {}).get("cumulative_write_strategy", "recompute_from_source") or "recompute_from_source"
@@ -658,13 +669,19 @@ def _run_weekly_refusals_profile(
         logger=logger,
     )
     try:
+        if is_zero_result:
+            logger.info("weekly zero block write started: report_id=%s dry_run=%s", report.id, str(bool(weekly_dry_run)).lower())
+        else:
+            logger.info("weekly block write started: report_id=%s dry_run=%s", report.id, str(bool(weekly_dry_run)).lower())
         write_result = writer.write_block(
             destination=destination,
             parsed_result=parsed_payload,
             dry_run=bool(weekly_dry_run),
         )
         logger.info(
-            "weekly refusals write result: dry_run=%s planned_updates=%s updated_cells=%s summary=%s",
+            "weekly block write completed: report_id=%s zero_result=%s dry_run=%s planned_updates=%s updated_cells=%s summary=%s",
+            report.id,
+            str(is_zero_result).lower(),
             str(write_result.dry_run).lower(),
             write_result.planned_updates,
             write_result.updated_cells,
@@ -1004,7 +1021,7 @@ def _run_layout_writer_with_routing(
     target_dsl_cell: str | None = None,
     api_writer_factory=GoogleSheetsApiLayoutWriter,
     ui_writer_factory=GoogleSheetsUILayoutWriter,
-) -> tuple[str, bool]:
+) -> tuple[str, bool, dict[str, Any]]:
     fallback_used = False
     if not api_write_enabled:
         writer = ui_writer_factory(project_root=config.project_root)
@@ -1014,21 +1031,22 @@ def _run_layout_writer_with_routing(
             tabs=tabs,
             report_id=report.id,
         )
-        writer.write_profile_analytics_result(
+        ui_result = writer.write_profile_analytics_result(
             page=page,
             compiled_result=compiled_result,
             destination=destination,
             dry_run=layout_dry_run,
             scenario_executor=scenario_executor,
         )
-        return ("layout_ui", fallback_used)
+        logger.info("layout ui write completed: target_tab=%s target_id=%s stats=%s", destination.tab_name, destination.target_id, ui_result)
+        return ("layout_ui", fallback_used, dict(ui_result or {}))
 
     writer_mode = "api_preferred" if api_preferred else "api_opt_in"
     logger.info("writer mode selected = %s", writer_mode)
     logger.info("api discovery start")
     try:
         api_writer = api_writer_factory(project_root=config.project_root, logger=logger)
-        api_writer.write_profile_analytics_result(
+        api_result = api_writer.write_profile_analytics_result(
             compiled_result=compiled_result,
             destination=destination,
             dry_run=api_dry_run,
@@ -1037,8 +1055,10 @@ def _run_layout_writer_with_routing(
             target_dsl_cell=target_dsl_cell,
         )
         logger.info("api discovery finish")
-        logger.info("api write success")
-        return (writer_mode, fallback_used)
+        logger.info("api write completed: target_tab=%s target_id=%s response=%s", destination.tab_name, destination.target_id, api_result)
+        if not api_dry_run and int((api_result or {}).get("totalUpdatedCells", 0) or 0) <= 0:
+            raise RuntimeError("layout api writer completed without sheet updates")
+        return (writer_mode, fallback_used, dict(api_result or {}))
     except Exception as exc:
         logger.error("api write fail: %s", exc)
         if not (api_preferred and api_fallback_to_ui):
@@ -1052,14 +1072,15 @@ def _run_layout_writer_with_routing(
             tabs=tabs,
             report_id=report.id,
         )
-        ui_writer.write_profile_analytics_result(
+        ui_result = ui_writer.write_profile_analytics_result(
             page=page,
             compiled_result=compiled_result,
             destination=destination,
             dry_run=layout_dry_run,
             scenario_executor=scenario_executor,
         )
-        return ("layout_ui_fallback", fallback_used)
+        logger.info("layout ui fallback write completed: target_tab=%s target_id=%s stats=%s", destination.tab_name, destination.target_id, ui_result)
+        return ("layout_ui_fallback", fallback_used, dict(ui_result or {}))
 
 
 
@@ -1565,6 +1586,9 @@ def main() -> None:
                 snapshots=snapshots,
             )
             logger.info("compiled result created: tabs=%s totals_by_tab=%s", compiled_result.tabs, compiled_result.totals_by_tab)
+            stage_rows_count = sum(len(items) for items in (compiled_result.stages_by_tab or {}).values())
+            top_cards_count = sum(len(items) for items in (compiled_result.top_cards_by_tab or {}).values())
+            logger.info("compiled result payload stats: tabs=%s stage_rows=%s top_cards=%s totals_by_tab=%s", compiled_result.tabs, stage_rows_count, top_cards_count, compiled_result.totals_by_tab)
             logger.info("compiled result built = true")
 
             compiled_json_path = save_compiled_result_json(
@@ -1588,7 +1612,7 @@ def main() -> None:
             logger.info("writer runtime mode selected: %s", destination.kind)
 
             if destination.kind == "google_sheets_layout_ui":
-                mode_used, fallback_used = _run_layout_writer_with_routing(
+                mode_used, fallback_used, writer_stats = _run_layout_writer_with_routing(
                     logger=logger,
                     config=config,
                     page=page,
@@ -1608,6 +1632,11 @@ def main() -> None:
                 )
                 logger.info("writer mode final = %s", mode_used)
                 logger.info("fallback used = %s", str(fallback_used).lower())
+                logger.info("writer stats = %s", writer_stats)
+                if not bool(args.writer_layout_dry_run or api_routing["api_dry_run"]):
+                    written_cells = int((writer_stats or {}).get("written_cells", (writer_stats or {}).get("totalUpdatedCells", 0)) or 0)
+                    if written_cells <= 0:
+                        raise RuntimeError("layout writer finished without updates; payload/target resolution must be checked")
             else:
                 writer = GoogleSheetsUIWriter()
                 writer.write_profile_analytics_result(
@@ -1618,6 +1647,7 @@ def main() -> None:
                 )
         except Exception as exc:
             logger.error("writer mvp failed: %s", exc)
+            raise
 
         logger.info("Profile flow finished. successful_tabs=%s/%s", len(snapshots), len(tabs))
         logger.info("Exported tabs: %s", exported_tabs)
@@ -1625,6 +1655,13 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
 
 
 

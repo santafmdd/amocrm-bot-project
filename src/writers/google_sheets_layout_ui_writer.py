@@ -101,7 +101,7 @@ class GoogleSheetsUILayoutWriter:
         destination: WriterDestinationConfig,
         dry_run: bool = False,
         scenario_executor: ScenarioExecutor | None = None,
-    ) -> None:
+    ) -> dict[str, Any]:
         if not destination.sheet_url.strip():
             raise RuntimeError("Google Sheets destination URL is empty for layout writer.")
 
@@ -307,17 +307,31 @@ class GoogleSheetsUILayoutWriter:
 
         if dry_run:
             self.logger.info("layout dry-run mode: no sheet write performed")
-            return
+            return {
+                "dry_run": True,
+                "planned_writes": len(writes),
+                "written_cells": 0,
+                "missing_stages": sorted(set(missing)),
+                "skipped_blocks_count": len(skipped_blocks),
+            }
 
         if not writes:
-            self.logger.warning("layout writer: no writes planned; all blocks were skipped or no stage rows matched")
-            return
+            reason = "layout writer: no writes planned; all blocks were skipped or no stage rows matched"
+            self.logger.error(reason)
+            raise RuntimeError(reason)
 
         for cell_ref, value in writes.items():
             self._write_numeric_cell(page, cell_ref, value)
 
         self.logger.info("layout cells updated count: %s", len(writes))
         self.logger.info("layout writer finished successfully")
+        return {
+            "dry_run": False,
+            "planned_writes": len(writes),
+            "written_cells": len(writes),
+            "missing_stages": sorted(set(missing)),
+            "skipped_blocks_count": len(skipped_blocks),
+        }
 
     def debug_inspect_visible_grid(self, page: Page, destination: WriterDestinationConfig) -> None:
         """Isolated diagnostics for visible Google Sheets grid area (no write, no discovery scan)."""
@@ -1816,5 +1830,7 @@ class GoogleSheetsUILayoutWriter:
         value = re.sub(r"[\.;:,]+", " ", value)
         value = re.sub(r"\s+", " ", value)
         return value.strip()
+
+
 
 

@@ -1525,3 +1525,34 @@ def test_entity_branch_emits_timing_logs(monkeypatch, caplog):
     assert "checkpoint=after_control_text_after" in messages
     assert "checkpoint=before_entity_return" in messages
     assert "total_entity_verification_ms" in messages
+
+def test_click_apply_skips_when_button_disabled_and_empty_results(monkeypatch):
+    flow = _make_flow()
+
+    class _DisabledButton(_FakeElement):
+        def evaluate(self, script):
+            src = str(script)
+            if "attrDisabled" in src or "button-input-disabled" in src:
+                return True
+            return super().evaluate(script)
+
+    disabled_button = _DisabledButton(text=u("\u041f\u0440\u0438\u043c\u0435\u043d\u0438\u0442\u044c"), cls="button-input-disabled", tag="button")
+
+    class _Panel:
+        def locator(self, selector):
+            if selector == "button:has-text('Применить')":
+                return _FakeLocator([disabled_button])
+            return _FakeLocator([])
+
+    monkeypatch.setattr(
+        flow,
+        "_collect_results_area_state",
+        lambda _page: {
+            "row_visible_counts": {},
+            "empty_visible_counts": {".list__no-items": 1},
+            "loader_counts": {},
+            "container_counts": {},
+        },
+    )
+
+    flow._click_apply(_FakePage(), panel=_Panel())
