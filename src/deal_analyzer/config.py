@@ -129,9 +129,9 @@ def load_deal_analyzer_config(config_path: str | None = None) -> DealAnalyzerCon
                 continue
 
     analyzer_backend = str(raw.get("analyzer_backend", "rules")).strip().lower() or "rules"
-    if analyzer_backend not in {"rules", "ollama"}:
+    if analyzer_backend not in {"rules", "ollama", "hybrid"}:
         raise RuntimeError(
-            f"Unsupported analyzer_backend={analyzer_backend!r}. Allowed values: 'rules', 'ollama'."
+            f"Unsupported analyzer_backend={analyzer_backend!r}. Allowed values: 'rules', 'ollama', 'hybrid'."
         )
 
     ollama_base_url = str(raw.get("ollama_base_url", "http://127.0.0.1:11434")).strip() or "http://127.0.0.1:11434"

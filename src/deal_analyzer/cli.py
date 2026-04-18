@@ -24,7 +24,7 @@ from .exporters import (
     write_json_export,
     write_markdown_export,
 )
-from .llm_backend import analyze_deal_with_ollama_outcome
+from .llm_backend import analyze_deal_with_hybrid_outcome, analyze_deal_with_ollama_outcome
 from .llm_client import OllamaClient
 from .models import AnalysisRunMetadata
 from .roks_extractor import extract_roks_snapshot
@@ -34,7 +34,7 @@ from .transcription import transcribe_call_evidence
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Deal analyzer CLI (rules + Ollama backends)")
+    parser = argparse.ArgumentParser(description="Deal analyzer CLI (rules + hybrid + Ollama backends)")
     parser.add_argument("--config", required=True, help="Path to analyzer config JSON")
     parser.add_argument("--no-latest", action="store_true", help="Disable latest copy outputs")
 
@@ -663,7 +663,7 @@ def _run_analyze_period(
 
     preflight_forced_rules = False
     effective_backend = cfg.analyzer_backend
-    if cfg.analyzer_backend == "ollama":
+    if cfg.analyzer_backend in {"ollama", "hybrid"}:
         preflight_forced_rules = _run_ollama_preflight(cfg, logger)
         if preflight_forced_rules:
             effective_backend = "rules"
@@ -730,6 +730,11 @@ def _run_analyze_period(
                     "status_name": crm.get("status_name") or "",
                     "score": analysis.get("score_0_100"),
                     "risk_flags": analysis.get("risk_flags") if isinstance(analysis.get("risk_flags"), list) else [],
+                    "data_quality_flags": analysis.get("data_quality_flags") if isinstance(analysis.get("data_quality_flags"), list) else [],
+                    "owner_ambiguity_flag": bool(analysis.get("owner_ambiguity_flag")),
+                    "crm_hygiene_confidence": str(analysis.get("crm_hygiene_confidence") or ""),
+                    "analysis_confidence": str(analysis.get("analysis_confidence") or ""),
+                    "manager_insight_short": analysis.get("manager_insight_short", ""),
                     "warnings": per_deal_payload.get("snapshot_warnings", []),
                     "artifact_path": str(deal_artifact),
                 }
@@ -756,6 +761,11 @@ def _run_analyze_period(
                     "status_name": "",
                     "score": None,
                     "risk_flags": ["analysis_failed"],
+                    "data_quality_flags": [],
+                    "owner_ambiguity_flag": False,
+                    "crm_hygiene_confidence": "",
+                    "analysis_confidence": "",
+                    "manager_insight_short": "",
                     "warnings": [str(exc)],
                     "artifact_path": str(failed_artifact),
                 }
@@ -872,7 +882,7 @@ def _run_ollama_preflight(cfg: DealAnalyzerConfig, logger) -> bool:
         return False
 
     logger.warning(
-        "ollama preflight failed: base_url=%s model=%s timeout_seconds=%s probe_timeout_seconds=%s reason=%s; switching entire period to rules fallback",
+        "ollama preflight failed: base_url=%s model=%s timeout_seconds=%s probe_timeout_seconds=%s reason=%s; switching LLM layer to rules fallback",
         cfg.ollama_base_url,
         cfg.ollama_model,
         cfg.ollama_timeout_seconds,
@@ -937,11 +947,12 @@ def _analyze_one_with_isolation(
         analysis = _attach_enrichment_and_operator_outputs(analysis, normalized, cfg)
         return analysis, counts
 
-    if effective_backend != "ollama":
+    if effective_backend not in {"ollama", "hybrid"}:
         raise RuntimeError(f"Unsupported analyzer backend: {effective_backend}")
 
     logger.info(
-        "ollama analyze call: deal=%s model=%s base_url=%s timeout_seconds=%s",
+        "%s analyze call: deal=%s model=%s base_url=%s timeout_seconds=%s",
+        effective_backend,
         deal_hint,
         cfg.ollama_model,
         cfg.ollama_base_url,
@@ -949,11 +960,14 @@ def _analyze_one_with_isolation(
     )
 
     try:
-        outcome = analyze_deal_with_ollama_outcome(normalized_deal=normalized, config=cfg)
+        if effective_backend == "hybrid":
+            outcome = analyze_deal_with_hybrid_outcome(normalized_deal=normalized, config=cfg)
+        else:
+            outcome = analyze_deal_with_ollama_outcome(normalized_deal=normalized, config=cfg)
         analysis = outcome.analysis.to_dict()
-        analysis["analysis_backend_requested"] = "ollama"
+        analysis["analysis_backend_requested"] = cfg.analyzer_backend
         analysis["backend"] = cfg.analyzer_backend
-        if outcome.backend_used == "ollama":
+        if outcome.backend_used in {"ollama", "hybrid"}:
             counts["llm_success_count"] += 1
             if outcome.repaired:
                 counts["llm_success_repaired_count"] += 1
@@ -961,15 +975,17 @@ def _analyze_one_with_isolation(
             counts["llm_fallback_count"] += 1
         if outcome.llm_error:
             counts["llm_error_count"] += 1
-            logger.warning("ollama fallback used: deal=%s reason=%s", deal_hint, outcome.error_message)
+            logger.warning("%s fallback used: deal=%s reason=%s", effective_backend, deal_hint, outcome.error_message)
         analysis = _attach_enrichment_and_operator_outputs(analysis, normalized, cfg)
         return analysis, counts
     except Exception as exc:  # hard isolation for batch path
-        logger.warning("ollama analyze failed, fallback to rules: deal=%s error=%s", deal_hint, exc)
+        logger.warning("%s analyze failed, fallback to rules: deal=%s error=%s", effective_backend, deal_hint, exc)
         fallback = analyze_deal(normalized, cfg).to_dict()
-        fallback["analysis_backend_requested"] = "ollama"
+        fallback["analysis_backend_requested"] = cfg.analyzer_backend
         fallback["analysis_backend_used"] = "rules_fallback"
         fallback["llm_repair_applied"] = False
+        fallback["llm_error"] = True
+        fallback["llm_fallback"] = True
         fallback["backend"] = cfg.analyzer_backend
         fallback = _attach_enrichment_and_operator_outputs(fallback, normalized, cfg)
         counts["llm_fallback_count"] += 1
@@ -1016,6 +1032,16 @@ def _build_backend_effective_summary(
 ) -> str:
     if backend_requested == "rules":
         return "rules_only"
+    if backend_requested == "hybrid":
+        if preflight_forced_rules:
+            return "hybrid_preflight_failed_rules_only"
+        success = int(llm_counts.get("llm_success_count", 0))
+        fallback = int(llm_counts.get("llm_fallback_count", 0))
+        if success > 0 and fallback == 0:
+            return "hybrid_with_llm_for_all"
+        if success > 0 and fallback > 0:
+            return "hybrid_with_partial_llm_fallback"
+        return "hybrid_requested_rules_only_fallback"
     if preflight_forced_rules:
         return "ollama_preflight_failed_all_rules_fallback"
     success = int(llm_counts.get("llm_success_count", 0))
@@ -1177,6 +1203,13 @@ def _build_period_run_summary(
                 text = str(flag).strip()
                 if text:
                     risk_counter[text] += 1
+    analysis_confidence_counter: Counter[str] = Counter()
+    owner_ambiguity_count = 0
+    for item in analyses:
+        confidence = str(item.get("analysis_confidence") or "").strip().lower() or "unknown"
+        analysis_confidence_counter[confidence] += 1
+        if bool(item.get("owner_ambiguity_flag")):
+            owner_ambiguity_count += 1
 
     avg_score = round(sum(score_values) / len(score_values), 2) if score_values else None
     analysis_backend_used = (
@@ -1200,6 +1233,8 @@ def _build_period_run_summary(
             "avg": avg_score,
         },
         "risk_flags_counts": dict(risk_counter),
+        "analysis_confidence_counts": dict(analysis_confidence_counter),
+        "owner_ambiguity_deals": owner_ambiguity_count,
     }
 
 
@@ -1232,6 +1267,18 @@ def _build_period_summary_markdown(*, summary: dict[str, Any], period_deal_recor
     lines: list[str] = []
     lines.append(f"# Analyze Period Run Summary ({summary.get('run_timestamp', '')})")
     lines.append("")
+    lines.append("## Data Quality / Interpretation Confidence")
+    confidence_counts = summary.get("analysis_confidence_counts", {}) if isinstance(summary.get("analysis_confidence_counts"), dict) else {}
+    if confidence_counts:
+        for key, val in sorted(confidence_counts.items(), key=lambda x: str(x[0])):
+            lines.append(f"- analysis_confidence[{key}]: {val}")
+    owner_ambiguity_deals = int(summary.get("owner_ambiguity_deals", 0) or 0)
+    low_confidence_deals = sum(1 for item in period_deal_records if str(item.get("analysis_confidence") or "").lower() == "low")
+    lines.append(f"- owner_ambiguity_deals: {owner_ambiguity_deals}")
+    lines.append(f"- low_confidence_deals: {low_confidence_deals}")
+    if low_confidence_deals > 0:
+        lines.append("- Note: часть выводов ограничена качеством CRM-данных и/или owner ambiguity.")
+    lines.append("")
     lines.append("## Run Info")
     lines.append(f"- Backend requested: {summary.get('backend_requested', '')}")
     lines.append(f"- Backend used: {summary.get('analysis_backend_used', '')}")
@@ -1257,6 +1304,18 @@ def _build_period_summary_markdown(*, summary: dict[str, Any], period_deal_recor
         for risk, count in sorted(regular_items, key=lambda x: x[1], reverse=True):
             lines.append(f"- {risk}: {count}")
     lines.append("")
+
+    short_insights = [
+        str(item.get("manager_insight_short") or "").strip()
+        for item in period_deal_records
+        if isinstance(item, dict)
+    ]
+    short_insights = [x for x in short_insights if x]
+    if short_insights:
+        lines.append("## Hybrid LLM Insights (Short)")
+        for insight, count in Counter(short_insights).most_common(5):
+            lines.append(f"- {insight} ({count})")
+        lines.append("")
     lines.append("## Qualified Loss / Market Mismatch")
     if not qualified_items:
         lines.append("- none")
@@ -1329,6 +1388,8 @@ def _build_manager_brief_markdown(*, summary: dict[str, Any], period_deal_record
         for item in period_deal_records
         if isinstance(item.get("warnings"), list) and len(item.get("warnings")) > 0
     )
+    owner_ambiguity_count = sum(1 for item in period_deal_records if bool(item.get("owner_ambiguity_flag")))
+    low_confidence_count = sum(1 for item in period_deal_records if str(item.get("analysis_confidence") or "").lower() == "low")
     attention_deals = sorted(
         period_deal_records,
         key=lambda x: (
@@ -1349,7 +1410,17 @@ def _build_manager_brief_markdown(*, summary: dict[str, Any], period_deal_record
         reverse=True,
     )[:5]
 
-    actions = _build_manager_brief_actions(top_risk_patterns=top_risk_patterns, summary=summary)
+    actions = _build_manager_brief_actions(
+        top_risk_patterns=top_risk_patterns,
+        summary=summary,
+        period_deal_records=period_deal_records,
+    )
+    short_insights = [
+        str(item.get("manager_insight_short") or "").strip()
+        for item in period_deal_records
+        if isinstance(item, dict)
+    ]
+    short_insights = [x for x in short_insights if x]
 
     lines: list[str] = []
     lines.append("# Manager Brief")
@@ -1363,6 +1434,8 @@ def _build_manager_brief_markdown(*, summary: dict[str, Any], period_deal_record
     lines.append(f"- Просмотрено сделок: {summary.get('total_deals_seen', 0)}")
     lines.append(f"- Проанализировано: {summary.get('total_deals_analyzed', 0)}")
     lines.append(f"- Упало: {summary.get('deals_failed', 0)}")
+    lines.append(f"- Owner ambiguity: {owner_ambiguity_count}")
+    lines.append(f"- Низкая надежность интерпретации: {low_confidence_count}")
     lines.append("")
     lines.append("## 5 главных риск-паттернов")
     if not top_risk_patterns:
@@ -1413,16 +1486,38 @@ def _build_manager_brief_markdown(*, summary: dict[str, Any], period_deal_record
     lines.append("## Что делать дальше")
     for action in actions:
         lines.append(f"- {action}")
+    if low_confidence_count > 0 or owner_ambiguity_count > 0:
+        lines.append("- Перед персональными выводами по low-confidence кейсам подтвердить фактического ведущего и полноту CRM-контекста.")
     lines.append("")
+    if short_insights:
+        lines.append("## Короткие управленческие инсайты (LLM, опционально)")
+        for insight, count in Counter(short_insights).most_common(5):
+            lines.append(f"- {insight} ({count})")
+        lines.append("")
     if warnings_count > 0:
         lines.append(f"_Технические предупреждения snapshot: {warnings_count} сделок (детали в deals/*.json и top_risks.json)._")
         lines.append("")
     return "\n".join(lines).strip() + "\n"
 
 
-def _build_manager_brief_actions(*, top_risk_patterns: list[tuple[str, int]], summary: dict[str, Any]) -> list[str]:
+def _build_manager_brief_actions(
+    *,
+    top_risk_patterns: list[tuple[str, int]],
+    summary: dict[str, Any],
+    period_deal_records: list[dict[str, Any]],
+) -> list[str]:
     actions: list[str] = []
     deals_failed = int(summary.get("deals_failed", 0) or 0)
+    analyzed_records = [x for x in period_deal_records if x.get("score") is not None]
+    all_loss_batch = bool(analyzed_records) and all(_is_loss_like_record(x) for x in analyzed_records)
+    if all_loss_batch:
+        return [
+            "Провести cleanup closed-lost: валидировать причину потери в каждой сделке и убрать пустые формулировки.",
+            "Сгруппировать потери по типам (anti-fit, market mismatch, цена, сроки) и обновить сегментную классификацию.",
+            "Исключить all-loss кейсы из стандартного pipeline pressure path, оставить только корректный closeout-контур.",
+            "Подготовить короткий coaching-разбор по топ-3 причинам потерь для команды.",
+            "Зафиксировать корректные критерии раннего отсева нецелевых сделок на этапе квалификации.",
+        ]
     if deals_failed > 0:
         actions.append("Разобрать упавшие сделки из artifacts и закрыть причины падения пайплайна анализа.")
     if top_risk_patterns:

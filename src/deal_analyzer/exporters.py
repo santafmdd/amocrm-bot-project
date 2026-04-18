@@ -156,6 +156,10 @@ def _csv_fields(*, include_executed_at: bool) -> list[str]:
         "manager_summary",
         "employee_coaching",
         "employee_fix_tasks",
+        "data_quality_flags",
+        "owner_ambiguity_flag",
+        "crm_hygiene_confidence",
+        "analysis_confidence",
         "presentation_quality_flag",
         "followup_quality_flag",
         "data_completeness_flag",
@@ -166,6 +170,9 @@ def _csv_fields(*, include_executed_at: bool) -> list[str]:
         "recommended_training_tasks_for_employee",
         "manager_message_draft",
         "employee_training_message_draft",
+        "loss_reason_short",
+        "manager_insight_short",
+        "coaching_hint_short",
     ]
     if include_executed_at:
         fields.insert(1, "executed_at")
@@ -215,6 +222,14 @@ def build_markdown_report(
         if row.get("analysis_backend_used"):
             lines.append(f"- Analysis backend used: {row.get('analysis_backend_used')}")
         lines.append(f"- LLM repair applied: {row.get('llm_repair_applied', False)}")
+        lines.append(f"- LLM fallback: {row.get('llm_fallback', False)}")
+        lines.append(f"- LLM error: {row.get('llm_error', False)}")
+        if row.get("loss_reason_short"):
+            lines.append(f"- Loss reason short: {row.get('loss_reason_short')}")
+        if row.get("manager_insight_short"):
+            lines.append(f"- Manager insight short: {row.get('manager_insight_short')}")
+        if row.get("coaching_hint_short"):
+            lines.append(f"- Coaching hint short: {row.get('coaching_hint_short')}")
         lines.append(
             "- Enrichment: status={status}, source={source}, confidence={conf}".format(
                 status=row.get("enrichment_match_status", ""),
@@ -226,6 +241,11 @@ def build_markdown_report(
         lines.append(f"- Presentation flag: {row.get('presentation_quality_flag')}")
         lines.append(f"- Follow-up flag: {row.get('followup_quality_flag')}")
         lines.append(f"- Completeness flag: {row.get('data_completeness_flag')}")
+        lines.append(f"- Analysis confidence: {row.get('analysis_confidence', '')}")
+        lines.append(f"- CRM hygiene confidence: {row.get('crm_hygiene_confidence', '')}")
+        lines.append(f"- Owner ambiguity: {row.get('owner_ambiguity_flag', False)}")
+        if isinstance(row.get("data_quality_flags"), list) and row.get("data_quality_flags"):
+            lines.append(f"- Data quality flags: {', '.join(str(x) for x in row.get('data_quality_flags'))}")
         if row.get("manager_summary"):
             lines.append(f"- Manager summary: {row.get('manager_summary')}")
         if row.get("employee_coaching"):

@@ -76,6 +76,27 @@ def build_operator_outputs(*, deal: dict[str, Any], analysis: dict[str, Any]) ->
 
     risk_flags = analysis.get("risk_flags") if isinstance(analysis.get("risk_flags"), list) else []
     growth_zones = analysis.get("growth_zones") if isinstance(analysis.get("growth_zones"), list) else []
+    risk_flags_norm = [str(x).strip().lower() for x in risk_flags]
+    status_norm = _clean_text(deal.get("status_name")).lower().replace("ё", "е")
+    is_closed_lost = any(x in status_norm for x in ("закрыто", "не реализ", "отказ"))
+    has_qualified_loss = any(x.startswith("qualified_loss:") for x in risk_flags_norm)
+    has_evidence_context = any(x.startswith("evidence_context:") for x in risk_flags_norm)
+    notes_present = isinstance(deal.get("notes_summary_raw"), list) and len(deal.get("notes_summary_raw")) > 0
+    tasks_present = isinstance(deal.get("tasks_summary_raw"), list) and len(deal.get("tasks_summary_raw")) > 0
+    comments_present = bool(_clean_text(deal.get("company_comment")) or _clean_text(deal.get("contact_comment")))
+    has_closed_context = notes_present or tasks_present or comments_present
+    analysis_confidence = _clean_text(analysis.get("analysis_confidence")).lower()
+    owner_ambiguity = bool(analysis.get("owner_ambiguity_flag"))
+    analysis_dq_flags = [str(x).strip().lower() for x in (analysis.get("data_quality_flags") or []) if str(x).strip()]
+    severe_low_confidence_markers = {
+        "crm_context_missing_with_stage_movement",
+        "crm_context_sparse_with_activity_signals",
+        "closed_lost_without_documented_reason",
+        "owner_ambiguity_detected",
+        "owner_ambiguity_responsible_mismatch",
+        "owner_ambiguity_assigned_by_mismatch",
+        "owner_ambiguity_attribution_limited",
+    }
 
     manager_summary = (
         f"{deal_name}: этап '{status or '-'}'"
@@ -89,6 +110,100 @@ def build_operator_outputs(*, deal: dict[str, Any], analysis: dict[str, Any]) ->
         )
         + "Следующий шаг: зафиксировать конкретное действие и срок в CRM."
     )
+
+    if has_qualified_loss:
+        return {
+            "manager_summary": (
+                f"{deal_name}: зафиксирован qualified loss (anti-fit/market mismatch). "
+                "Нужна корректная closeout-классификация без pressure follow-up."
+            ),
+            "employee_coaching": (
+                "Кейс не про дожим: фокус на ранней квалификации, корректной фиксации anti-fit/market mismatch "
+                "и аккуратном закрытии сделки с полезным контекстом в CRM."
+            ),
+            "employee_fix_tasks": [
+                "Зафиксировать причину отказа в формате «что не совпало и почему это anti-fit/market mismatch».",
+                "Обновить closeout-классификацию: тип причины, этап выявления и критерий нецелевого кейса.",
+                "Добавить короткую заметку по раннему отсеву похожих кейсов в будущих сделках.",
+            ],
+        }
+
+    low_confidence_guard = analysis_confidence == "low" and (
+        is_closed_lost
+        or owner_ambiguity
+        or any(flag in severe_low_confidence_markers for flag in analysis_dq_flags)
+    )
+    if low_confidence_guard and not has_qualified_loss:
+        manager_caution = (
+            "Интерпретация ограничена качеством CRM-данных и возможной owner ambiguity."
+            if owner_ambiguity
+            else "Интерпретация ограничена качеством CRM-данных."
+        )
+        if is_closed_lost:
+            return {
+                "manager_summary": (
+                    f"{deal_name}: closed-lost кейс с ограниченной надежностью выводов. "
+                    f"{manager_caution} Приоритет — корректная фиксация причины потери и closeout-cleanup."
+                ),
+                "employee_coaching": (
+                    "Не делаем вывод о бездействии: сначала восстановить фактическую причину потери, "
+                    "проверить атрибуцию owner и заполнить CRM-контекст."
+                ),
+                "employee_fix_tasks": [
+                    "Зафиксировать причину потери в нейтральном формате «кто/почему/на каком этапе».",
+                    "Проверить соответствие owner в CRM фактическому ведущему сделки.",
+                    "Сделать closeout-cleanup: убрать пустые/противоречивые поля и обновить классификацию.",
+                ],
+            }
+        return {
+            "manager_summary": (
+                f"{deal_name}: вывод по сделке ограничен качеством CRM-данных. {manager_caution} "
+                "До персональных выводов подтвердить фактического ведущего и контекст последних касаний."
+            ),
+            "employee_coaching": (
+                "Сфокусироваться на фактах и полноте CRM: коротко зафиксировать контекст, следующий шаг и владельца коммуникации."
+            ),
+            "employee_fix_tasks": [
+                "Проверить атрибуцию owner и фактического ведущего сделки.",
+                "Добавить короткий evidence note по последнему значимому контакту.",
+                "Зафиксировать следующий шаг и срок в нейтральной формулировке.",
+            ],
+        }
+
+    if is_closed_lost and not has_qualified_loss and has_closed_context:
+        return {
+            "manager_summary": (
+                f"{deal_name}: closed-lost кейс с базовым контекстом. "
+                "Нужно завершить корректную closeout-классификацию и зафиксировать причину потери."
+            ),
+            "employee_coaching": (
+                "Фокус на качестве фиксации причины потери: кто отказал, что именно не совпало, "
+                "и какой anti-pattern нужно учесть в будущей квалификации."
+            ),
+            "employee_fix_tasks": [
+                "Уточнить и зафиксировать ключевую причину потери в финальной записи сделки.",
+                "Проставить closeout-классификацию (тип причины + этап, где выявлен разрыв).",
+                "Сделать CRM-cleanup: убрать пустые/противоречивые поля в закрытой сделке.",
+                "Добавить короткий anti-pattern note для раннего отсева похожих кейсов.",
+            ],
+        }
+
+    if is_closed_lost and has_evidence_context:
+        return {
+            "manager_summary": (
+                f"{deal_name}: закрытая сделка с дефицитом evidence-контекста. "
+                "Приоритет — восстановить причину потери и корректно классифицировать closeout."
+            ),
+            "employee_coaching": (
+                "Сначала восстановить фактологию потери "
+                "(кто отказал, почему, на каком этапе, что именно не совпало)."
+            ),
+            "employee_fix_tasks": [
+                "Дописать причину потери в карточке: кто принял решение и по какой причине.",
+                "Проставить closeout-классификацию (цена/срок/продукт/нецелевой запрос/другое).",
+                "Сделать CRM-cleanup: убрать пустые поля и противоречащие записи по финальному статусу.",
+            ],
+        }
 
     coaching_parts: list[str] = []
     if growth_zones:
@@ -231,6 +346,7 @@ def _enrich_one(row: dict[str, Any], *, context: EnrichmentContext, config, logg
 
     _apply_client_fields(row, client_match.row, (config.fields_mapping or {}))
     _apply_appointment_fields(row, appointment_match.row, (config.fields_mapping or {}))
+    _apply_owner_ambiguity_hints(row)
 
     logger.info(
         "deal analyzer enrich: deal=%s status=%s source=%s confidence=%.2f client_row=%s appointment_row=%s",
@@ -242,6 +358,43 @@ def _enrich_one(row: dict[str, Any], *, context: EnrichmentContext, config, logg
         row["matched_appointment_row_id"],
     )
     return row
+
+
+def _apply_owner_ambiguity_hints(row: dict[str, Any]) -> None:
+    flags = row.get("data_quality_flags")
+    if not isinstance(flags, list):
+        flags = []
+    responsible = _normalize_text(str(row.get("responsible_user_name") or ""))
+    conducted = _normalize_text(str(row.get("enriched_conducted_by") or ""))
+    assigned = _normalize_text(str(row.get("enriched_assigned_by") or ""))
+    if responsible and conducted and responsible != conducted:
+        row["owner_ambiguity_flag"] = True
+        flags.append("owner_ambiguity_responsible_mismatch")
+    elif responsible and assigned and responsible != assigned:
+        row["owner_ambiguity_flag"] = True
+        flags.append("owner_ambiguity_assigned_by_mismatch")
+    else:
+        row.setdefault("owner_ambiguity_flag", False)
+    row["data_quality_flags"] = _dedup(flags)
+
+
+def _normalize_text(value: str) -> str:
+    return " ".join(str(value or "").strip().lower().replace("ё", "е").split())
+
+
+def _dedup(items: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
+    return out
 
 
 def _apply_client_fields(row: dict[str, Any], source_row: dict[str, str], fields_mapping: dict[str, dict[str, str]]) -> None:

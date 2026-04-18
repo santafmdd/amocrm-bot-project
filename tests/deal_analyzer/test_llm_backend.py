@@ -2,7 +2,7 @@
 from unittest.mock import patch
 
 from src.deal_analyzer.config import DealAnalyzerConfig
-from src.deal_analyzer.llm_backend import analyze_deal_with_ollama_outcome
+from src.deal_analyzer.llm_backend import analyze_deal_with_hybrid_outcome, analyze_deal_with_ollama_outcome
 from src.deal_analyzer.llm_client import OllamaClientError, ParsedJsonResponse
 
 
@@ -123,3 +123,41 @@ def test_llm_backend_uses_timeout_from_config_when_creating_client():
     assert captured["timeout_seconds"] == 37
     assert captured["model"] == cfg.ollama_model
     assert captured["base_url"] == cfg.ollama_base_url
+
+
+def test_hybrid_backend_success_adds_short_fields_without_overriding_rules_payload():
+    cfg = _cfg()
+    cfg = DealAnalyzerConfig(**{**cfg.__dict__, "analyzer_backend": "hybrid"})
+    row = {"deal_id": 5, "amo_lead_id": 5, "deal_name": "Hybrid Deal"}
+    payload = {
+        "loss_reason_short": "Анти-fit по внедрению",
+        "manager_insight_short": "Кейс не из целевого сегмента",
+        "coaching_hint_short": "Ранний отсев по признакам anti-fit",
+    }
+
+    out = analyze_deal_with_hybrid_outcome(normalized_deal=row, config=cfg, client=_FakeClient(payload))
+    assert out.backend_used == "hybrid"
+    assert out.llm_error is False
+    assert out.analysis.analysis_backend_used == "hybrid"
+    assert out.analysis.loss_reason_short == "Анти-fit по внедрению"
+    assert out.analysis.manager_insight_short == "Кейс не из целевого сегмента"
+    assert out.analysis.coaching_hint_short == "Ранний отсев по признакам anti-fit"
+    assert out.analysis.llm_fallback is False
+    assert out.analysis.llm_error is False
+
+
+def test_hybrid_backend_invalid_json_or_timeout_falls_back_to_rules_only():
+    cfg = _cfg()
+    cfg = DealAnalyzerConfig(**{**cfg.__dict__, "analyzer_backend": "hybrid"})
+
+    out = analyze_deal_with_hybrid_outcome(
+        normalized_deal={"deal_id": 6, "deal_name": "Hybrid Bad"}, config=cfg, client=_AlwaysFailClient()
+    )
+    assert out.backend_used == "rules_fallback"
+    assert out.llm_error is True
+    assert out.analysis.analysis_backend_used == "rules_fallback"
+    assert out.analysis.loss_reason_short == ""
+    assert out.analysis.manager_insight_short == ""
+    assert out.analysis.coaching_hint_short == ""
+    assert out.analysis.llm_fallback is True
+    assert out.analysis.llm_error is True

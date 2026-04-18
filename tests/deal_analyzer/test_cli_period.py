@@ -154,3 +154,61 @@ def test_cli_analyze_period_parses_limit():
         args = _parse()
     assert args.command == "analyze-period"
     assert args.limit == 7
+
+
+def test_hybrid_success_path_uses_hybrid_backend_and_counts_llm_success():
+    logger = _Logger()
+    cfg = _cfg(timeout_seconds=50)
+    cfg = DealAnalyzerConfig(**{**cfg.__dict__, "analyzer_backend": "hybrid"})
+
+    outcome = LlmAnalysisOutcome(
+        _analysis(21, "hybrid"),
+        "hybrid",
+        False,
+        None,
+        False,
+    )
+
+    with patch("src.deal_analyzer.cli.analyze_deal_with_hybrid_outcome", return_value=outcome):
+        analysis, counts = _analyze_one_with_isolation({"deal_id": 21}, cfg, logger, deal_hint="21", backend_override="hybrid")
+
+    assert analysis["analysis_backend_used"] == "hybrid"
+    assert counts["llm_success_count"] == 1
+    assert counts["llm_fallback_count"] == 0
+    assert counts["llm_error_count"] == 0
+
+
+def test_hybrid_invalid_json_or_timeout_falls_back_without_crashing():
+    logger = _Logger()
+    cfg = _cfg(timeout_seconds=50)
+    cfg = DealAnalyzerConfig(**{**cfg.__dict__, "analyzer_backend": "hybrid"})
+
+    outcome = LlmAnalysisOutcome(
+        _analysis(22, "rules_fallback"),
+        "rules_fallback",
+        True,
+        "bad json",
+        False,
+    )
+
+    with patch("src.deal_analyzer.cli.analyze_deal_with_hybrid_outcome", return_value=outcome):
+        analysis, counts = _analyze_one_with_isolation({"deal_id": 22}, cfg, logger, deal_hint="22", backend_override="hybrid")
+
+    assert analysis["analysis_backend_used"] == "rules_fallback"
+    assert counts["llm_success_count"] == 0
+    assert counts["llm_fallback_count"] == 1
+    assert counts["llm_error_count"] == 1
+
+
+def test_rules_only_path_unchanged_with_hybrid_available():
+    logger = _Logger()
+    cfg = DealAnalyzerConfig(**{**_cfg().__dict__, "analyzer_backend": "rules"})
+    analysis, counts = _analyze_one_with_isolation({"deal_id": 23, "deal_name": "Rules only"}, cfg, logger, deal_hint="23")
+    assert analysis["analysis_backend_used"] == "rules"
+    assert analysis["analysis_backend_requested"] == "rules"
+    assert counts == {
+        "llm_success_count": 0,
+        "llm_success_repaired_count": 0,
+        "llm_fallback_count": 0,
+        "llm_error_count": 0,
+    }

@@ -22,6 +22,15 @@ class DealAnalysis:
     recommended_training_tasks_for_employee: list[str]
     manager_message_draft: str
     employee_training_message_draft: str
+    data_quality_flags: list[str] | None = None
+    owner_ambiguity_flag: bool = False
+    crm_hygiene_confidence: str = "medium"
+    analysis_confidence: str = "medium"
+    loss_reason_short: str = ""
+    manager_insight_short: str = ""
+    coaching_hint_short: str = ""
+    llm_error: bool = False
+    llm_fallback: bool = False
     analysis_backend_requested: str = "rules"
     analysis_backend_used: str = "rules"
     llm_repair_applied: bool = False

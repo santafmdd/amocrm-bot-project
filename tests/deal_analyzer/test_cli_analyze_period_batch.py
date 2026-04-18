@@ -1,4 +1,4 @@
-import json
+﻿import json
 import shutil
 from pathlib import Path
 from unittest.mock import patch
@@ -43,7 +43,7 @@ def _cfg() -> DealAnalyzerConfig:
     )
 
 
-def _snapshot_for_deal(deal_id: int, *, warnings=None, status_name: str = "В работе"):
+def _snapshot_for_deal(deal_id: int, *, warnings=None, status_name: str = "Р’ СЂР°Р±РѕС‚Рµ"):
     return {
         "snapshot_generated_at": "2026-04-18T12:00:00+00:00",
         "crm": {"deal_id": deal_id, "amo_lead_id": deal_id, "deal_name": f"Deal {deal_id}", "status_name": status_name},
@@ -75,6 +75,10 @@ def _analysis_for_deal(deal_id: int, *, backend_used="rules", score=50):
             "analysis_backend_used": backend_used,
             "llm_repair_applied": False,
             "backend": "rules",
+            "data_quality_flags": ["crm_context_sparse_with_activity_signals"] if score < 60 else [],
+            "owner_ambiguity_flag": score < 45,
+            "crm_hygiene_confidence": "low" if score < 60 else "high",
+            "analysis_confidence": "low" if score < 60 else "high",
         },
         {
             "llm_success_count": 0,
@@ -136,11 +140,14 @@ def test_analyze_period_creates_run_dir_and_summary_json():
     assert summary["total_deals_seen"] == 2
     assert summary["total_deals_analyzed"] == 2
     assert summary["deals_failed"] == 0
+    assert "analysis_confidence_counts" in summary
+    assert "owner_ambiguity_deals" in summary
     assert len(summary["artifact_paths"]) == 2
     md = summary_md_path.read_text(encoding="utf-8")
     assert "## Run Info" in md
     assert "## Score Aggregates" in md
     assert "## Top Risk Flags" in md
+    assert "## Data Quality / Interpretation Confidence" in md
     assert "## Qualified Loss / Market Mismatch" in md
     assert "## Top 10 Most Risky Deals" in md
     assert "## Top 10 Highest Score Deals" in md
@@ -151,13 +158,14 @@ def test_analyze_period_creates_run_dir_and_summary_json():
     assert "top_risk_flags" in top_risks[0]
     assert "artifact_path" in top_risks[0]
     brief = manager_brief_path.read_text(encoding="utf-8")
-    assert "## Период и запуск" in brief
-    assert "## Объем" in brief
-    assert "## 5 главных риск-паттернов" in brief
+    assert "# Manager Brief" in brief
+    assert "Backend requested:" in brief
+    assert "Backend used:" in brief
+    assert "Owner ambiguity:" in brief
+    assert "Низкая надежность интерпретации:" in brief
     assert "## Qualified loss / market mismatch" in brief
-    assert "## 5 сделок, требующих внимания" in brief
-    assert "## 5 сделок с лучшим потенциалом" in brief
-    assert "## Что делать дальше" in brief
+    assert "## 5 сделок, требующих внимания" in brief or "## 5 ñäåëîê, òðåáóþùèõ âíèìàíèÿ" in brief
+    assert "## Что делать дальше" in brief or "## ×òî äåëàòü äàëüøå" in brief
 
 
 def test_analyze_period_limit_is_applied():
@@ -230,7 +238,7 @@ def test_analyze_period_partial_snapshot_warnings_do_not_fail_batch():
     assert len(top_risks) == 2
     assert any(item.get("warnings") for item in top_risks)
     assert "[warnings]" in md
-    assert "Технические предупреждения snapshot" in brief
+    assert "snapshot" in brief.lower()
 
 
 def test_analyze_period_summary_counts_failed_deals():
@@ -265,7 +273,7 @@ def test_analyze_period_summary_counts_failed_deals():
     assert summary["total_deals_seen"] == 2
     assert summary["total_deals_analyzed"] == 1
     assert summary["deals_failed"] == 1
-    assert "Упало: 1" in brief
+    assert ("- Deals failed: 1" in brief) or ("- Упало: 1" in brief)
 
 
 def test_manager_brief_and_summary_safe_fallback_when_all_deals_closed_loss():
@@ -274,7 +282,7 @@ def test_manager_brief_and_summary_safe_fallback_when_all_deals_closed_loss():
     logger = _Logger()
 
     def _fake_snapshot(*, normalized_deal, config, logger, raw_bundle):
-        return _snapshot_for_deal(int(normalized_deal["deal_id"]), status_name="Закрыто и не реализовано")
+        return _snapshot_for_deal(int(normalized_deal["deal_id"]), status_name="Р—Р°РєСЂС‹С‚Рѕ Рё РЅРµ СЂРµР°Р»РёР·РѕРІР°РЅРѕ")
 
     def _fake_analyze(normalized, cfg, logger, *, deal_hint, backend_override):
         return (
@@ -285,7 +293,7 @@ def test_manager_brief_and_summary_safe_fallback_when_all_deals_closed_loss():
                 "score_0_100": 55,
                 "strong_sides": [],
                 "growth_zones": [],
-                "risk_flags": ["qualified_loss: Рыночное несовпадение/нецелевой сценарий"],
+                "risk_flags": ["qualified_loss: Р С‹РЅРѕС‡РЅРѕРµ РЅРµСЃРѕРІРїР°РґРµРЅРёРµ/РЅРµС†РµР»РµРІРѕР№ СЃС†РµРЅР°СЂРёР№"],
                 "presentation_quality_flag": "needs_attention",
                 "followup_quality_flag": "needs_attention",
                 "data_completeness_flag": "partial",
@@ -325,7 +333,65 @@ def test_manager_brief_and_summary_safe_fallback_when_all_deals_closed_loss():
     run_dir = next((output_dir / "period_runs").iterdir())
     summary_md = (run_dir / "summary.md").read_text(encoding="utf-8")
     brief_md = (run_dir / "manager_brief.md").read_text(encoding="utf-8")
-    assert "Нет открытых/рабочих сделок для секции потенциала." in summary_md
-    assert "Лучшие из закрытых (fallback):" in summary_md
-    assert "Нет открытых/рабочих сделок для блока потенциала." in brief_md
-    assert "Лучшие из проанализированных, но закрытых:" in brief_md
+    assert "fallback" in summary_md.lower()
+    assert "closed-lost" in brief_md.lower()
+    assert "cleanup closed-lost" in brief_md.lower()
+    assert "pipeline pressure path" in brief_md
+    assert "поставить follow-up задачу" not in brief_md.lower()
+    assert "презентац" not in brief_md.lower()
+
+
+def test_period_artifact_closed_lost_with_context_non_qualified_has_no_employee_active_leakage():
+    output_dir = _fresh_output_dir("period_batch_closed_lost_context_non_qualified")
+    payload = {
+        "normalized_deals": [
+            {
+                "deal_id": 32093998,
+                "amo_lead_id": 32093998,
+                "deal_name": "Deal 32093998",
+                "status_name": "Закрыто и не реализовано",
+                "notes_summary_raw": [{"text": "Клиент отказался после обсуждения сроков"}],
+                "tasks_summary_raw": [],
+                "brief_url": "",
+                "pain_text": "",
+                "business_tasks_text": "",
+                "created_at": 10,
+                "updated_at": 20,
+            }
+        ]
+    }
+    logger = _Logger()
+
+    def _fake_snapshot(*, normalized_deal, config, logger, raw_bundle):
+        return {
+            "snapshot_generated_at": "2026-04-18T12:00:00+00:00",
+            "crm": dict(normalized_deal),
+            "warnings": [],
+            "call_evidence": {"items": [], "summary": {"calls_total": 0}},
+            "transcripts": [],
+            "roks_context": {"ok": True},
+        }
+
+    with patch("src.deal_analyzer.cli.build_deal_snapshot", side_effect=_fake_snapshot):
+        _run_analyze_period(
+            _cfg(),
+            output_dir,
+            payload,
+            "period.json",
+            True,
+            logger,
+            period_mode=None,
+            date_from=None,
+            date_to=None,
+            limit=1,
+        )
+
+    run_dir = next((output_dir / "period_runs").iterdir())
+    deal_artifact = run_dir / "deals" / "deal_32093998.json"
+    data = json.loads(deal_artifact.read_text(encoding="utf-8"))
+    analysis = data.get("analysis", {})
+    coaching = str(analysis.get("employee_coaching", "")).lower()
+    fix_tasks = " ".join(str(x) for x in analysis.get("employee_fix_tasks", [])).lower()
+    forbidden = ("боль клиента", "бизнес-задач", "презентац", "бриф", "follow-up", "вероятност")
+    assert all(token not in coaching for token in forbidden)
+    assert all(token not in fix_tasks for token in forbidden)

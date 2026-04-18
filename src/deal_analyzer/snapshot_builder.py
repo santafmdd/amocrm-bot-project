@@ -20,6 +20,10 @@ def build_deal_snapshot(
 ) -> dict[str, Any]:
     snapshot_warnings: list[str] = []
     enriched = _safe_enrich_one(normalized_deal=normalized_deal, config=config, logger=logger, warnings=snapshot_warnings)
+    quality = _snapshot_quality(enriched)
+    enriched.setdefault("data_quality_flags", quality["data_quality_flags"])
+    enriched.setdefault("owner_ambiguity_flag", quality["owner_ambiguity_flag"])
+    enriched.setdefault("crm_hygiene_confidence", quality["crm_hygiene_confidence"])
     manager = str(enriched.get("responsible_user_name") or "").strip()
     roks = _safe_extract_roks_snapshot(config=config, logger=logger, manager=manager or None, team=not bool(manager), warnings=snapshot_warnings)
 
@@ -33,6 +37,7 @@ def build_deal_snapshot(
         "deal_id": enriched.get("deal_id"),
         "amo_lead_id": enriched.get("amo_lead_id"),
         "crm": enriched,
+        "data_quality": quality,
         "enrichment": {
             "match_status": enriched.get("enrichment_match_status", "none"),
             "match_source": enriched.get("enrichment_match_source", "none"),
@@ -80,6 +85,10 @@ def build_period_snapshots(
 
     items: list[dict[str, Any]] = []
     for row in enriched_rows:
+        quality = _snapshot_quality(row)
+        row.setdefault("data_quality_flags", quality["data_quality_flags"])
+        row.setdefault("owner_ambiguity_flag", quality["owner_ambiguity_flag"])
+        row.setdefault("crm_hygiene_confidence", quality["crm_hygiene_confidence"])
         manager_name = str(row.get("responsible_user_name") or "").strip()
         deal_id = str(row.get("deal_id") or row.get("amo_lead_id") or "")
         call_result = _safe_collect_deal_calls(
@@ -97,6 +106,7 @@ def build_period_snapshots(
                 "deal_id": row.get("deal_id"),
                 "amo_lead_id": row.get("amo_lead_id"),
                 "crm": row,
+                "data_quality": quality,
                 "enrichment": {
                     "match_status": row.get("enrichment_match_status", "none"),
                     "match_source": row.get("enrichment_match_source", "none"),
@@ -220,3 +230,46 @@ def _safe_transcribe_call_evidence(*, calls: list[dict[str, Any]], config, logge
         logger.warning("snapshot transcription failed: calls=%s error=%s", len(calls), exc)
         warnings.append(f"transcription_failed:{exc}")
         return []
+
+
+def _snapshot_quality(deal: dict[str, Any]) -> dict[str, Any]:
+    flags = deal.get("data_quality_flags")
+    if not isinstance(flags, list):
+        flags = []
+    normalized_flags: list[str] = []
+    seen: set[str] = set()
+    for item in flags:
+        text = " ".join(str(item or "").strip().split())
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized_flags.append(text)
+
+    owner_ambiguity_flag = bool(deal.get("owner_ambiguity_flag")) or any(
+        str(x).lower().startswith("owner_ambiguity") for x in normalized_flags
+    )
+    crm_hygiene_confidence = str(deal.get("crm_hygiene_confidence") or "").strip().lower()
+    if crm_hygiene_confidence not in {"high", "medium", "low"}:
+        if any(
+            x in {
+                "crm_context_missing_with_stage_movement",
+                "crm_context_sparse_with_activity_signals",
+                "closed_lost_without_documented_reason",
+                "owner_missing_in_crm",
+            }
+            for x in normalized_flags
+        ):
+            crm_hygiene_confidence = "low"
+        elif normalized_flags:
+            crm_hygiene_confidence = "medium"
+        else:
+            crm_hygiene_confidence = "high"
+
+    return {
+        "data_quality_flags": normalized_flags,
+        "owner_ambiguity_flag": owner_ambiguity_flag,
+        "crm_hygiene_confidence": crm_hygiene_confidence,
+    }

@@ -12,6 +12,11 @@ REPAIR_JSON_INSTRUCTION = (
     "Без текста до/после JSON, без тройных кавычек."
 )
 
+HYBRID_SHORT_JSON_INSTRUCTION = (
+    "Верни только валидный JSON-объект без markdown/комментариев/объяснений. "
+    "Ровно поля: loss_reason_short, manager_insight_short, coaching_hint_short."
+)
+
 
 def build_manager_message_draft(analysis: DealAnalysis) -> str:
     deal_label = analysis.deal_name or f"Сделка {analysis.deal_id}"
@@ -56,6 +61,33 @@ def append_json_repair_instruction(messages: list[dict[str, str]]) -> list[dict[
     out = list(messages)
     out.append({"role": "user", "content": REPAIR_JSON_INSTRUCTION})
     return out
+
+
+def append_hybrid_json_repair_instruction(messages: list[dict[str, str]]) -> list[dict[str, str]]:
+    out = list(messages)
+    out.append({"role": "user", "content": HYBRID_SHORT_JSON_INSTRUCTION})
+    return out
+
+
+def build_hybrid_short_messages(*, normalized_deal: dict[str, Any], config: DealAnalyzerConfig) -> list[dict[str, str]]:
+    system_prompt = (
+        "Ты помогаешь с коротким уточнением анализа сделки. "
+        "Не выдумывай факты, используй только входные данные. "
+        "Нужен строго JSON без markdown и текста вокруг. "
+        "Разрешены только ключи: loss_reason_short, manager_insight_short, coaching_hint_short. "
+        "Каждое поле: короткая строка до 180 символов. "
+        f"Профиль стиля: {config.style_profile_name}."
+    )
+    compact = _compact_payload_for_llm(normalized_deal)
+    user_prompt = (
+        "Сделка (compact payload):\n"
+        f"{json.dumps(compact, ensure_ascii=False, indent=2)}\n\n"
+        "Верни короткое уточнение по трем полям JSON."
+    )
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
 
 
 def _build_system_prompt(style_profile_name: str) -> str:

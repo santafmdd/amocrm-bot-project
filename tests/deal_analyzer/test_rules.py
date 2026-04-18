@@ -1,6 +1,7 @@
 ﻿from pathlib import Path
 
 from src.deal_analyzer.config import DealAnalyzerConfig
+from src.deal_analyzer.enrichment import build_operator_outputs
 from src.deal_analyzer.rules import analyze_deal
 
 
@@ -208,6 +209,25 @@ def test_policy_qualified_loss_avoids_default_followup_presentation_push():
     assert "давление" in employee_tasks_joined or "квалификац" in employee_tasks_joined or "отказа" in employee_tasks_joined
 
 
+def test_policy_closed_lost_without_context_focuses_on_closeout_classification_not_demo():
+    row = {
+        "deal_id": 17,
+        "amo_lead_id": 17,
+        "deal_name": "Closed lost no context",
+        "status_name": "Закрыто и не реализовано",
+        "notes_summary_raw": [],
+        "tasks_summary_raw": [],
+        "created_at": 10,
+        "updated_at": 20,
+    }
+    analysis = analyze_deal(row, _cfg())
+    manager_actions_joined = " ".join(analysis.recommended_actions_for_manager).lower()
+    assert "презентац" not in manager_actions_joined
+    assert "follow-up" not in manager_actions_joined
+    assert "вероятност" not in manager_actions_joined
+    assert "причин" in manager_actions_joined or "класси" in manager_actions_joined or "закры" in manager_actions_joined
+
+
 def test_policy_evidence_context_prioritizes_crm_evidence_completion():
     row = {
         "deal_id": 15,
@@ -246,3 +266,166 @@ def test_policy_process_hygiene_keeps_followup_recommendations():
     assert any(flag.startswith("process_hygiene:") for flag in analysis.risk_flags)
     manager_actions_joined = " ".join(analysis.recommended_actions_for_manager).lower()
     assert "follow-up" in manager_actions_joined or "вероятност" in manager_actions_joined
+
+
+def test_won_status_returns_safe_handoff_recommendations():
+    row = {
+        "deal_id": 18,
+        "amo_lead_id": 18,
+        "deal_name": "Won deal",
+        "status_name": "Успешно реализовано",
+        "notes_summary_raw": [{"text": "Сделка закрыта успешно"}],
+        "tasks_summary_raw": [{"text": "Передача в сопровождение"}],
+        "created_at": 10,
+        "updated_at": 20,
+    }
+    analysis = analyze_deal(row, _cfg())
+    manager_actions_joined = " ".join(analysis.recommended_actions_for_manager).lower()
+    assert "handoff" in manager_actions_joined or "post-sale" in manager_actions_joined or "передач" in manager_actions_joined
+    assert "поставить follow-up задачу" not in manager_actions_joined
+
+
+def test_employee_outputs_for_qualified_loss_no_generic_demo_followup_leakage():
+    row = {
+        "deal_id": 19,
+        "amo_lead_id": 19,
+        "deal_name": "Qualified loss employee policy",
+        "status_name": "Закрыто и не реализовано",
+        "notes_summary_raw": [{"text": "Клиент отказался: свои разработки, не будут работать в облаке"}],
+        "tasks_summary_raw": [],
+        "brief_url": "",
+        "pain_text": "",
+        "business_tasks_text": "",
+        "created_at": 10,
+        "updated_at": 20,
+    }
+    analysis = analyze_deal(row, _cfg()).to_dict()
+    outputs = build_operator_outputs(deal=row, analysis=analysis)
+    coaching = str(outputs.get("employee_coaching", "")).lower()
+    fix_tasks = " ".join(str(x) for x in outputs.get("employee_fix_tasks", [])).lower()
+    assert "презентац" not in coaching
+    assert "бриф" not in coaching
+    assert "презентац" not in fix_tasks
+    assert "follow-up" not in fix_tasks
+    assert "бриф" not in fix_tasks
+    assert any(token in fix_tasks for token in ("anti-fit", "market mismatch", "класси", "нецелев"))
+
+
+def test_employee_outputs_for_closed_lost_without_qualified_loss_not_demo_path():
+    row = {
+        "deal_id": 20,
+        "amo_lead_id": 20,
+        "deal_name": "Closed lost no context employee policy",
+        "status_name": "Закрыто и не реализовано",
+        "notes_summary_raw": [],
+        "tasks_summary_raw": [],
+        "brief_url": "",
+        "pain_text": "",
+        "business_tasks_text": "",
+        "created_at": 10,
+        "updated_at": 20,
+    }
+    analysis = analyze_deal(row, _cfg()).to_dict()
+    outputs = build_operator_outputs(deal=row, analysis=analysis)
+    coaching = str(outputs.get("employee_coaching", "")).lower()
+    fix_tasks = " ".join(str(x) for x in outputs.get("employee_fix_tasks", [])).lower()
+    assert "презентац" not in coaching
+    assert "бриф" not in coaching
+    assert "презентац" not in fix_tasks
+    assert "follow-up" not in fix_tasks
+    assert "восстанов" in coaching or "причин" in fix_tasks or "класси" in fix_tasks
+
+
+def test_employee_outputs_for_active_process_hygiene_keep_followup_guidance():
+    row = {
+        "deal_id": 21,
+        "amo_lead_id": 21,
+        "deal_name": "Active process hygiene employee policy",
+        "status_name": "В работе",
+        "notes_summary_raw": [{"text": "Контекст есть, клиент заинтересован"}],
+        "tasks_summary_raw": [],
+        "brief_url": "",
+        "pain_text": "Есть боль",
+        "business_tasks_text": "Есть бизнес задача",
+        "created_at": 10,
+        "updated_at": 20,
+    }
+    analysis = analyze_deal(row, _cfg()).to_dict()
+    outputs = build_operator_outputs(deal=row, analysis=analysis)
+    fix_tasks = " ".join(str(x) for x in outputs.get("employee_fix_tasks", [])).lower()
+    assert "follow-up" in fix_tasks or "бриф" in fix_tasks
+
+
+def test_closed_lost_with_context_non_qualified_uses_closeout_policy_without_active_leakage():
+    row = {
+        "deal_id": 32093998,
+        "amo_lead_id": 32093998,
+        "deal_name": "Closed lost with minimal context",
+        "status_name": "Закрыто и не реализовано",
+        "notes_summary_raw": [{"text": "Клиент попросил поставить паузу и закрыть кейс, детали причины не зафиксированы."}],
+        "tasks_summary_raw": [],
+        "brief_url": "",
+        "pain_text": "",
+        "business_tasks_text": "",
+        "created_at": 10,
+        "updated_at": 20,
+    }
+    analysis = analyze_deal(row, _cfg()).to_dict()
+    assert not any(str(x).startswith("qualified_loss:") for x in analysis.get("risk_flags", []))
+    outputs = build_operator_outputs(deal=row, analysis=analysis)
+    coaching = str(outputs.get("employee_coaching", "")).lower()
+    fix_tasks = " ".join(str(x) for x in outputs.get("employee_fix_tasks", [])).lower()
+    forbidden = ("боль клиента", "бизнес-задач", "презентац", "бриф", "follow-up", "вероятност")
+    assert all(token not in coaching for token in forbidden)
+    assert all(token not in fix_tasks for token in forbidden)
+    assert any(token in coaching for token in ("потер", "класси", "anti-pattern"))
+    assert any(token in fix_tasks for token in ("потер", "closeout", "crm-cleanup", "класси"))
+
+
+def test_low_confidence_owner_ambiguity_is_marked_and_manager_actions_get_caution():
+    row = {
+        "deal_id": 31,
+        "amo_lead_id": 31,
+        "deal_name": "Owner ambiguity sample",
+        "status_name": "В работе",
+        "responsible_user_name": "Менеджер А",
+        "enriched_conducted_by": "Менеджер Б",
+        "enriched_appointment_date": "2026-04-10",
+        "notes_summary_raw": [],
+        "tasks_summary_raw": [],
+        "company_name": "ООО Тест",
+        "created_at": 10,
+        "updated_at": 20,
+    }
+    analysis = analyze_deal(row, _cfg())
+    assert analysis.owner_ambiguity_flag is True
+    assert analysis.analysis_confidence == "low"
+    assert any("owner_ambiguity" in str(x) for x in (analysis.data_quality_flags or []))
+    actions = " ".join(analysis.recommended_actions_for_manager).lower()
+    assert "ограничен качеством crm" in actions or "owner ambiguity" in actions
+
+
+def test_low_confidence_closed_lost_outputs_are_not_accusatory_or_active_pipeline_default():
+    row = {
+        "deal_id": 32,
+        "amo_lead_id": 32,
+        "deal_name": "Low confidence closeout",
+        "status_name": "Закрыто и не реализовано",
+        "responsible_user_name": "Менеджер А",
+        "enriched_assigned_by": "Руководитель",
+        "notes_summary_raw": [],
+        "tasks_summary_raw": [],
+        "company_name": "ООО Контекст",
+        "enriched_appointment_date": "2026-04-11",
+        "created_at": 10,
+        "updated_at": 20,
+    }
+    analysis = analyze_deal(row, _cfg()).to_dict()
+    outputs = build_operator_outputs(deal=row, analysis=analysis)
+    text = " ".join(
+        [str(outputs.get("employee_coaching", ""))]
+        + [str(x) for x in outputs.get("employee_fix_tasks", [])]
+    ).lower()
+    for bad in ("презентац", "follow-up", "вероятност", "боль клиента", "бизнес-задач"):
+        assert bad not in text
+    assert any(token in text for token in ("причин", "closeout", "owner", "атриб"))

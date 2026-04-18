@@ -6,7 +6,12 @@ from typing import Any
 from .config import DealAnalyzerConfig
 from .llm_client import OllamaClient, OllamaClientError
 from .models import DealAnalysis
-from .prompt_builder import append_json_repair_instruction, build_ollama_chat_messages
+from .prompt_builder import (
+    append_hybrid_json_repair_instruction,
+    append_json_repair_instruction,
+    build_hybrid_short_messages,
+    build_ollama_chat_messages,
+)
 from .rules import analyze_deal
 
 
@@ -92,6 +97,75 @@ def analyze_deal_with_ollama_outcome(
         )
 
 
+def analyze_deal_with_hybrid_outcome(
+    *,
+    normalized_deal: dict[str, Any],
+    config: DealAnalyzerConfig,
+    client: OllamaClient | None = None,
+) -> LlmAnalysisOutcome:
+    baseline = analyze_deal(normalized_deal, config).to_dict()
+    ollama = client or OllamaClient(
+        base_url=config.ollama_base_url,
+        model=config.ollama_model,
+        timeout_seconds=config.ollama_timeout_seconds,
+    )
+    base_messages = build_hybrid_short_messages(normalized_deal=normalized_deal, config=config)
+
+    first_error: OllamaClientError | None = None
+    try:
+        parsed = ollama.chat_json(messages=base_messages)
+        merged = _merge_hybrid_short_fields(baseline, parsed.payload)
+        merged["analysis_backend_requested"] = config.analyzer_backend
+        merged["analysis_backend_used"] = "hybrid"
+        merged["llm_repair_applied"] = bool(parsed.repair_applied)
+        merged["llm_error"] = False
+        merged["llm_fallback"] = False
+        return LlmAnalysisOutcome(
+            analysis=DealAnalysis(**merged),
+            backend_used="hybrid",
+            llm_error=False,
+            error_message=None,
+            repaired=bool(parsed.repair_applied),
+        )
+    except OllamaClientError as exc:
+        first_error = exc
+
+    repair_messages = append_hybrid_json_repair_instruction(base_messages)
+    try:
+        parsed = ollama.chat_json(messages=repair_messages)
+        merged = _merge_hybrid_short_fields(baseline, parsed.payload)
+        merged["analysis_backend_requested"] = config.analyzer_backend
+        merged["analysis_backend_used"] = "hybrid"
+        merged["llm_repair_applied"] = True
+        merged["llm_error"] = False
+        merged["llm_fallback"] = False
+        return LlmAnalysisOutcome(
+            analysis=DealAnalysis(**merged),
+            backend_used="hybrid",
+            llm_error=False,
+            error_message=None,
+            repaired=True,
+        )
+    except OllamaClientError as second:
+        fallback = dict(baseline)
+        fallback["analysis_backend_requested"] = config.analyzer_backend
+        fallback["analysis_backend_used"] = "rules_fallback"
+        fallback["llm_repair_applied"] = False
+        fallback["llm_error"] = True
+        fallback["llm_fallback"] = True
+        message = (
+            "Hybrid LLM failed after retry. "
+            f"first={first_error}; second={second}"
+        )
+        return LlmAnalysisOutcome(
+            analysis=DealAnalysis(**fallback),
+            backend_used="rules_fallback",
+            llm_error=True,
+            error_message=message,
+            repaired=False,
+        )
+
+
 def _merge_with_baseline(base: dict[str, Any], llm_payload: dict[str, Any]) -> dict[str, Any]:
     out = dict(base)
 
@@ -143,3 +217,15 @@ def _coerce_str_list(value: Any, fallback: list[str]) -> list[str]:
 def _coerce_text(value: Any, fallback: str) -> str:
     txt = " ".join(str(value or "").strip().split())
     return txt or fallback
+
+
+def _merge_hybrid_short_fields(base: dict[str, Any], llm_payload: dict[str, Any]) -> dict[str, Any]:
+    out = dict(base)
+    out["loss_reason_short"] = _coerce_text(llm_payload.get("loss_reason_short"), out.get("loss_reason_short", ""))
+    out["manager_insight_short"] = _coerce_text(
+        llm_payload.get("manager_insight_short"), out.get("manager_insight_short", "")
+    )
+    out["coaching_hint_short"] = _coerce_text(
+        llm_payload.get("coaching_hint_short"), out.get("coaching_hint_short", "")
+    )
+    return out

@@ -36,6 +36,8 @@ def analyze_deal(normalized_deal: dict[str, Any], config: DealAnalyzerConfig) ->
 
     status_norm = _normalize_text_for_match(deal.get("status_name"))
     is_closed_lost = any(x in status_norm for x in ("закрыто", "не реализ", "отказ"))
+    is_won = any(x in status_norm for x in ("успешно реализ", "успешная реализац", "выигран", "оплата"))
+    status_policy = _resolve_status_policy(status_norm=status_norm, is_closed_lost=is_closed_lost, is_won=is_won)
     has_reasoned_loss = is_closed_lost and _has_reasoned_loss_context(notes_joined)
     has_market_mismatch = has_reasoned_loss and _has_market_mismatch_keywords(notes_joined)
 
@@ -73,6 +75,16 @@ def analyze_deal(normalized_deal: dict[str, Any], config: DealAnalyzerConfig) ->
             has_long_call,
         )
     )
+    data_quality_flags: list[str] = _as_list_str(deal.get("data_quality_flags"))
+    owner_ambiguity_flag = bool(deal.get("owner_ambiguity_flag"))
+    owner_ambiguity_reason = _detect_owner_ambiguity_reason(
+        deal=deal,
+        has_notes_content=has_notes_content,
+        has_tasks_content=has_tasks_content,
+    )
+    if owner_ambiguity_reason:
+        owner_ambiguity_flag = True
+        data_quality_flags.append(owner_ambiguity_reason)
 
     score = 0
     if has_presentation:
@@ -115,6 +127,34 @@ def analyze_deal(normalized_deal: dict[str, Any], config: DealAnalyzerConfig) ->
         score -= 10
     if score <= 0 and has_any_context:
         score = 12
+
+    data_quality_flags.extend(
+        _build_data_quality_flags(
+            deal=deal,
+            is_closed_lost=is_closed_lost,
+            has_notes_content=has_notes_content,
+            has_tasks_content=has_tasks_content,
+            has_any_context=has_any_context,
+            has_stage_movement=has_stage_movement,
+            empty_context_with_movement=empty_context_with_movement,
+            owner_ambiguity_flag=owner_ambiguity_flag,
+        )
+    )
+    data_quality_flags = _dedup_list(data_quality_flags)
+
+    crm_hygiene_confidence, analysis_confidence = _resolve_confidence_levels(
+        data_quality_flags=data_quality_flags,
+        owner_ambiguity_flag=owner_ambiguity_flag,
+        has_any_context=has_any_context,
+        has_notes_content=has_notes_content,
+        has_tasks_content=has_tasks_content,
+    )
+    if analysis_confidence == "low":
+        activity_trace = has_stage_movement or has_contact_data or has_company_data or has_long_call or bool(
+            _clean_text(deal.get("enriched_appointment_date"))
+        )
+        if activity_trace and score < 15:
+            score = 15
 
     score = max(0, min(100, int(score)))
 
@@ -160,7 +200,7 @@ def analyze_deal(normalized_deal: dict[str, Any], config: DealAnalyzerConfig) ->
     else:
         data_completeness_flag = "poor"
 
-    policy = _select_policy(risk_flags)
+    policy = _select_policy(risk_flags, status_policy=status_policy)
     recommended_actions_for_manager = _manager_actions(
         policy=policy,
         has_presentation=has_presentation,
@@ -178,6 +218,14 @@ def analyze_deal(normalized_deal: dict[str, Any], config: DealAnalyzerConfig) ->
         has_business_tasks=has_business_tasks,
         has_notes_content=has_notes_content,
     )
+    recommended_actions_for_manager, recommended_training_tasks_for_employee = _apply_data_quality_guardrails(
+        manager_actions=recommended_actions_for_manager,
+        employee_tasks=recommended_training_tasks_for_employee,
+        analysis_confidence=analysis_confidence,
+        owner_ambiguity_flag=owner_ambiguity_flag,
+        status_policy=status_policy,
+        policy=policy,
+    )
 
     analysis = DealAnalysis(
         deal_id=_as_int(deal.get("deal_id")),
@@ -190,6 +238,10 @@ def analyze_deal(normalized_deal: dict[str, Any], config: DealAnalyzerConfig) ->
         presentation_quality_flag=presentation_quality_flag,
         followup_quality_flag=followup_quality_flag,
         data_completeness_flag=data_completeness_flag,
+        data_quality_flags=data_quality_flags,
+        owner_ambiguity_flag=owner_ambiguity_flag,
+        crm_hygiene_confidence=crm_hygiene_confidence,
+        analysis_confidence=analysis_confidence,
         recommended_actions_for_manager=recommended_actions_for_manager,
         recommended_training_tasks_for_employee=recommended_training_tasks_for_employee,
         manager_message_draft="",
@@ -203,6 +255,43 @@ def analyze_deal(normalized_deal: dict[str, Any], config: DealAnalyzerConfig) ->
     merged["manager_message_draft"] = manager_draft
     merged["employee_training_message_draft"] = employee_draft
     return DealAnalysis(**merged)
+
+
+def _apply_data_quality_guardrails(
+    *,
+    manager_actions: list[str],
+    employee_tasks: list[str],
+    analysis_confidence: str,
+    owner_ambiguity_flag: bool,
+    status_policy: str,
+    policy: str,
+) -> tuple[list[str], list[str]]:
+    manager = list(manager_actions)
+    employee = list(employee_tasks)
+    if analysis_confidence != "low":
+        return manager, employee
+
+    caution = "Внимание: вывод ограничен качеством CRM-данных; подтвердите факты перед персональными выводами."
+    owner_caution = "Внимание: возможна неоднозначность владельца сделки в CRM (owner ambiguity)."
+    manager.insert(0, owner_caution if owner_ambiguity_flag else caution)
+
+    if policy == "qualified_loss":
+        return _dedup_list(manager), _dedup_list(employee)
+
+    if status_policy == "closed_lost":
+        employee = [
+            "Проверить и зафиксировать фактическую причину потери в нейтральной формулировке.",
+            "Проставить closeout-классификацию и удалить противоречия в полях CRM.",
+            "Зафиксировать, кто фактически вел коммуникацию, если owner в CRM мог отличаться.",
+        ]
+        return _dedup_list(manager), _dedup_list(employee)
+
+    if owner_ambiguity_flag:
+        employee.insert(
+            0,
+            "Перед оценкой персональных действий сверить фактического ведущего сделки и атрибуцию owner в CRM.",
+        )
+    return _dedup_list(manager), _dedup_list(employee)
 
 
 def _push_flag(ok: bool, strong: list[str], growth: list[str], ok_text: str, fail_text: str) -> None:
@@ -228,6 +317,19 @@ def _manager_actions(
             "Пометить кейс как нецелевой или ограниченно перспективный для текущего сегмента.",
             "Исключить сделку из стандартного follow-up pressure path и зафиксировать статус решения.",
             "Передать кейс в сегментный анализ рынка и продуктового позиционирования.",
+        ]
+    if policy == "closed_lost_context":
+        return [
+            "Восстановить и зафиксировать корректную причину потери: кто отказал, почему и на каком этапе.",
+            "Классифицировать потерю по типу (цена/сроки/продукт/нецелевой запрос) для управленческой аналитики.",
+            "Закрыть кейс с валидным контекстом, без запуска стандартного pipeline-прогрева.",
+            "Использовать кейс как материал для улучшения квалификации и сегментации входящего потока.",
+        ]
+    if policy == "won_handoff":
+        return [
+            "Подтвердить post-sale handoff: ответственный, срок и формат передачи клиенту.",
+            "Проверить полноту итоговой фиксации: ожидания клиента, рамки внедрения, контрольная точка follow-up.",
+            "Сохранить кейс как позитивный эталон для внутренних разборов.",
         ]
     if policy == "evidence_context":
         actions: list[str] = []
@@ -267,6 +369,17 @@ def _employee_training_tasks(
             "Отработать формулировку причины отказа в CRM так, чтобы она была полезна для сегментного анализа.",
             "Сфокусироваться на качестве квалификации и раннем отсеве нецелевых кейсов.",
         ]
+    if policy == "closed_lost_context":
+        return [
+            "Тренировка: фиксировать причину потери в формате «кто/почему/что не совпало».",
+            "Тренировка: классификация closed-lost кейсов по типам причин без шаблонных действий прогрева.",
+            "Тренировка: аккуратное закрытие кейса с корректным CRM-контекстом.",
+        ]
+    if policy == "won_handoff":
+        return [
+            "Тренировка: качественный handoff после успешной сделки (сроки, ответственные, ожидания клиента).",
+            "Тренировка: структурная post-sale заметка в CRM без потери контекста.",
+        ]
     if policy == "evidence_context":
         tasks: list[str] = []
         if not has_notes_content:
@@ -289,14 +402,28 @@ def _employee_training_tasks(
     return tasks or ["Тренировка не требуется, поддерживать текущий стандарт"]
 
 
-def _select_policy(risk_flags: list[str]) -> str:
+def _select_policy(risk_flags: list[str], *, status_policy: str) -> str:
+    if status_policy == "won":
+        return "won_handoff"
     if any(str(x).startswith("qualified_loss:") for x in risk_flags):
         return "qualified_loss"
+    if status_policy == "closed_lost":
+        return "closed_lost_context"
     process_count = sum(1 for x in risk_flags if str(x).startswith("process_hygiene:"))
     evidence_count = sum(1 for x in risk_flags if str(x).startswith("evidence_context:"))
     if evidence_count >= process_count and evidence_count > 0:
         return "evidence_context"
     return "process_hygiene"
+
+
+def _resolve_status_policy(*, status_norm: str, is_closed_lost: bool, is_won: bool) -> str:
+    if is_won:
+        return "won"
+    if is_closed_lost:
+        return "closed_lost"
+    if status_norm:
+        return "active"
+    return "unknown"
 
 
 def _clean_text(value: Any) -> str:
@@ -398,3 +525,90 @@ def _has_market_mismatch_keywords(notes_norm: str) -> bool:
         "рынок не",
     )
     return any(marker in notes_norm for marker in markers)
+
+
+def _build_data_quality_flags(
+    *,
+    deal: dict[str, Any],
+    is_closed_lost: bool,
+    has_notes_content: bool,
+    has_tasks_content: bool,
+    has_any_context: bool,
+    has_stage_movement: bool,
+    empty_context_with_movement: bool,
+    owner_ambiguity_flag: bool,
+) -> list[str]:
+    flags: list[str] = []
+    appointment = _clean_text(deal.get("enriched_appointment_date"))
+    if empty_context_with_movement:
+        flags.append("crm_context_missing_with_stage_movement")
+    if not has_notes_content and not has_tasks_content and (
+        has_any_context or bool(appointment) or has_stage_movement
+    ):
+        flags.append("crm_context_sparse_with_activity_signals")
+    if is_closed_lost and not has_notes_content:
+        flags.append("closed_lost_without_documented_reason")
+    if not _clean_text(deal.get("responsible_user_name")):
+        flags.append("owner_missing_in_crm")
+    if owner_ambiguity_flag:
+        flags.append("owner_ambiguity_detected")
+    return flags
+
+
+def _resolve_confidence_levels(
+    *,
+    data_quality_flags: list[str],
+    owner_ambiguity_flag: bool,
+    has_any_context: bool,
+    has_notes_content: bool,
+    has_tasks_content: bool,
+) -> tuple[str, str]:
+    low_markers = {
+        "crm_context_missing_with_stage_movement",
+        "crm_context_sparse_with_activity_signals",
+        "closed_lost_without_documented_reason",
+        "owner_ambiguity_detected",
+        "owner_missing_in_crm",
+        "owner_ambiguity_responsible_mismatch",
+    }
+    if owner_ambiguity_flag or any(x in low_markers for x in data_quality_flags):
+        return "low", "low"
+    if has_any_context and (has_notes_content or has_tasks_content):
+        return "high", "high"
+    return "medium", "medium"
+
+
+def _detect_owner_ambiguity_reason(
+    *,
+    deal: dict[str, Any],
+    has_notes_content: bool,
+    has_tasks_content: bool,
+) -> str:
+    responsible = _normalize_text_for_match(deal.get("responsible_user_name"))
+    conducted = _normalize_text_for_match(deal.get("enriched_conducted_by"))
+    assigned = _normalize_text_for_match(deal.get("enriched_assigned_by"))
+    appointment = _clean_text(deal.get("enriched_appointment_date"))
+    if responsible and conducted and responsible != conducted:
+        return "owner_ambiguity_responsible_mismatch"
+    if responsible and assigned and responsible != assigned and not (has_notes_content or has_tasks_content):
+        return "owner_ambiguity_assigned_by_mismatch"
+    if appointment and responsible and not (has_notes_content or has_tasks_content) and (
+        _clean_text(deal.get("company_name")) or _clean_text(deal.get("contact_name"))
+    ):
+        return "owner_ambiguity_attribution_limited"
+    return ""
+
+
+def _dedup_list(items: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        text = _clean_text(item)
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
+    return out

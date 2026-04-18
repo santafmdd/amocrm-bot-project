@@ -48,6 +48,7 @@ def test_build_deal_snapshot_contract():
 
     assert "crm" in snap
     assert "enrichment" in snap
+    assert "data_quality" in snap
     assert "roks_context" in snap
     assert snap["crm"]["deal_id"] == 1
 
@@ -66,6 +67,7 @@ def test_build_period_snapshots_contract_and_manager_split():
 
     assert snap["deals_total"] == 2
     assert len(snap["items"]) == 2
+    assert "data_quality" in snap["items"][0]
     assert "roks_team_context" in snap
 
 

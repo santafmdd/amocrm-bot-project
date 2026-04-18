@@ -93,6 +93,17 @@ def test_load_deal_analyzer_config_rejects_unknown_backend():
             load_deal_analyzer_config(str(cfg_path))
 
 
+def test_load_deal_analyzer_config_accepts_hybrid_backend():
+    cfg_path = Path("d:/AI_Automation/amocrm_bot/project/config/deal_analyzer.local.json")
+
+    with patch("pathlib.Path.exists", return_value=True), patch(
+        "pathlib.Path.read_text", return_value='{"analyzer_backend":"hybrid"}'
+    ):
+        cfg = load_deal_analyzer_config(str(cfg_path))
+
+    assert cfg.analyzer_backend == "hybrid"
+
+
 def test_resolve_period_smart_mode_weekend_goes_current_week_to_date():
     cfg_path = Path("d:/AI_Automation/amocrm_bot/project/config/deal_analyzer.local.json")
     with patch("pathlib.Path.exists", return_value=True), patch("pathlib.Path.read_text", return_value=_cfg_payload()):

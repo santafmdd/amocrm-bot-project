@@ -1,4 +1,4 @@
-﻿# Deal Analyzer MVP (rules + Ollama)
+﻿# Deal Analyzer MVP (rules + hybrid + Ollama)
 
 ## Scope
 Deal analyzer reads collector output and builds local analytical result.
@@ -12,9 +12,26 @@ Current constraints:
 ## Backends
 `analyzer_backend` in config:
 - `rules` - deterministic rule-based analyzer (default).
+- `hybrid` - rules-first analysis + optional short LLM layer.
 - `ollama` - local LLM analysis through Ollama chat API.
 
 Rules backend remains available as stable fallback.
+
+## Hybrid backend (safe overlay)
+`hybrid` never replaces base rules scoring.
+
+Flow:
+1. Build standard rules analysis (mandatory).
+2. If Ollama is available, request only a small structured JSON overlay:
+   - `loss_reason_short`
+   - `manager_insight_short`
+   - `coaching_hint_short`
+3. On timeout / invalid JSON / model error:
+   - run does not crash;
+   - base rules result is kept;
+   - artifact marks fallback/error with `llm_fallback=true` and `llm_error=true`.
+
+This keeps period runs stable while still adding optional short insights when LLM response is valid.
 
 ## Ollama Reliability: Preflight + Repair + Fallback
 For `analyze-period` with `analyzer_backend=ollama`:
@@ -86,6 +103,11 @@ Per-deal backend fields:
 - `analysis_backend_requested`
 - `analysis_backend_used`
 - `llm_repair_applied`
+- `llm_error`
+- `llm_fallback`
+- `loss_reason_short`
+- `manager_insight_short`
+- `coaching_hint_short`
 
 ## Period Modes
 Supported `period_mode` values:
@@ -183,6 +205,8 @@ python -m src.deal_analyzer.cli --config config/deal_analyzer.local.json analyze
 - `qualified_loss` (осознанный отказ/market mismatch): рекомендации смещаются в фиксацию причины, сегментный вывод и снятие лишнего follow-up давления.
 - `evidence_context` gap: приоритет — заполнение CRM-контекста (notes, pain, business task, evidence).
 - `process_hygiene` gap (без qualified_loss): сохраняются классические follow-up/next-step/probability рекомендации.
+- `closed_lost + evidence_context gap`: рекомендации про восстановление причины потери и корректную классификацию closeout, без дефолтного прогрева/демо.
+- `won`: безопасный минимум по post-sale/handoff (без агрессивных pipeline pressure рекомендаций).
 - Для all-loss batch manager artifacts рендерятся безопасно: блок потенциала не вводит в заблуждение и показывает fallback по закрытым кейсам.
 
 Это технический batch slice для analyzer и snapshot pipeline, не weekly layer и не writer layer.
@@ -220,3 +244,16 @@ python -m src.deal_analyzer.cli --config config/deal_analyzer.local.json analyze
 ## Notes
 - Enrichment is read-only (no write-back to Google Sheets).
 - Weekly/refusals/analytics writer flows are untouched.
+
+## Data Quality / Owner Ambiguity Guardrails
+- Analyzer now marks interpretation reliability with:
+  - `data_quality_flags`
+  - `owner_ambiguity_flag`
+  - `crm_hygiene_confidence` (`high|medium|low`)
+  - `analysis_confidence` (`high|medium|low`)
+- Conservative owner ambiguity heuristic is used when CRM owner differs from enriched meeting actors (`enriched_conducted_by` / `enriched_assigned_by`) or attribution is limited.
+- For low-confidence deals, manager/employee outputs switch to caution-first wording:
+  - no accusatory assumptions about manager inactivity;
+  - focus on fact restoration, owner attribution check, and CRM cleanup.
+- Artifacts expose these markers in per-deal JSON and period markdown/csv outputs.
+
