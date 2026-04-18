@@ -60,6 +60,22 @@ class DealAnalyzerConfig:
     call_backend: str = "amocrm_api"
     amocrm_auth_config_path: str = ""
     call_base_domain: str = ""
+    janitor_enabled: bool = False
+    janitor_dry_run_default: bool = True
+    retention_days_exports: int = 30
+    retention_days_audio_cache: int = 14
+    retention_days_transcripts: int = 30
+    keep_last_exports_per_family: int = 5
+    max_audio_cache_gb: float = 2.0
+    max_logs_mb: float = 300.0
+    logs_dir: str = "logs"
+    audio_cache_dir: str = "workspace/deal_analyzer/audio_cache"
+    janitor_report_dir: str = "workspace/ops_storage"
+    retention_days_screenshots: int = 14
+    keep_last_screenshots: int = 200
+    retention_days_tmp_dirs: int = 3
+    screenshot_dir: str = "workspace/screenshots"
+    tmp_dirs: tuple[str, ...] = ("workspace/tmp", "workspace/tmp_tests", "pytest-tmp", "pytest_tmp_env")
 
 
 @dataclass(frozen=True)
@@ -197,6 +213,23 @@ def load_deal_analyzer_config(config_path: str | None = None) -> DealAnalyzerCon
     amocrm_auth_config_path = str(raw.get("amocrm_auth_config_path", "")).strip()
     call_base_domain = str(raw.get("call_base_domain", "")).strip()
 
+    janitor_enabled = bool(raw.get("janitor_enabled", False))
+    janitor_dry_run_default = bool(raw.get("janitor_dry_run_default", True))
+    retention_days_exports = _parse_non_negative_int(raw.get("retention_days_exports", 30), field="retention_days_exports")
+    retention_days_audio_cache = _parse_non_negative_int(raw.get("retention_days_audio_cache", 14), field="retention_days_audio_cache")
+    retention_days_transcripts = _parse_non_negative_int(raw.get("retention_days_transcripts", 30), field="retention_days_transcripts")
+    keep_last_exports_per_family = _parse_non_negative_int(raw.get("keep_last_exports_per_family", 5), field="keep_last_exports_per_family")
+    max_audio_cache_gb = _parse_non_negative_float(raw.get("max_audio_cache_gb", 2.0), field="max_audio_cache_gb")
+    max_logs_mb = _parse_non_negative_float(raw.get("max_logs_mb", 300.0), field="max_logs_mb")
+    logs_dir = str(raw.get("logs_dir", "logs")).strip() or "logs"
+    audio_cache_dir = str(raw.get("audio_cache_dir", "workspace/deal_analyzer/audio_cache")).strip() or "workspace/deal_analyzer/audio_cache"
+    janitor_report_dir = str(raw.get("janitor_report_dir", "workspace/ops_storage")).strip() or "workspace/ops_storage"
+    retention_days_screenshots = _parse_non_negative_int(raw.get("retention_days_screenshots", 14), field="retention_days_screenshots")
+    keep_last_screenshots = _parse_non_negative_int(raw.get("keep_last_screenshots", 200), field="keep_last_screenshots")
+    retention_days_tmp_dirs = _parse_non_negative_int(raw.get("retention_days_tmp_dirs", 3), field="retention_days_tmp_dirs")
+    screenshot_dir = str(raw.get("screenshot_dir", "workspace/screenshots")).strip() or "workspace/screenshots"
+    tmp_dirs = tuple(_parse_str_list(raw.get("tmp_dirs", ["workspace/tmp", "workspace/tmp_tests", "pytest-tmp", "pytest_tmp_env"])))
+
     roks_source_url = str(raw.get("roks_source_url", "")).strip()
     roks_sheet_name = str(raw.get("roks_sheet_name", "")).strip()
     roks_sheet_candidates = _parse_str_list(raw.get("roks_sheet_candidates"))
@@ -241,6 +274,22 @@ def load_deal_analyzer_config(config_path: str | None = None) -> DealAnalyzerCon
         call_backend=call_backend,
         amocrm_auth_config_path=amocrm_auth_config_path,
         call_base_domain=call_base_domain,
+        janitor_enabled=janitor_enabled,
+        janitor_dry_run_default=janitor_dry_run_default,
+        retention_days_exports=retention_days_exports,
+        retention_days_audio_cache=retention_days_audio_cache,
+        retention_days_transcripts=retention_days_transcripts,
+        keep_last_exports_per_family=keep_last_exports_per_family,
+        max_audio_cache_gb=max_audio_cache_gb,
+        max_logs_mb=max_logs_mb,
+        logs_dir=logs_dir,
+        audio_cache_dir=audio_cache_dir,
+        janitor_report_dir=janitor_report_dir,
+        retention_days_screenshots=retention_days_screenshots,
+        keep_last_screenshots=keep_last_screenshots,
+        retention_days_tmp_dirs=retention_days_tmp_dirs,
+        screenshot_dir=screenshot_dir,
+        tmp_dirs=tmp_dirs,
     )
 
 
@@ -320,6 +369,26 @@ def _parse_str_list(raw: Any) -> list[str]:
         if text:
             items.append(text)
     return items
+
+def _parse_non_negative_int(value: Any, *, field: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"Invalid {field}: expected integer, got {value!r}") from exc
+    if parsed < 0:
+        raise RuntimeError(f"Invalid {field}: must be >= 0")
+    return parsed
+
+
+def _parse_non_negative_float(value: Any, *, field: str) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"Invalid {field}: expected float, got {value!r}") from exc
+    if parsed < 0:
+        raise RuntimeError(f"Invalid {field}: must be >= 0")
+    return parsed
+
 
 def _parse_date(value: str, field_name: str) -> date:
     try:

@@ -44,3 +44,29 @@ def test_cli_parses_build_call_snapshot_command():
     with patch.object(sys, "argv", argv):
         args = _parse_args()
     assert args.command == "build-call-snapshot"
+
+
+def test_cli_parses_janitor_report_command():
+    argv = [
+        "prog",
+        "--config",
+        "config/deal_analyzer.local.json",
+        "janitor-report",
+    ]
+    with patch.object(sys, "argv", argv):
+        args = _parse_args()
+    assert args.command == "janitor-report"
+
+
+def test_cli_parses_janitor_clean_apply_command():
+    argv = [
+        "prog",
+        "--config",
+        "config/deal_analyzer.local.json",
+        "janitor-clean",
+        "--apply",
+    ]
+    with patch.object(sys, "argv", argv):
+        args = _parse_args()
+    assert args.command == "janitor-clean"
+    assert args.apply is True

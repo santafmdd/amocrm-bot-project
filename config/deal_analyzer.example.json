@@ -70,5 +70,26 @@
   "call_collection_mode": "disabled",
   "call_backend": "amocrm_api",
   "amocrm_auth_config_path": "config/amocrm_auth.local.json",
-  "call_base_domain": ""
+  "call_base_domain": "",
+  "janitor_enabled": false,
+  "janitor_dry_run_default": true,
+  "retention_days_exports": 30,
+  "retention_days_audio_cache": 14,
+  "retention_days_transcripts": 30,
+  "keep_last_exports_per_family": 5,
+  "max_audio_cache_gb": 2.0,
+  "max_logs_mb": 300.0,
+  "logs_dir": "logs",
+  "audio_cache_dir": "workspace/deal_analyzer/audio_cache",
+  "janitor_report_dir": "workspace/ops_storage",
+  "retention_days_screenshots": 14,
+  "keep_last_screenshots": 200,
+  "retention_days_tmp_dirs": 3,
+  "screenshot_dir": "workspace/screenshots",
+  "tmp_dirs": [
+    "workspace/tmp",
+    "workspace/tmp_tests",
+    "pytest-tmp",
+    "pytest_tmp_env"
+  ]
 }

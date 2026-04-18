@@ -741,3 +741,31 @@ Minimal external integration OAuth bootstrap is documented in [docs/amocrm_auth_
 - Added operator CLI commands: `collect-calls`, `transcribe-deal`, `transcribe-period`, `build-call-snapshot`.
 - No changes in analytics / weekly_refusals / Google Sheets writer flows.
 - Details: `docs/deal_analyzer_calls_mvp.md`.
+
+## Update (2026-04-18): Storage Janitor MVP
+
+???????? ?????????? janitor ???? ??? workspace/logs/caches (dry-run + apply) ? allowlist ? retention policy.
+
+CLI:
+- `python -m src.deal_analyzer.cli --config config/deal_analyzer.local.json janitor-report`
+- `python -m src.deal_analyzer.cli --config config/deal_analyzer.local.json janitor-clean --dry-run`
+- `python -m src.deal_analyzer.cli --config config/deal_analyzer.local.json janitor-clean --apply`
+
+??????: `docs/storage_janitor_mvp.md`.
+
+## Update 2026-04-18: Test Hygiene + Janitor Targets
+
+- Full suite command `python -m pytest -q -p no:cacheprovider tests` now passes without import mismatch.
+- Root cause: duplicated test module names (`test_config.py`, `test_client.py`, `test_exporters.py`) across subfolders.
+- Fix: test subfolders are package-marked (`__init__.py`) and guarded by a collection hygiene test.
+- Janitor policy now includes:
+  - `workspace/screenshots`
+  - `workspace/tmp`
+  - `workspace/tmp_tests`
+  - `pytest-tmp`
+  - `pytest_tmp_env`
+- Safe default remains unchanged: janitor is disabled unless explicitly enabled (`janitor_enabled=true`).
+- Default retention knobs:
+  - `retention_days_screenshots` (default 14)
+  - `keep_last_screenshots` (default 200)
+  - `retention_days_tmp_dirs` (default 3)

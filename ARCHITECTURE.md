@@ -220,3 +220,25 @@ Contract:
 - call evidence is collected API-first and deduplicated before snapshot integration;
 - transcription is backend-routed and cached by deterministic key;
 - analyzer consumes prepared snapshot (`CRM + enrich + call evidence + transcripts + ROKS`) and does not query sources directly.
+
+## Update (2026-04-18): Ops Storage / Janitor Layer
+
+???????? ????????? ?????? `src/ops_storage/*`:
+- retention planning
+- safe allowlist validation
+- dry-run / apply cleanup
+- reporting (json/md)
+
+Janitor ?????????? ?? analytics/weekly_refusals/writer flow ? ???????? ?????? ?? artifact/cache/log ???????????.
+
+## Update 2026-04-18: Janitor Coverage
+
+Janitor coverage was expanded beyond analyzer/collector exports. It now has explicit categories for:
+- screenshots
+- tmp directories
+- exports
+- transcripts
+- audio cache
+- logs
+
+All cleanup is still allowlist-only and supports dry-run reporting before any deletion.

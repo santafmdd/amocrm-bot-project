@@ -959,3 +959,29 @@ No regressions introduced into:
 
 Reference doc:
 - `docs/deal_analyzer_calls_mvp.md`
+
+## Update (2026-04-18): Storage Janitor MVP
+
+Done:
+- new `ops_storage` module with retention planner + janitor cleaner + report renderer;
+- policy supports `keep_latest`, `keep last N`, `older-than-days`, `max-size trim`;
+- allowlist safety enforced (paths outside allowlist fail fast);
+- integrated operator CLI commands `janitor-report` / `janitor-clean`.
+
+Not changed:
+- analytics flow
+- weekly_refusals flow
+- existing writer logic
+
+## Update 2026-04-18: Test Hygiene + Storage Cleanup
+
+- Full test command `python -m pytest -q -p no:cacheprovider tests` is green (no import mismatch).
+- Collection issue was caused by duplicate test module basenames across `tests/*` subpackages.
+- Added package markers in test subdirs and a dedicated hygiene test.
+- Janitor now tracks additional cleanup roots:
+  - `workspace/screenshots`
+  - `workspace/tmp`
+  - `workspace/tmp_tests`
+  - `pytest-tmp`
+  - `pytest_tmp_env`
+- Default retention added for screenshots and tmp dirs; janitor remains opt-in (`janitor_enabled=false` by default).

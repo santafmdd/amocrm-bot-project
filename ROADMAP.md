@@ -153,3 +153,23 @@ Delivered:
 Next:
 - plug first production STT backend into transcription adapter
 - add episode-level call segmentation on top of cached transcripts
+
+## Update (2026-04-18): Storage Hygiene Baseline
+
+Delivered:
+- centralized janitor retention policy for analyzer/collector artifacts, transcript cache, audio cache, logs;
+- dry-run preview and reclaim estimate;
+- safe cleanup with allowlist enforcement and report artifacts.
+
+Next:
+1. tune production retention thresholds from real disk profile;
+2. optional scheduled janitor execution policy.
+
+## Update 2026-04-18: Stabilization Checkpoint
+
+Completed:
+- pytest collection hygiene for duplicated test module names;
+- janitor target expansion for screenshot and tmp artifact directories.
+
+Next:
+- keep janitor retention tuned from real dry-run telemetry without broadening delete scope outside allowlist.

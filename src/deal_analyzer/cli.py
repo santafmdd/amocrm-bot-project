@@ -8,6 +8,8 @@ from typing import Any
 
 from src.config import load_config
 from src.logger import setup_logging
+from src.ops_storage.config import build_janitor_config_from_analyzer
+from src.ops_storage.janitor import run_janitor_clean, run_janitor_report
 from src.safety import ensure_inside_root
 
 from .call_downloader import CallDownloader
@@ -79,6 +81,12 @@ def _parse_args() -> argparse.Namespace:
     call_snapshot = sub.add_parser("build-call-snapshot", help="Build read-only snapshot with call evidence/transcripts")
     call_snapshot.add_argument("--input", required=True, help="Path to collector deal/period JSON")
 
+    sub.add_parser("janitor-report", help="Storage janitor report (no deletion)")
+
+    janitor_clean = sub.add_parser("janitor-clean", help="Storage janitor cleanup")
+    janitor_clean.add_argument("--dry-run", action="store_true", help="Preview cleanup candidates")
+    janitor_clean.add_argument("--apply", action="store_true", help="Apply deletion for candidates")
+
     return parser.parse_args()
 
 
@@ -101,6 +109,14 @@ def main() -> None:
 
     if args.command == "roks-snapshot":
         _run_roks_snapshot(cfg, output_dir, write_latest, logger, manager=str(args.manager or "").strip(), team=bool(args.team))
+        return
+
+    if args.command == "janitor-report":
+        _run_janitor_report(cfg, app, logger)
+        return
+
+    if args.command == "janitor-clean":
+        _run_janitor_clean(cfg, app, logger, dry_run=bool(getattr(args, "dry_run", False)), apply=bool(getattr(args, "apply", False)))
         return
 
     input_path = ensure_inside_root(Path(args.input).resolve(), app.project_root)
@@ -149,6 +165,38 @@ def main() -> None:
         return
 
     raise RuntimeError(f"Unsupported command: {args.command}")
+
+
+def _run_janitor_report(cfg: DealAnalyzerConfig, app, logger) -> None:
+    janitor_cfg = build_janitor_config_from_analyzer(analyzer_config=cfg, app_config=app)
+    if not janitor_cfg.enabled:
+        logger.warning("janitor disabled in config (janitor_enabled=false)")
+    result = run_janitor_report(config=janitor_cfg, logger=logger)
+    summary = result.report_payload.get("summary", {}) if isinstance(result.report_payload.get("summary"), dict) else {}
+    logger.info(
+        "janitor-report: total=%s reclaimable=%s deletable_files=%s json=%s md=%s",
+        summary.get("total_size_human", ""),
+        summary.get("reclaimable_human", ""),
+        summary.get("deletable_files", 0),
+        result.report_json,
+        result.report_md,
+    )
+
+
+def _run_janitor_clean(cfg: DealAnalyzerConfig, app, logger, *, dry_run: bool, apply: bool) -> None:
+    janitor_cfg = build_janitor_config_from_analyzer(analyzer_config=cfg, app_config=app)
+    if not janitor_cfg.enabled:
+        logger.warning("janitor disabled in config (janitor_enabled=false)")
+    if dry_run and apply:
+        raise RuntimeError("janitor-clean: use only one flag: --dry-run or --apply")
+    result = run_janitor_clean(config=janitor_cfg, logger=logger, apply=apply, dry_run_override=True if dry_run else None)
+    logger.info(
+        "janitor-clean finished: mode=%s deleted_files=%s deleted_bytes=%s report_json=%s",
+        result.mode,
+        result.deleted_files,
+        result.deleted_bytes,
+        result.report_json,
+    )
 
 
 def _run_enrich_deal(
