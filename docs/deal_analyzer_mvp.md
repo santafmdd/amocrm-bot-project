@@ -141,6 +141,8 @@ python -m src.deal_analyzer.cli --config config/deal_analyzer.local.json analyze
 `analyze-period` теперь дополнительно создает batch run-папку:
 - `workspace/deal_analyzer/period_runs/<run_timestamp>/deals/deal_<id>.json` — per-deal snapshot+analysis artifacts;
 - `workspace/deal_analyzer/period_runs/<run_timestamp>/summary.json` — агрегированный итог запуска.
+- `workspace/deal_analyzer/period_runs/<run_timestamp>/summary.md` — человекочитаемый итог run.
+- `workspace/deal_analyzer/period_runs/<run_timestamp>/top_risks.json` — быстрый риск-лист по сделкам.
 
 `summary.json` включает:
 - `run_timestamp`
@@ -152,6 +154,16 @@ python -m src.deal_analyzer.cli --config config/deal_analyzer.local.json analyze
 - `artifact_paths`
 - `score_aggregates` (`min/max/avg`)
 - `risk_flags_counts`
+
+`summary.md` — это операторский markdown-срез с ключевыми секциями:
+- run info;
+- score aggregates;
+- top risk flags;
+- top 10 risky deals;
+- top 10 highest score deals;
+- пометка `[warnings]` для сделок со snapshot warnings.
+
+`top_risks.json` — массив по сделкам для быстрого разбора риска/приоритезации.
 
 Это технический batch slice для analyzer и snapshot pipeline, не weekly layer и не writer layer.
 

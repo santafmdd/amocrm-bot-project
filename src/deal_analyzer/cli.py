@@ -684,6 +684,7 @@ def _run_analyze_period(
     }
     deals_failed = 0
     deal_artifact_paths: list[str] = []
+    period_deal_records: list[dict[str, Any]] = []
 
     for idx, row in enumerate(normalized_rows):
         deal_hint = str(row.get("deal_id") or row.get("amo_lead_id") or idx)
@@ -722,6 +723,16 @@ def _run_analyze_period(
             deal_artifact = deals_dir / _deal_artifact_filename(analysis=analysis, index=idx)
             _write_json_path(deal_artifact, per_deal_payload)
             deal_artifact_paths.append(str(deal_artifact))
+            period_deal_records.append(
+                {
+                    "deal_id": analysis.get("deal_id") or crm.get("deal_id"),
+                    "deal_name": analysis.get("deal_name") or crm.get("deal_name") or "",
+                    "score": analysis.get("score_0_100"),
+                    "risk_flags": analysis.get("risk_flags") if isinstance(analysis.get("risk_flags"), list) else [],
+                    "warnings": per_deal_payload.get("snapshot_warnings", []),
+                    "artifact_path": str(deal_artifact),
+                }
+            )
         except Exception as exc:
             deals_failed += 1
             logger.warning("analyze-period per-deal failed: deal=%s error=%s", deal_hint, exc)
@@ -737,6 +748,16 @@ def _run_analyze_period(
                 },
             )
             deal_artifact_paths.append(str(failed_artifact))
+            period_deal_records.append(
+                {
+                    "deal_id": deal_hint,
+                    "deal_name": "",
+                    "score": None,
+                    "risk_flags": ["analysis_failed"],
+                    "warnings": [str(exc)],
+                    "artifact_path": str(failed_artifact),
+                }
+            )
 
     effective_summary = _build_backend_effective_summary(llm_counts, cfg.analyzer_backend, preflight_forced_rules)
     metadata = AnalysisRunMetadata(
@@ -789,9 +810,20 @@ def _run_analyze_period(
     )
     summary_path = run_dir / "summary.json"
     _write_json_path(summary_path, summary_payload)
+    top_risks_payload = _build_top_risks_payload(period_deal_records=period_deal_records)
+    top_risks_path = run_dir / "top_risks.json"
+    _write_json_path(top_risks_path, top_risks_payload)
+    summary_md_path = run_dir / "summary.md"
+    summary_md_path.write_text(
+        _build_period_summary_markdown(
+            summary=summary_payload,
+            period_deal_records=period_deal_records,
+        ),
+        encoding="utf-8",
+    )
 
     logger.info(
-        "analyze-period success: backend=%s deals_seen=%s deals_analyzed=%s deals_failed=%s llm_success=%s llm_success_repaired=%s llm_fallback=%s llm_error=%s effective=%s json=%s md=%s csv=%s run_summary=%s",
+        "analyze-period success: backend=%s deals_seen=%s deals_analyzed=%s deals_failed=%s llm_success=%s llm_success_repaired=%s llm_fallback=%s llm_error=%s effective=%s json=%s md=%s csv=%s run_summary=%s run_md=%s top_risks=%s",
         cfg.analyzer_backend,
         len(normalized_rows_all),
         len(analyses),
@@ -805,6 +837,8 @@ def _run_analyze_period(
         md_out.timestamped,
         csv_out.timestamped,
         summary_path,
+        summary_md_path,
+        top_risks_path,
     )
 
 
@@ -1156,6 +1190,96 @@ def _build_period_run_summary(
         },
         "risk_flags_counts": dict(risk_counter),
     }
+
+
+def _build_top_risks_payload(*, period_deal_records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    ranked = sorted(
+        period_deal_records,
+        key=lambda x: (
+            len(x.get("risk_flags") if isinstance(x.get("risk_flags"), list) else []),
+            -int(x.get("score")) if isinstance(x.get("score"), int) else 9999,
+        ),
+        reverse=True,
+    )
+    out: list[dict[str, Any]] = []
+    for item in ranked:
+        flags = item.get("risk_flags") if isinstance(item.get("risk_flags"), list) else []
+        out.append(
+            {
+                "deal_id": item.get("deal_id"),
+                "deal_name": item.get("deal_name", ""),
+                "score": item.get("score"),
+                "top_risk_flags": [str(x) for x in flags[:3]],
+                "warnings": item.get("warnings", []) if isinstance(item.get("warnings"), list) else [],
+                "artifact_path": item.get("artifact_path", ""),
+            }
+        )
+    return out
+
+
+def _build_period_summary_markdown(*, summary: dict[str, Any], period_deal_records: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    lines.append(f"# Analyze Period Run Summary ({summary.get('run_timestamp', '')})")
+    lines.append("")
+    lines.append("## Run Info")
+    lines.append(f"- Backend requested: {summary.get('backend_requested', '')}")
+    lines.append(f"- Backend used: {summary.get('analysis_backend_used', '')}")
+    lines.append(f"- Deals seen: {summary.get('total_deals_seen', 0)}")
+    lines.append(f"- Deals analyzed: {summary.get('total_deals_analyzed', 0)}")
+    lines.append(f"- Deals failed: {summary.get('deals_failed', 0)}")
+    lines.append("")
+
+    agg = summary.get("score_aggregates", {}) if isinstance(summary.get("score_aggregates"), dict) else {}
+    lines.append("## Score Aggregates")
+    lines.append(f"- Min: {agg.get('min')}")
+    lines.append(f"- Max: {agg.get('max')}")
+    lines.append(f"- Avg: {agg.get('avg')}")
+    lines.append("")
+
+    lines.append("## Top Risk Flags")
+    risk_counts = summary.get("risk_flags_counts", {}) if isinstance(summary.get("risk_flags_counts"), dict) else {}
+    if not risk_counts:
+        lines.append("- none")
+    else:
+        for risk, count in sorted(risk_counts.items(), key=lambda x: x[1], reverse=True):
+            lines.append(f"- {risk}: {count}")
+    lines.append("")
+
+    ranked_risky = sorted(
+        period_deal_records,
+        key=lambda x: (
+            len(x.get("risk_flags") if isinstance(x.get("risk_flags"), list) else []),
+            -int(x.get("score")) if isinstance(x.get("score"), int) else 9999,
+        ),
+        reverse=True,
+    )[:10]
+    lines.append("## Top 10 Most Risky Deals")
+    if not ranked_risky:
+        lines.append("- none")
+    for item in ranked_risky:
+        warnings = item.get("warnings") if isinstance(item.get("warnings"), list) else []
+        warn_note = " [warnings]" if warnings else ""
+        lines.append(
+            f"- deal={item.get('deal_id')} score={item.get('score')} risks={len(item.get('risk_flags', []))}{warn_note} name={item.get('deal_name', '')}"
+        )
+    lines.append("")
+
+    top_scores = sorted(
+        period_deal_records,
+        key=lambda x: int(x.get("score")) if isinstance(x.get("score"), int) else -1,
+        reverse=True,
+    )[:10]
+    lines.append("## Top 10 Highest Score Deals")
+    if not top_scores:
+        lines.append("- none")
+    for item in top_scores:
+        warnings = item.get("warnings") if isinstance(item.get("warnings"), list) else []
+        warn_note = " [warnings]" if warnings else ""
+        lines.append(
+            f"- deal={item.get('deal_id')} score={item.get('score')}{warn_note} name={item.get('deal_name', '')}"
+        )
+    lines.append("")
+    return "\n".join(lines).strip() + "\n"
 
 
 def _build_calls_markdown(*, results: list[dict[str, Any]], title: str) -> str:

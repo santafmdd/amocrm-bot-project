@@ -125,12 +125,28 @@ def test_analyze_period_creates_run_dir_and_summary_json():
     run_dirs = [p for p in run_root.iterdir() if p.is_dir()]
     assert len(run_dirs) == 1
     summary_path = run_dirs[0] / "summary.json"
+    summary_md_path = run_dirs[0] / "summary.md"
+    top_risks_path = run_dirs[0] / "top_risks.json"
     assert summary_path.exists()
+    assert summary_md_path.exists()
+    assert top_risks_path.exists()
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     assert summary["total_deals_seen"] == 2
     assert summary["total_deals_analyzed"] == 2
     assert summary["deals_failed"] == 0
     assert len(summary["artifact_paths"]) == 2
+    md = summary_md_path.read_text(encoding="utf-8")
+    assert "## Run Info" in md
+    assert "## Score Aggregates" in md
+    assert "## Top Risk Flags" in md
+    assert "## Top 10 Most Risky Deals" in md
+    assert "## Top 10 Highest Score Deals" in md
+    top_risks = json.loads(top_risks_path.read_text(encoding="utf-8"))
+    assert isinstance(top_risks, list)
+    assert len(top_risks) == 2
+    assert "deal_id" in top_risks[0]
+    assert "top_risk_flags" in top_risks[0]
+    assert "artifact_path" in top_risks[0]
 
 
 def test_analyze_period_limit_is_applied():
@@ -196,7 +212,12 @@ def test_analyze_period_partial_snapshot_warnings_do_not_fail_batch():
     second = json.loads(artifacts[1].read_text(encoding="utf-8"))
     assert second["snapshot_warnings"] == ["transcription_failed:test"]
     summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    top_risks = json.loads((run_dir / "top_risks.json").read_text(encoding="utf-8"))
+    md = (run_dir / "summary.md").read_text(encoding="utf-8")
     assert summary["deals_failed"] == 0
+    assert len(top_risks) == 2
+    assert any(item.get("warnings") for item in top_risks)
+    assert "[warnings]" in md
 
 
 def test_analyze_period_summary_counts_failed_deals():
