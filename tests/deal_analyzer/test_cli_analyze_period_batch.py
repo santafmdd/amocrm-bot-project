@@ -43,10 +43,10 @@ def _cfg() -> DealAnalyzerConfig:
     )
 
 
-def _snapshot_for_deal(deal_id: int, *, warnings=None):
+def _snapshot_for_deal(deal_id: int, *, warnings=None, status_name: str = "В работе"):
     return {
         "snapshot_generated_at": "2026-04-18T12:00:00+00:00",
-        "crm": {"deal_id": deal_id, "amo_lead_id": deal_id, "deal_name": f"Deal {deal_id}"},
+        "crm": {"deal_id": deal_id, "amo_lead_id": deal_id, "deal_name": f"Deal {deal_id}", "status_name": status_name},
         "warnings": list(warnings or []),
         "call_evidence": {"items": [], "summary": {"calls_total": 0}},
         "transcripts": [],
@@ -63,7 +63,7 @@ def _analysis_for_deal(deal_id: int, *, backend_used="rules", score=50):
             "score_0_100": score,
             "strong_sides": [],
             "growth_zones": [],
-            "risk_flags": ["risk_a"] if score < 60 else [],
+            "risk_flags": ["qualified_loss: market mismatch"] if score < 45 else (["process_hygiene: missing follow-up"] if score < 60 else []),
             "presentation_quality_flag": "ok",
             "followup_quality_flag": "ok",
             "data_completeness_flag": "partial",
@@ -127,9 +127,11 @@ def test_analyze_period_creates_run_dir_and_summary_json():
     summary_path = run_dirs[0] / "summary.json"
     summary_md_path = run_dirs[0] / "summary.md"
     top_risks_path = run_dirs[0] / "top_risks.json"
+    manager_brief_path = run_dirs[0] / "manager_brief.md"
     assert summary_path.exists()
     assert summary_md_path.exists()
     assert top_risks_path.exists()
+    assert manager_brief_path.exists()
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     assert summary["total_deals_seen"] == 2
     assert summary["total_deals_analyzed"] == 2
@@ -139,6 +141,7 @@ def test_analyze_period_creates_run_dir_and_summary_json():
     assert "## Run Info" in md
     assert "## Score Aggregates" in md
     assert "## Top Risk Flags" in md
+    assert "## Qualified Loss / Market Mismatch" in md
     assert "## Top 10 Most Risky Deals" in md
     assert "## Top 10 Highest Score Deals" in md
     top_risks = json.loads(top_risks_path.read_text(encoding="utf-8"))
@@ -147,6 +150,14 @@ def test_analyze_period_creates_run_dir_and_summary_json():
     assert "deal_id" in top_risks[0]
     assert "top_risk_flags" in top_risks[0]
     assert "artifact_path" in top_risks[0]
+    brief = manager_brief_path.read_text(encoding="utf-8")
+    assert "## Период и запуск" in brief
+    assert "## Объем" in brief
+    assert "## 5 главных риск-паттернов" in brief
+    assert "## Qualified loss / market mismatch" in brief
+    assert "## 5 сделок, требующих внимания" in brief
+    assert "## 5 сделок с лучшим потенциалом" in brief
+    assert "## Что делать дальше" in brief
 
 
 def test_analyze_period_limit_is_applied():
@@ -214,10 +225,12 @@ def test_analyze_period_partial_snapshot_warnings_do_not_fail_batch():
     summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
     top_risks = json.loads((run_dir / "top_risks.json").read_text(encoding="utf-8"))
     md = (run_dir / "summary.md").read_text(encoding="utf-8")
+    brief = (run_dir / "manager_brief.md").read_text(encoding="utf-8")
     assert summary["deals_failed"] == 0
     assert len(top_risks) == 2
     assert any(item.get("warnings") for item in top_risks)
     assert "[warnings]" in md
+    assert "Технические предупреждения snapshot" in brief
 
 
 def test_analyze_period_summary_counts_failed_deals():
@@ -248,6 +261,71 @@ def test_analyze_period_summary_counts_failed_deals():
 
     run_dir = next((output_dir / "period_runs").iterdir())
     summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    brief = (run_dir / "manager_brief.md").read_text(encoding="utf-8")
     assert summary["total_deals_seen"] == 2
     assert summary["total_deals_analyzed"] == 1
     assert summary["deals_failed"] == 1
+    assert "Упало: 1" in brief
+
+
+def test_manager_brief_and_summary_safe_fallback_when_all_deals_closed_loss():
+    output_dir = _fresh_output_dir("period_batch_all_loss")
+    payload = {"normalized_deals": [{"deal_id": 1}, {"deal_id": 2}]}
+    logger = _Logger()
+
+    def _fake_snapshot(*, normalized_deal, config, logger, raw_bundle):
+        return _snapshot_for_deal(int(normalized_deal["deal_id"]), status_name="Закрыто и не реализовано")
+
+    def _fake_analyze(normalized, cfg, logger, *, deal_hint, backend_override):
+        return (
+            {
+                "deal_id": int(normalized["deal_id"]),
+                "amo_lead_id": int(normalized["deal_id"]),
+                "deal_name": f"Deal {normalized['deal_id']}",
+                "score_0_100": 55,
+                "strong_sides": [],
+                "growth_zones": [],
+                "risk_flags": ["qualified_loss: Рыночное несовпадение/нецелевой сценарий"],
+                "presentation_quality_flag": "needs_attention",
+                "followup_quality_flag": "needs_attention",
+                "data_completeness_flag": "partial",
+                "recommended_actions_for_manager": [],
+                "recommended_training_tasks_for_employee": [],
+                "manager_message_draft": "",
+                "employee_training_message_draft": "",
+                "analysis_backend_requested": "rules",
+                "analysis_backend_used": "rules",
+                "llm_repair_applied": False,
+                "backend": "rules",
+            },
+            {
+                "llm_success_count": 0,
+                "llm_success_repaired_count": 0,
+                "llm_fallback_count": 0,
+                "llm_error_count": 0,
+            },
+        )
+
+    with patch("src.deal_analyzer.cli.build_deal_snapshot", side_effect=_fake_snapshot), patch(
+        "src.deal_analyzer.cli._analyze_one_with_isolation", side_effect=_fake_analyze
+    ):
+        _run_analyze_period(
+            _cfg(),
+            output_dir,
+            payload,
+            "period.json",
+            True,
+            logger,
+            period_mode=None,
+            date_from=None,
+            date_to=None,
+            limit=None,
+        )
+
+    run_dir = next((output_dir / "period_runs").iterdir())
+    summary_md = (run_dir / "summary.md").read_text(encoding="utf-8")
+    brief_md = (run_dir / "manager_brief.md").read_text(encoding="utf-8")
+    assert "Нет открытых/рабочих сделок для секции потенциала." in summary_md
+    assert "Лучшие из закрытых (fallback):" in summary_md
+    assert "Нет открытых/рабочих сделок для блока потенциала." in brief_md
+    assert "Лучшие из проанализированных, но закрытых:" in brief_md

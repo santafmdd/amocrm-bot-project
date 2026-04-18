@@ -143,6 +143,7 @@ python -m src.deal_analyzer.cli --config config/deal_analyzer.local.json analyze
 - `workspace/deal_analyzer/period_runs/<run_timestamp>/summary.json` — агрегированный итог запуска.
 - `workspace/deal_analyzer/period_runs/<run_timestamp>/summary.md` — человекочитаемый итог run.
 - `workspace/deal_analyzer/period_runs/<run_timestamp>/top_risks.json` — быстрый риск-лист по сделкам.
+- `workspace/deal_analyzer/period_runs/<run_timestamp>/manager_brief.md` — короткий управленческий бриф для быстрого чтения.
 
 `summary.json` включает:
 - `run_timestamp`
@@ -164,6 +165,25 @@ python -m src.deal_analyzer.cli --config config/deal_analyzer.local.json analyze
 - пометка `[warnings]` для сделок со snapshot warnings.
 
 `top_risks.json` — массив по сделкам для быстрого разбора риска/приоритезации.
+
+`manager_brief.md` — управленческий компактный отчет:
+- объем (просмотрено/проанализировано/упало),
+- 5 основных риск-паттернов,
+- отдельный блок `Qualified loss / market mismatch`,
+- 5 сделок внимания,
+- 5 сделок с лучшим потенциалом,
+- короткий блок "что делать дальше".
+
+### Rules quality slice (latest)
+- Rules scoring теперь учитывает не только demo/brief, но и контекст из CRM: notes/tasks/tags, контактные и company-данные, long-call сигналы.
+- Сценарии `reasoned loss` (осознанный отказ/market mismatch) помечаются отдельно как `qualified_loss:*`, а не смешиваются с пустыми hygiene-кейсами.
+- В period markdown-отчетах `qualified_loss` выводится отдельной секцией.
+
+### Policy-aware recommendations
+- `qualified_loss` (осознанный отказ/market mismatch): рекомендации смещаются в фиксацию причины, сегментный вывод и снятие лишнего follow-up давления.
+- `evidence_context` gap: приоритет — заполнение CRM-контекста (notes, pain, business task, evidence).
+- `process_hygiene` gap (без qualified_loss): сохраняются классические follow-up/next-step/probability рекомендации.
+- Для all-loss batch manager artifacts рендерятся безопасно: блок потенциала не вводит в заблуждение и показывает fallback по закрытым кейсам.
 
 Это технический batch slice для analyzer и snapshot pipeline, не weekly layer и не writer layer.
 

@@ -727,6 +727,7 @@ def _run_analyze_period(
                 {
                     "deal_id": analysis.get("deal_id") or crm.get("deal_id"),
                     "deal_name": analysis.get("deal_name") or crm.get("deal_name") or "",
+                    "status_name": crm.get("status_name") or "",
                     "score": analysis.get("score_0_100"),
                     "risk_flags": analysis.get("risk_flags") if isinstance(analysis.get("risk_flags"), list) else [],
                     "warnings": per_deal_payload.get("snapshot_warnings", []),
@@ -752,6 +753,7 @@ def _run_analyze_period(
                 {
                     "deal_id": deal_hint,
                     "deal_name": "",
+                    "status_name": "",
                     "score": None,
                     "risk_flags": ["analysis_failed"],
                     "warnings": [str(exc)],
@@ -821,9 +823,17 @@ def _run_analyze_period(
         ),
         encoding="utf-8",
     )
+    manager_brief_path = run_dir / "manager_brief.md"
+    manager_brief_path.write_text(
+        _build_manager_brief_markdown(
+            summary=summary_payload,
+            period_deal_records=period_deal_records,
+        ),
+        encoding="utf-8",
+    )
 
     logger.info(
-        "analyze-period success: backend=%s deals_seen=%s deals_analyzed=%s deals_failed=%s llm_success=%s llm_success_repaired=%s llm_fallback=%s llm_error=%s effective=%s json=%s md=%s csv=%s run_summary=%s run_md=%s top_risks=%s",
+        "analyze-period success: backend=%s deals_seen=%s deals_analyzed=%s deals_failed=%s llm_success=%s llm_success_repaired=%s llm_fallback=%s llm_error=%s effective=%s json=%s md=%s csv=%s run_summary=%s run_md=%s top_risks=%s manager_brief=%s",
         cfg.analyzer_backend,
         len(normalized_rows_all),
         len(analyses),
@@ -839,6 +849,7 @@ def _run_analyze_period(
         summary_path,
         summary_md_path,
         top_risks_path,
+        manager_brief_path,
     )
 
 
@@ -1238,10 +1249,19 @@ def _build_period_summary_markdown(*, summary: dict[str, Any], period_deal_recor
 
     lines.append("## Top Risk Flags")
     risk_counts = summary.get("risk_flags_counts", {}) if isinstance(summary.get("risk_flags_counts"), dict) else {}
-    if not risk_counts:
+    qualified_items = [(k, v) for k, v in risk_counts.items() if str(k).startswith("qualified_loss:")]
+    regular_items = [(k, v) for k, v in risk_counts.items() if not str(k).startswith("qualified_loss:")]
+    if not regular_items:
         lines.append("- none")
     else:
-        for risk, count in sorted(risk_counts.items(), key=lambda x: x[1], reverse=True):
+        for risk, count in sorted(regular_items, key=lambda x: x[1], reverse=True):
+            lines.append(f"- {risk}: {count}")
+    lines.append("")
+    lines.append("## Qualified Loss / Market Mismatch")
+    if not qualified_items:
+        lines.append("- none")
+    else:
+        for risk, count in sorted(qualified_items, key=lambda x: x[1], reverse=True):
             lines.append(f"- {risk}: {count}")
     lines.append("")
 
@@ -1264,14 +1284,30 @@ def _build_period_summary_markdown(*, summary: dict[str, Any], period_deal_recor
         )
     lines.append("")
 
+    non_loss_scores = [
+        item for item in period_deal_records if not _is_loss_like_record(item)
+    ]
     top_scores = sorted(
-        period_deal_records,
+        non_loss_scores,
         key=lambda x: int(x.get("score")) if isinstance(x.get("score"), int) else -1,
         reverse=True,
     )[:10]
     lines.append("## Top 10 Highest Score Deals")
     if not top_scores:
-        lines.append("- none")
+        closed_loss_fallback = sorted(
+            [item for item in period_deal_records if _is_loss_like_record(item)],
+            key=lambda x: int(x.get("score")) if isinstance(x.get("score"), int) else -1,
+            reverse=True,
+        )[:10]
+        lines.append("- Нет открытых/рабочих сделок для секции потенциала.")
+        if closed_loss_fallback:
+            lines.append("- Лучшие из закрытых (fallback):")
+            for item in closed_loss_fallback:
+                warnings = item.get("warnings") if isinstance(item.get("warnings"), list) else []
+                warn_note = " [warnings]" if warnings else ""
+                lines.append(
+                    f"  - deal={item.get('deal_id')} score={item.get('score')}{warn_note} name={item.get('deal_name', '')}"
+                )
     for item in top_scores:
         warnings = item.get("warnings") if isinstance(item.get("warnings"), list) else []
         warn_note = " [warnings]" if warnings else ""
@@ -1280,6 +1316,131 @@ def _build_period_summary_markdown(*, summary: dict[str, Any], period_deal_recor
         )
     lines.append("")
     return "\n".join(lines).strip() + "\n"
+
+
+def _build_manager_brief_markdown(*, summary: dict[str, Any], period_deal_records: list[dict[str, Any]]) -> str:
+    risk_counts = summary.get("risk_flags_counts", {}) if isinstance(summary.get("risk_flags_counts"), dict) else {}
+    qualified_items = [(k, v) for k, v in risk_counts.items() if str(k).startswith("qualified_loss:")]
+    regular_items = [(k, v) for k, v in risk_counts.items() if not str(k).startswith("qualified_loss:")]
+    top_risk_patterns = sorted(regular_items, key=lambda x: x[1], reverse=True)[:5]
+    top_qualified = sorted(qualified_items, key=lambda x: x[1], reverse=True)[:5]
+    warnings_count = sum(
+        1
+        for item in period_deal_records
+        if isinstance(item.get("warnings"), list) and len(item.get("warnings")) > 0
+    )
+    attention_deals = sorted(
+        period_deal_records,
+        key=lambda x: (
+            len(x.get("risk_flags") if isinstance(x.get("risk_flags"), list) else []),
+            -(int(x.get("score")) if isinstance(x.get("score"), int) else 0),
+        ),
+        reverse=True,
+    )[:5]
+    non_loss_candidates = [
+        item for item in period_deal_records if not _is_loss_like_record(item)
+    ]
+    best_potential = sorted(
+        non_loss_candidates,
+        key=lambda x: (
+            int(x.get("score")) if isinstance(x.get("score"), int) else -1,
+            -len(x.get("risk_flags") if isinstance(x.get("risk_flags"), list) else []),
+        ),
+        reverse=True,
+    )[:5]
+
+    actions = _build_manager_brief_actions(top_risk_patterns=top_risk_patterns, summary=summary)
+
+    lines: list[str] = []
+    lines.append("# Manager Brief")
+    lines.append("")
+    lines.append("## Период и запуск")
+    lines.append(f"- Run timestamp: {summary.get('run_timestamp', '')}")
+    lines.append(f"- Backend requested: {summary.get('backend_requested', '')}")
+    lines.append(f"- Backend used: {summary.get('analysis_backend_used', '')}")
+    lines.append("")
+    lines.append("## Объем")
+    lines.append(f"- Просмотрено сделок: {summary.get('total_deals_seen', 0)}")
+    lines.append(f"- Проанализировано: {summary.get('total_deals_analyzed', 0)}")
+    lines.append(f"- Упало: {summary.get('deals_failed', 0)}")
+    lines.append("")
+    lines.append("## 5 главных риск-паттернов")
+    if not top_risk_patterns:
+        lines.append("- Нет доминирующих риск-паттернов")
+    else:
+        for risk, count in top_risk_patterns:
+            lines.append(f"- {risk}: {count}")
+    lines.append("")
+    lines.append("## Qualified loss / market mismatch")
+    if not top_qualified:
+        lines.append("- Нет явных qualified loss паттернов")
+    else:
+        for risk, count in top_qualified:
+            lines.append(f"- {risk}: {count}")
+    lines.append("")
+    lines.append("## 5 сделок, требующих внимания")
+    if not attention_deals:
+        lines.append("- Нет данных")
+    else:
+        for item in attention_deals:
+            warn = " (есть warnings)" if isinstance(item.get("warnings"), list) and item.get("warnings") else ""
+            lines.append(
+                f"- deal={item.get('deal_id')} | score={item.get('score')} | risks={len(item.get('risk_flags', []))}{warn} | {item.get('deal_name', '')}"
+            )
+    lines.append("")
+    lines.append("## 5 сделок с лучшим потенциалом")
+    if not best_potential:
+        closed_loss_fallback = sorted(
+            [item for item in period_deal_records if _is_loss_like_record(item)],
+            key=lambda x: int(x.get("score")) if isinstance(x.get("score"), int) else -1,
+            reverse=True,
+        )[:5]
+        lines.append("- Нет открытых/рабочих сделок для блока потенциала.")
+        if closed_loss_fallback:
+            lines.append("- Лучшие из проанализированных, но закрытых:")
+            for item in closed_loss_fallback:
+                warn = " (есть warnings)" if isinstance(item.get("warnings"), list) and item.get("warnings") else ""
+                lines.append(
+                    f"  - deal={item.get('deal_id')} | score={item.get('score')} | risks={len(item.get('risk_flags', []))}{warn} | {item.get('deal_name', '')}"
+                )
+    else:
+        for item in best_potential:
+            warn = " (есть warnings)" if isinstance(item.get("warnings"), list) and item.get("warnings") else ""
+            lines.append(
+                f"- deal={item.get('deal_id')} | score={item.get('score')} | risks={len(item.get('risk_flags', []))}{warn} | {item.get('deal_name', '')}"
+            )
+    lines.append("")
+    lines.append("## Что делать дальше")
+    for action in actions:
+        lines.append(f"- {action}")
+    lines.append("")
+    if warnings_count > 0:
+        lines.append(f"_Технические предупреждения snapshot: {warnings_count} сделок (детали в deals/*.json и top_risks.json)._")
+        lines.append("")
+    return "\n".join(lines).strip() + "\n"
+
+
+def _build_manager_brief_actions(*, top_risk_patterns: list[tuple[str, int]], summary: dict[str, Any]) -> list[str]:
+    actions: list[str] = []
+    deals_failed = int(summary.get("deals_failed", 0) or 0)
+    if deals_failed > 0:
+        actions.append("Разобрать упавшие сделки из artifacts и закрыть причины падения пайплайна анализа.")
+    if top_risk_patterns:
+        actions.append("Провести короткий разбор топ-рисков с менеджерами по проблемным сделкам.")
+    actions.append("Проверить, что по приоритетным сделкам зафиксирован следующий шаг и срок в CRM.")
+    actions.append("Назначить follow-up по сделкам из списка внимания с контролем результата.")
+    actions.append("Отдельно прогнать 1:1 коучинг по повторяющимся рискам из отчета.")
+    if int(summary.get("total_deals_analyzed", 0) or 0) > 0:
+        actions.append("Использовать сделки с лучшим потенциалом как эталоны для команды.")
+    return actions[:7]
+
+
+def _is_loss_like_record(item: dict[str, Any]) -> bool:
+    flags = item.get("risk_flags") if isinstance(item.get("risk_flags"), list) else []
+    if any(str(flag).startswith("qualified_loss:") for flag in flags):
+        return True
+    status_name = str(item.get("status_name") or "").lower()
+    return ("закрыто" in status_name and "не реализ" in status_name) or ("закрыто" in status_name and "отказ" in status_name)
 
 
 def _build_calls_markdown(*, results: list[dict[str, Any]], title: str) -> str:
