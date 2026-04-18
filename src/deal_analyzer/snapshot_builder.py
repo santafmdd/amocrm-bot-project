@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any
 
 from .call_downloader import CallDownloader
@@ -17,14 +18,15 @@ def build_deal_snapshot(
     logger,
     raw_bundle: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    enriched = enrich_rows([dict(normalized_deal)], config=config, logger=logger)[0]
+    snapshot_warnings: list[str] = []
+    enriched = _safe_enrich_one(normalized_deal=normalized_deal, config=config, logger=logger, warnings=snapshot_warnings)
     manager = str(enriched.get("responsible_user_name") or "").strip()
-    roks = extract_roks_snapshot(config=config, logger=logger, manager=manager or None, team=not bool(manager))
+    roks = _safe_extract_roks_snapshot(config=config, logger=logger, manager=manager or None, team=not bool(manager), warnings=snapshot_warnings)
 
     call_downloader = CallDownloader(config=config, logger=logger)
-    call_result = call_downloader.collect_deal_calls(deal=enriched, raw_bundle=raw_bundle)
+    call_result = _safe_collect_deal_calls(call_downloader=call_downloader, deal=enriched, raw_bundle=raw_bundle, logger=logger, warnings=snapshot_warnings)
     call_dicts = call_evidence_to_dicts(call_result.calls)
-    transcripts = transcribe_call_evidence(calls=call_dicts, config=config, logger=logger)
+    transcripts = _safe_transcribe_call_evidence(calls=call_dicts, config=config, logger=logger, warnings=snapshot_warnings)
 
     return {
         "snapshot_generated_at": datetime.now(timezone.utc).isoformat(),
@@ -47,6 +49,7 @@ def build_deal_snapshot(
         "transcripts": transcripts,
         "call_derived_summary": _build_call_derived_summary(call_result.calls, transcripts),
         "roks_context": roks.to_dict(),
+        "warnings": snapshot_warnings,
     }
 
 
@@ -57,13 +60,20 @@ def build_period_snapshots(
     logger,
     raw_bundles_by_deal: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    enriched_rows = enrich_rows([dict(row) for row in normalized_deals], config=config, logger=logger)
+    snapshot_warnings: list[str] = []
+    enriched_rows = _safe_enrich_rows(normalized_deals=normalized_deals, config=config, logger=logger, warnings=snapshot_warnings)
     managers = sorted({str(row.get("responsible_user_name") or "").strip() for row in enriched_rows if str(row.get("responsible_user_name") or "").strip()})
 
-    roks_team = extract_roks_snapshot(config=config, logger=logger, team=True)
+    roks_team = _safe_extract_roks_snapshot(config=config, logger=logger, team=True, warnings=snapshot_warnings)
     roks_by_manager: dict[str, dict[str, Any]] = {}
     for manager in managers:
-        roks_by_manager[manager] = extract_roks_snapshot(config=config, logger=logger, manager=manager, team=False).to_dict()
+        roks_by_manager[manager] = _safe_extract_roks_snapshot(
+            config=config,
+            logger=logger,
+            manager=manager,
+            team=False,
+            warnings=snapshot_warnings,
+        ).to_dict()
 
     call_downloader = CallDownloader(config=config, logger=logger)
     raw_bundles_by_deal = raw_bundles_by_deal or {}
@@ -72,9 +82,15 @@ def build_period_snapshots(
     for row in enriched_rows:
         manager_name = str(row.get("responsible_user_name") or "").strip()
         deal_id = str(row.get("deal_id") or row.get("amo_lead_id") or "")
-        call_result = call_downloader.collect_deal_calls(deal=row, raw_bundle=raw_bundles_by_deal.get(deal_id))
+        call_result = _safe_collect_deal_calls(
+            call_downloader=call_downloader,
+            deal=row,
+            raw_bundle=raw_bundles_by_deal.get(deal_id),
+            logger=logger,
+            warnings=snapshot_warnings,
+        )
         call_dicts = call_evidence_to_dicts(call_result.calls)
-        transcripts = transcribe_call_evidence(calls=call_dicts, config=config, logger=logger)
+        transcripts = _safe_transcribe_call_evidence(calls=call_dicts, config=config, logger=logger, warnings=snapshot_warnings)
 
         items.append(
             {
@@ -97,6 +113,7 @@ def build_period_snapshots(
                 "transcripts": transcripts,
                 "call_derived_summary": _build_call_derived_summary(call_result.calls, transcripts),
                 "roks_context": roks_by_manager.get(manager_name, roks_team.to_dict()),
+                "warnings": [],
             }
         )
 
@@ -106,6 +123,7 @@ def build_period_snapshots(
         "managers": managers,
         "roks_team_context": roks_team.to_dict(),
         "items": items,
+        "warnings": snapshot_warnings,
     }
 
 
@@ -119,3 +137,86 @@ def _build_call_derived_summary(calls, transcripts: list[dict[str, Any]]) -> dic
         "calls_with_transcript": with_transcript,
         "primary_factual_anchor_available": bool(total > 0),
     }
+
+
+def _safe_enrich_one(*, normalized_deal: dict[str, Any], config, logger, warnings: list[str]) -> dict[str, Any]:
+    try:
+        rows = enrich_rows([dict(normalized_deal)], config=config, logger=logger)
+        if rows:
+            return rows[0]
+    except Exception as exc:
+        logger.warning("snapshot enrich failed for deal: deal_id=%s error=%s", normalized_deal.get("deal_id") or normalized_deal.get("amo_lead_id") or "", exc)
+        warnings.append(f"enrichment_failed:{exc}")
+    fallback = dict(normalized_deal)
+    fallback["enrichment_match_status"] = "error"
+    fallback["enrichment_match_source"] = "error"
+    fallback["enrichment_confidence"] = 0.0
+    return fallback
+
+
+def _safe_enrich_rows(*, normalized_deals: list[dict[str, Any]], config, logger, warnings: list[str]) -> list[dict[str, Any]]:
+    try:
+        rows = enrich_rows([dict(row) for row in normalized_deals], config=config, logger=logger)
+        if rows:
+            return rows
+    except Exception as exc:
+        logger.warning("snapshot enrich failed for period: deals=%s error=%s", len(normalized_deals), exc)
+        warnings.append(f"enrichment_failed:{exc}")
+    fallback_rows: list[dict[str, Any]] = []
+    for row in normalized_deals:
+        item = dict(row)
+        item["enrichment_match_status"] = "error"
+        item["enrichment_match_source"] = "error"
+        item["enrichment_confidence"] = 0.0
+        fallback_rows.append(item)
+    return fallback_rows
+
+
+def _safe_extract_roks_snapshot(*, config, logger, warnings: list[str], manager: str | None = None, team: bool = False):
+    try:
+        return extract_roks_snapshot(config=config, logger=logger, manager=manager, team=team)
+    except Exception as exc:
+        scope = "team" if team else "manager"
+        error_text = str(exc)
+        logger.warning("snapshot roks extraction failed: scope=%s manager=%s error=%s", scope, manager or "", exc)
+        warnings.append(f"roks_failed:{scope}:{exc}")
+        return SimpleNamespace(
+            to_dict=lambda: {
+                "ok": False,
+                "scope": scope,
+                "manager": manager or "",
+                "source_url": "",
+                "sheet_title": "",
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "employee_month_context": {},
+                "team_month_context": {},
+                "weekly_context": {},
+                "conversion_snapshot": {},
+                "forecast_residual": {},
+                "warnings": [f"roks_extraction_failed:{error_text}"],
+                "error": error_text,
+            }
+        )
+
+
+def _safe_collect_deal_calls(*, call_downloader, deal: dict[str, Any], raw_bundle: dict[str, Any] | None, logger, warnings: list[str]):
+    try:
+        return call_downloader.collect_deal_calls(deal=deal, raw_bundle=raw_bundle)
+    except Exception as exc:
+        deal_id = deal.get("deal_id") or deal.get("amo_lead_id") or ""
+        logger.warning("snapshot call collection failed: deal_id=%s error=%s", deal_id, exc)
+        warnings.append(f"call_collection_failed:{deal_id}:{exc}")
+        return SimpleNamespace(
+            calls=[],
+            warnings=[f"call_collection_failed:{exc}"],
+            source_used="error",
+        )
+
+
+def _safe_transcribe_call_evidence(*, calls: list[dict[str, Any]], config, logger, warnings: list[str]) -> list[dict[str, Any]]:
+    try:
+        return transcribe_call_evidence(calls=calls, config=config, logger=logger)
+    except Exception as exc:
+        logger.warning("snapshot transcription failed: calls=%s error=%s", len(calls), exc)
+        warnings.append(f"transcription_failed:{exc}")
+        return []

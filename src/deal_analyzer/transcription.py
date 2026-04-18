@@ -50,7 +50,6 @@ def transcribe_call_evidence(
                 "transcript_created_at": "",
                 "transcript_cache_key": key,
             }
-            cache.set(key, fallback)
             out.append(fallback)
             continue
 

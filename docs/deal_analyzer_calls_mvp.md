@@ -76,6 +76,11 @@ Dedup ????:
 
 Analyzer ?????????? ???????? ??? ?????????????? normalized snapshot ? ?? ????? ? ????????? ????????.
 
+## Failure handling
+- `snapshot_builder` теперь error-tolerant: падение `enrich`, `roks`, `call collection` или `transcription` не валит сборку снапшота целиком.
+- При частичном сбое возвращается стабильная структура snapshot с `warnings` и безопасными fallback-данными (пустые calls/transcripts, `roks_context.ok=false`, enrichment status=`error` при необходимости).
+- Ошибки transcription backend больше не кешируются: `backend_error` возвращается только для текущей попытки, следующая попытка снова реально вызывает backend.
+
 ## CLI
 - `python -m src.deal_analyzer.cli --config config/deal_analyzer.local.json collect-calls --input <collector_json>`
 - `python -m src.deal_analyzer.cli --config config/deal_analyzer.local.json transcribe-deal --input <collector_deal_json>`

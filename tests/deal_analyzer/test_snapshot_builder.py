@@ -67,3 +67,63 @@ def test_build_period_snapshots_contract_and_manager_split():
     assert snap["deals_total"] == 2
     assert len(snap["items"]) == 2
     assert "roks_team_context" in snap
+
+
+def test_build_deal_snapshot_survives_enrich_failure():
+    row = {"deal_id": 10, "amo_lead_id": 10, "deal_name": "Demo"}
+    with patch("src.deal_analyzer.snapshot_builder.enrich_rows", side_effect=RuntimeError("enrich boom")), patch(
+        "src.deal_analyzer.snapshot_builder.extract_roks_snapshot"
+    ) as roks, patch("src.deal_analyzer.snapshot_builder.transcribe_call_evidence", return_value=[]):
+        roks.return_value.to_dict.return_value = {"ok": True}
+        snap = build_deal_snapshot(normalized_deal=row, config=_cfg(), logger=_Logger())
+    assert snap["crm"]["deal_id"] == 10
+    assert snap["crm"]["enrichment_match_status"] == "error"
+    assert any("enrichment_failed" in w for w in snap["warnings"])
+
+
+def test_build_deal_snapshot_survives_roks_failure():
+    row = {"deal_id": 11, "amo_lead_id": 11, "deal_name": "Demo"}
+    with patch("src.deal_analyzer.snapshot_builder.enrich_rows", return_value=[{**row, "enrichment_match_status": "none"}]), patch(
+        "src.deal_analyzer.snapshot_builder.extract_roks_snapshot", side_effect=RuntimeError("roks boom")
+    ), patch("src.deal_analyzer.snapshot_builder.transcribe_call_evidence", return_value=[]):
+        snap = build_deal_snapshot(normalized_deal=row, config=_cfg(), logger=_Logger())
+    assert snap["roks_context"]["ok"] is False
+    assert any("roks_failed" in w for w in snap["warnings"])
+
+
+def test_build_deal_snapshot_survives_call_collection_failure():
+    row = {"deal_id": 12, "amo_lead_id": 12, "deal_name": "Demo"}
+    with patch("src.deal_analyzer.snapshot_builder.enrich_rows", return_value=[{**row, "enrichment_match_status": "none"}]), patch(
+        "src.deal_analyzer.snapshot_builder.extract_roks_snapshot"
+    ) as roks, patch("src.deal_analyzer.snapshot_builder.CallDownloader") as downloader_cls, patch(
+        "src.deal_analyzer.snapshot_builder.transcribe_call_evidence", return_value=[]
+    ):
+        roks.return_value.to_dict.return_value = {"ok": True}
+        downloader_cls.return_value.collect_deal_calls.side_effect = RuntimeError("call boom")
+        snap = build_deal_snapshot(normalized_deal=row, config=_cfg(), logger=_Logger())
+    assert snap["call_evidence"]["items"] == []
+    assert snap["call_evidence"]["source_used"] == "error"
+    assert any("call_collection_failed" in w for w in snap["warnings"])
+
+
+def test_build_deal_snapshot_survives_transcription_failure():
+    row = {"deal_id": 13, "amo_lead_id": 13, "deal_name": "Demo"}
+    with patch("src.deal_analyzer.snapshot_builder.enrich_rows", return_value=[{**row, "enrichment_match_status": "none"}]), patch(
+        "src.deal_analyzer.snapshot_builder.extract_roks_snapshot"
+    ) as roks, patch("src.deal_analyzer.snapshot_builder.transcribe_call_evidence", side_effect=RuntimeError("tx boom")):
+        roks.return_value.to_dict.return_value = {"ok": True}
+        snap = build_deal_snapshot(normalized_deal=row, config=_cfg(), logger=_Logger())
+    assert snap["transcripts"] == []
+    assert any("transcription_failed" in w for w in snap["warnings"])
+
+
+def test_build_period_snapshots_survives_enrich_failure():
+    rows = [{"deal_id": 21, "amo_lead_id": 21, "responsible_user_name": "Илья"}]
+    with patch("src.deal_analyzer.snapshot_builder.enrich_rows", side_effect=RuntimeError("enrich boom")), patch(
+        "src.deal_analyzer.snapshot_builder.extract_roks_snapshot"
+    ) as roks, patch("src.deal_analyzer.snapshot_builder.transcribe_call_evidence", return_value=[]):
+        roks.return_value.to_dict.return_value = {"ok": True}
+        snap = build_period_snapshots(normalized_deals=rows, config=_cfg(), logger=_Logger())
+    assert snap["deals_total"] == 1
+    assert snap["items"][0]["crm"]["enrichment_match_status"] == "error"
+    assert any("enrichment_failed" in w for w in snap["warnings"])
