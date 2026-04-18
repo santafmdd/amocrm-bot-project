@@ -42,6 +42,13 @@ def _parse_args() -> argparse.Namespace:
     one = sub.add_parser("analyze-deal", help="Analyze one deal from collector JSON")
     one.add_argument("--input", required=True, help="Path to collector deal JSON")
 
+    analyze_snapshot = sub.add_parser(
+        "analyze-snapshot",
+        help="Vertical slice: build/use snapshot for one deal and save analysis JSON artifact",
+    )
+    analyze_snapshot.add_argument("--input", required=True, help="Path to collector JSON or prepared snapshot JSON")
+    analyze_snapshot.add_argument("--deal-id", default="", help="Deal identifier to select from period input")
+
     period = sub.add_parser("analyze-period", help="Analyze period payload from collector JSON")
     period.add_argument("--input", required=True, help="Path to collector period JSON")
     period.add_argument(
@@ -124,6 +131,18 @@ def main() -> None:
 
     if args.command == "analyze-deal":
         _run_analyze_deal(cfg, output_dir, payload, input_path.name, write_latest, logger)
+        return
+
+    if args.command == "analyze-snapshot":
+        _run_analyze_snapshot(
+            cfg,
+            output_dir,
+            payload,
+            input_path.name,
+            write_latest,
+            logger,
+            deal_id=str(getattr(args, "deal_id", "") or "").strip(),
+        )
         return
 
     if args.command == "analyze-period":
@@ -528,6 +547,88 @@ def _run_analyze_deal(
     )
 
 
+def _run_analyze_snapshot(
+    cfg: DealAnalyzerConfig,
+    output_dir: Path,
+    payload: dict[str, Any] | list[Any],
+    source_name: str,
+    write_latest: bool,
+    logger,
+    *,
+    deal_id: str,
+) -> None:
+    snapshot_source = "prepared_snapshot"
+    if deal_id:
+        normalized = _find_normalized_by_deal_id(payload, deal_id)
+        raw_bundle = _extract_raw_bundle_for_deal(payload, deal_id)
+        snapshot = build_deal_snapshot(normalized_deal=normalized, config=cfg, logger=logger, raw_bundle=raw_bundle)
+        snapshot_source = "built_from_deal_id"
+    else:
+        prepared_snapshot = _extract_prepared_snapshot(payload)
+        if prepared_snapshot is not None:
+            snapshot = prepared_snapshot
+        else:
+            normalized = _extract_single_normalized(payload)
+            raw_bundle = _extract_raw_bundle_for_deal(
+                payload,
+                str(normalized.get("deal_id") or normalized.get("amo_lead_id") or ""),
+            )
+            snapshot = build_deal_snapshot(normalized_deal=normalized, config=cfg, logger=logger, raw_bundle=raw_bundle)
+            snapshot_source = "built_from_single_input"
+
+    crm = snapshot.get("crm") if isinstance(snapshot, dict) and isinstance(snapshot.get("crm"), dict) else {}
+    if not crm:
+        raise RuntimeError("analyze-snapshot requires snapshot.crm payload")
+
+    analysis, llm_counts = _analyze_one_with_isolation(
+        crm,
+        cfg,
+        logger,
+        deal_hint=str(crm.get("deal_id") or crm.get("amo_lead_id") or "snapshot"),
+        backend_override=cfg.analyzer_backend,
+    )
+    executed_at = datetime.now(timezone.utc).isoformat()
+    metadata = AnalysisRunMetadata(
+        executed_at=executed_at,
+        period_mode_resolved="snapshot_single",
+        period_start="",
+        period_end="",
+        public_period_label="snapshot_single",
+        as_of_date=datetime.now().date().isoformat(),
+        llm_success_count=llm_counts["llm_success_count"],
+        llm_success_repaired_count=llm_counts["llm_success_repaired_count"],
+        llm_fallback_count=llm_counts["llm_fallback_count"],
+        llm_error_count=llm_counts["llm_error_count"],
+        backend_requested=cfg.analyzer_backend,
+        backend_effective_summary=_build_backend_effective_summary(llm_counts, cfg.analyzer_backend),
+    )
+    public_meta = _public_metadata(cfg, metadata)
+    export_payload = {
+        "command": "analyze-snapshot",
+        "source": source_name,
+        "snapshot_source": snapshot_source,
+        "backend_requested": cfg.analyzer_backend,
+        "backend_used": analysis.get("analysis_backend_used", ""),
+        "metadata": public_meta,
+        "snapshot": snapshot,
+        "analysis": analysis,
+    }
+    json_out = write_json_export(
+        output_dir=output_dir,
+        name="analyze_snapshot",
+        payload=export_payload,
+        write_latest=write_latest,
+    )
+    logger.info(
+        "analyze-snapshot success: source=%s backend_requested=%s backend_used=%s deal_id=%s json=%s",
+        snapshot_source,
+        cfg.analyzer_backend,
+        analysis.get("analysis_backend_used", ""),
+        analysis.get("deal_id"),
+        json_out.timestamped,
+    )
+
+
 def _run_analyze_period(
     cfg: DealAnalyzerConfig,
     output_dir: Path,
@@ -849,6 +950,37 @@ def _extract_period_normalized(payload: dict[str, Any] | list[Any]) -> list[dict
     if isinstance(payload, list):
         return [x for x in payload if isinstance(x, dict)]
     raise RuntimeError("analyze-period input does not contain normalized deals list")
+
+
+def _find_normalized_by_deal_id(payload: dict[str, Any] | list[Any], deal_id: str) -> dict[str, Any]:
+    wanted = str(deal_id).strip()
+    if not wanted:
+        raise RuntimeError("analyze-snapshot --deal-id is empty")
+    try:
+        rows = _extract_period_normalized(payload)
+    except RuntimeError:
+        rows = []
+    for row in rows:
+        if str(row.get("deal_id") or "").strip() == wanted or str(row.get("amo_lead_id") or "").strip() == wanted:
+            return row
+
+    one = _extract_single_normalized(payload)
+    if str(one.get("deal_id") or "").strip() == wanted or str(one.get("amo_lead_id") or "").strip() == wanted:
+        return one
+    raise RuntimeError(f"analyze-snapshot deal not found in input: deal_id={wanted}")
+
+
+def _extract_prepared_snapshot(payload: dict[str, Any] | list[Any]) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    snapshot = payload.get("snapshot")
+    if isinstance(snapshot, dict) and isinstance(snapshot.get("crm"), dict):
+        return snapshot
+    if isinstance(payload.get("crm"), dict) and (
+        "snapshot_generated_at" in payload or "call_evidence" in payload or "roks_context" in payload
+    ):
+        return payload
+    return None
 
 
 def _looks_like_normalized_row(payload: dict[str, Any]) -> bool:

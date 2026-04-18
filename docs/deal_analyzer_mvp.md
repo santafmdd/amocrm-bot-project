@@ -131,6 +131,36 @@ Analyze period:
 python -m src.deal_analyzer.cli --config config/deal_analyzer.local.json analyze-period --period-mode previous_workweek --input workspace/amocrm_collector/collect_period_2026-04-01_2026-04-07_latest.json
 ```
 
+## Vertical Slice: Snapshot -> Analysis -> JSON
+Минимальный сценарий для одной сделки/снапшота:
+
+1. Получить prepared snapshot (например, из `build-call-snapshot`) **или** взять collector input и указать `--deal-id`.
+2. Запустить:
+
+```powershell
+python -m src.deal_analyzer.cli --config config/deal_analyzer.local.json analyze-snapshot --input workspace/deal_analyzer/call_snapshot_deal_latest.json
+```
+
+или
+
+```powershell
+python -m src.deal_analyzer.cli --config config/deal_analyzer.local.json analyze-snapshot --input workspace/amocrm_collector/collect_period_2026-04-01_2026-04-07_latest.json --deal-id 31913530
+```
+
+Результат:
+- JSON artifact в `workspace/deal_analyzer/analyze_snapshot_<timestamp>.json`;
+- latest copy: `workspace/deal_analyzer/analyze_snapshot_latest.json` (если не задан `--no-latest`);
+- в логе фиксируется `backend_requested` и фактический `analysis_backend_used`.
+
+Покрыто сейчас:
+- стабильный snapshot (включая partial warnings);
+- запуск текущего backend (`rules`/`ollama`) поверх `snapshot.crm`;
+- сохранение итогового JSON.
+
+Пока не покрыто:
+- запись результата в Google Sheets;
+- UI/оркестрация внешних запусков.
+
 ## Notes
 - Enrichment is read-only (no write-back to Google Sheets).
 - Weekly/refusals/analytics writer flows are untouched.
