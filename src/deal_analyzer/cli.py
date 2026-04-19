@@ -706,6 +706,12 @@ def _run_analyze_period(
         resolved.period_end.isoformat(),
         resolved.as_of_date.isoformat(),
     )
+    logger.info(
+        "call collection mode effective: mode=%s call_backend=%s transcription_backend=%s",
+        cfg.call_collection_mode,
+        cfg.call_backend,
+        cfg.transcription_backend,
+    )
 
     preflight_forced_rules = False
     effective_backend = cfg.analyzer_backend
@@ -855,6 +861,82 @@ def _run_analyze_period(
                     "call_signal_objection_not_target": bool(analysis.get("call_signal_objection_not_target")),
                     "call_signal_next_step_present": bool(analysis.get("call_signal_next_step_present")),
                     "call_signal_decision_maker_reached": bool(analysis.get("call_signal_decision_maker_reached")),
+                    "call_source_used": str(snapshot.get("call_evidence", {}).get("source_used", ""))
+                    if isinstance(snapshot.get("call_evidence"), dict)
+                    else "",
+                    "call_candidates_count": len(snapshot.get("call_evidence", {}).get("items", []))
+                    if isinstance(snapshot.get("call_evidence"), dict)
+                    and isinstance(snapshot.get("call_evidence", {}).get("items"), list)
+                    else 0,
+                    "recording_url_count": sum(
+                        1
+                        for call in (
+                            snapshot.get("call_evidence", {}).get("items", [])
+                            if isinstance(snapshot.get("call_evidence"), dict)
+                            and isinstance(snapshot.get("call_evidence", {}).get("items"), list)
+                            else []
+                        )
+                        if isinstance(call, dict) and str(call.get("recording_url") or "").strip()
+                    ),
+                    "audio_downloaded_count": sum(
+                        1
+                        for call in (
+                            snapshot.get("call_evidence", {}).get("items", [])
+                            if isinstance(snapshot.get("call_evidence"), dict)
+                            and isinstance(snapshot.get("call_evidence", {}).get("items"), list)
+                            else []
+                        )
+                        if isinstance(call, dict) and str(call.get("audio_download_status") or "").strip().lower() == "downloaded"
+                    ),
+                    "audio_cached_count": sum(
+                        1
+                        for call in (
+                            snapshot.get("call_evidence", {}).get("items", [])
+                            if isinstance(snapshot.get("call_evidence"), dict)
+                            and isinstance(snapshot.get("call_evidence", {}).get("items"), list)
+                            else []
+                        )
+                        if isinstance(call, dict)
+                        and str(call.get("audio_download_status") or "").strip().lower() in {"cached", "local_exists", "resolved_file_url"}
+                    ),
+                    "audio_failed_count": sum(
+                        1
+                        for call in (
+                            snapshot.get("call_evidence", {}).get("items", [])
+                            if isinstance(snapshot.get("call_evidence"), dict)
+                            and isinstance(snapshot.get("call_evidence", {}).get("items"), list)
+                            else []
+                        )
+                        if isinstance(call, dict) and str(call.get("audio_download_status") or "").strip().lower() == "failed"
+                    ),
+                    "transcription_attempted_count": sum(
+                        1
+                        for t in (
+                            snapshot.get("transcripts", [])
+                            if isinstance(snapshot.get("transcripts"), list)
+                            else []
+                        )
+                        if isinstance(t, dict) and str(t.get("transcript_status") or "").strip().lower() != "disabled"
+                    ),
+                    "transcription_success_count": sum(
+                        1
+                        for t in (
+                            snapshot.get("transcripts", [])
+                            if isinstance(snapshot.get("transcripts"), list)
+                            else []
+                        )
+                        if isinstance(t, dict) and str(t.get("transcript_status") or "").strip().lower() in {"ok", "cached"}
+                    ),
+                    "transcription_failed_count": sum(
+                        1
+                        for t in (
+                            snapshot.get("transcripts", [])
+                            if isinstance(snapshot.get("transcripts"), list)
+                            else []
+                        )
+                        if isinstance(t, dict)
+                        and str(t.get("transcript_status") or "").strip().lower() not in {"ok", "cached", "disabled"}
+                    ),
                     "call_evidence_items_count": len(snapshot.get("call_evidence", {}).get("items", []))
                     if isinstance(snapshot.get("call_evidence"), dict)
                     and isinstance(snapshot.get("call_evidence", {}).get("items"), list)
@@ -946,6 +1028,15 @@ def _run_analyze_period(
                     "call_signal_objection_not_target": False,
                     "call_signal_next_step_present": False,
                     "call_signal_decision_maker_reached": False,
+                    "call_source_used": "analysis_failed",
+                    "call_candidates_count": 0,
+                    "recording_url_count": 0,
+                    "audio_downloaded_count": 0,
+                    "audio_cached_count": 0,
+                    "audio_failed_count": 0,
+                    "transcription_attempted_count": 0,
+                    "transcription_success_count": 0,
+                    "transcription_failed_count": 0,
                     "call_evidence_items_count": 0,
                     "call_evidence_calls_total": 0,
                     "has_audio_path": False,
@@ -997,6 +1088,7 @@ def _run_analyze_period(
     summary_payload = _build_period_run_summary(
         run_started_at=run_started_at,
         backend_requested=cfg.analyzer_backend,
+        call_collection_mode=cfg.call_collection_mode,
         analyses=analyses,
         deal_artifact_paths=deal_artifact_paths,
         total_deals_seen=len(normalized_rows_all),
@@ -1007,6 +1099,19 @@ def _run_analyze_period(
     )
     summary_path = run_dir / "summary.json"
     _write_json_path(summary_path, summary_payload)
+    call_diag = summary_payload.get("call_runtime_diagnostics", {}) if isinstance(summary_payload.get("call_runtime_diagnostics"), dict) else {}
+    logger.info(
+        "call runtime diagnostics: mode=%s deals_with_call_candidates=%s deals_with_recording_url=%s audio_downloaded=%s audio_cached=%s audio_failed=%s transcription_attempted=%s transcription_success=%s transcription_failed=%s",
+        call_diag.get("call_collection_mode_effective", cfg.call_collection_mode),
+        call_diag.get("deals_with_call_candidates", 0),
+        call_diag.get("deals_with_recording_url", 0),
+        call_diag.get("audio_downloaded", 0),
+        call_diag.get("audio_cached", 0),
+        call_diag.get("audio_failed", 0),
+        call_diag.get("transcription_attempted", 0),
+        call_diag.get("transcription_success", 0),
+        call_diag.get("transcription_failed", 0),
+    )
     top_risks_payload = _build_top_risks_payload(period_deal_records=period_deal_records)
     top_risks_path = run_dir / "top_risks.json"
     _write_json_path(top_risks_path, top_risks_payload)
@@ -1677,6 +1782,7 @@ def _build_period_run_summary(
     *,
     run_started_at: datetime,
     backend_requested: str,
+    call_collection_mode: str,
     analyses: list[dict[str, Any]],
     deal_artifact_paths: list[str],
     total_deals_seen: int,
@@ -1712,6 +1818,10 @@ def _build_period_run_summary(
     llm_overlay_deals = sum(1 for item in analyses if _llm_overlay_fields_filled(item))
     call_aggregates = build_call_signal_aggregates(period_deal_records)
     transcript_runtime_diagnostics = _build_transcript_runtime_diagnostics(period_deal_records)
+    call_runtime_diagnostics = _build_call_runtime_diagnostics(
+        period_deal_records,
+        call_collection_mode=call_collection_mode,
+    )
     return {
         "run_timestamp": run_started_at.isoformat(),
         "backend_requested": backend_requested,
@@ -1733,6 +1843,7 @@ def _build_period_run_summary(
         "llm_overlay_deals": llm_overlay_deals,
         "call_signal_aggregates": call_aggregates,
         "transcript_runtime_diagnostics": transcript_runtime_diagnostics,
+        "call_runtime_diagnostics": call_runtime_diagnostics,
     }
 
 
@@ -1760,6 +1871,30 @@ def _build_transcript_runtime_diagnostics(period_deal_records: list[dict[str, An
         "deals_with_nonempty_call_signal_summary": deals_with_nonempty_call_signal_summary,
         "deals_with_transcription_error": deals_with_transcription_error,
         "transcript_layer_effective": transcript_layer_effective,
+    }
+
+
+def _build_call_runtime_diagnostics(
+    period_deal_records: list[dict[str, Any]],
+    *,
+    call_collection_mode: str,
+) -> dict[str, Any]:
+    deals = [x for x in period_deal_records if isinstance(x, dict)]
+    mode_counter: Counter[str] = Counter(
+        str(x.get("call_source_used") or "").strip().lower() or "unknown"
+        for x in deals
+    )
+    return {
+        "call_collection_mode_effective": str(call_collection_mode or "").strip().lower() or "unknown",
+        "call_source_used_counts": dict(mode_counter),
+        "deals_with_call_candidates": sum(1 for x in deals if int(x.get("call_candidates_count", 0) or 0) > 0),
+        "deals_with_recording_url": sum(1 for x in deals if int(x.get("recording_url_count", 0) or 0) > 0),
+        "audio_downloaded": sum(int(x.get("audio_downloaded_count", 0) or 0) for x in deals),
+        "audio_cached": sum(int(x.get("audio_cached_count", 0) or 0) for x in deals),
+        "audio_failed": sum(int(x.get("audio_failed_count", 0) or 0) for x in deals),
+        "transcription_attempted": sum(int(x.get("transcription_attempted_count", 0) or 0) for x in deals),
+        "transcription_success": sum(int(x.get("transcription_success_count", 0) or 0) for x in deals),
+        "transcription_failed": sum(int(x.get("transcription_failed_count", 0) or 0) for x in deals),
     }
 
 
@@ -1843,6 +1978,17 @@ def _build_period_summary_markdown(*, summary: dict[str, Any], period_deal_recor
         lines.append("- Вывод: транскрибация реально участвует в анализе.")
     else:
         lines.append("- Вывод: в этом запуске транскрибация фактически не повлияла на анализ.")
+    lines.append("")
+    call_diag = summary.get("call_runtime_diagnostics", {}) if isinstance(summary.get("call_runtime_diagnostics"), dict) else {}
+    lines.append("## E2E проверка звонков")
+    lines.append(f"- Найдено звонков: {call_diag.get('deals_with_call_candidates', 0)} сделок-кандидатов")
+    lines.append(f"- Найдено записей: {call_diag.get('deals_with_recording_url', 0)} сделок с recording_url")
+    lines.append(f"- Скачано: {call_diag.get('audio_downloaded', 0)}")
+    lines.append(f"- Расшифровано: {call_diag.get('transcription_success', 0)}")
+    if int(call_diag.get("transcription_success", 0) or 0) > 0:
+        lines.append("- Итог: call-layer реально работает.")
+    else:
+        lines.append("- Итог: call-layer не дошел до транскрипции.")
     lines.append("")
     lines.append("## Run Info")
     lines.append(f"- Backend requested: {summary.get('backend_requested', '')}")

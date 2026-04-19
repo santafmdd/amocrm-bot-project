@@ -167,7 +167,18 @@ def test_analyze_period_creates_run_dir_and_summary_json():
     assert "analysis_confidence_counts" in summary
     assert "owner_ambiguity_deals" in summary
     assert "call_signal_aggregates" in summary
+    assert "call_runtime_diagnostics" in summary
     assert "transcript_runtime_diagnostics" in summary
+    call_diag = summary["call_runtime_diagnostics"]
+    assert "call_collection_mode_effective" in call_diag
+    assert "deals_with_call_candidates" in call_diag
+    assert "deals_with_recording_url" in call_diag
+    assert "audio_downloaded" in call_diag
+    assert "audio_cached" in call_diag
+    assert "audio_failed" in call_diag
+    assert "transcription_attempted" in call_diag
+    assert "transcription_success" in call_diag
+    assert "transcription_failed" in call_diag
     tx_diag = summary["transcript_runtime_diagnostics"]
     assert "deals_with_any_call_evidence" in tx_diag
     assert "deals_with_audio_path" in tx_diag
@@ -184,6 +195,7 @@ def test_analyze_period_creates_run_dir_and_summary_json():
     assert "## Data Quality / Interpretation Confidence" in md
     assert "## Call-Aware Signals" in md
     assert "## Проверка транскрибации" in md
+    assert "## E2E проверка звонков" in md
     assert "## Weekly Meeting Focus" in md
     assert "### Что просело сильнее всего" in md
     assert "### Что можно исправить за 1 неделю" in md
@@ -338,6 +350,91 @@ def test_analyze_period_partial_snapshot_warnings_do_not_fail_batch():
     assert any(item.get("warnings") for item in top_risks)
     assert "[warnings]" in md
     assert "snapshot" in brief.lower()
+
+
+def test_call_runtime_diagnostics_pipeline_stays_alive_on_audio_and_transcription_failures():
+    output_dir = _fresh_output_dir("period_batch_call_runtime_failures")
+    payload = {"normalized_deals": [{"deal_id": 1}, {"deal_id": 2}]}
+    logger = _Logger()
+
+    def _fake_snapshot(*, normalized_deal, config, logger, raw_bundle):
+        deal_id = int(normalized_deal["deal_id"])
+        if deal_id == 1:
+            return {
+                "snapshot_generated_at": "2026-04-18T12:00:00+00:00",
+                "crm": {"deal_id": 1, "amo_lead_id": 1, "deal_name": "Deal 1", "status_name": "В работе"},
+                "warnings": [],
+                "call_evidence": {
+                    "source_used": "api_first",
+                    "warnings": [],
+                    "items": [
+                        {
+                            "call_id": "c1",
+                            "deal_id": "1",
+                            "recording_url": "https://example.test/r1.mp3",
+                            "audio_path": "",
+                            "audio_download_status": "failed",
+                        }
+                    ],
+                    "summary": {"calls_total": 1},
+                },
+                "transcripts": [
+                    {"call_id": "c1", "transcript_status": "backend_error", "transcript_text": "", "transcript_error": "boom"}
+                ],
+                "roks_context": {"ok": True},
+            }
+        return {
+            "snapshot_generated_at": "2026-04-18T12:00:00+00:00",
+            "crm": {"deal_id": 2, "amo_lead_id": 2, "deal_name": "Deal 2", "status_name": "В работе"},
+            "warnings": [],
+            "call_evidence": {
+                "source_used": "api_first",
+                "warnings": [],
+                "items": [
+                    {
+                        "call_id": "c2",
+                        "deal_id": "2",
+                        "recording_url": "https://example.test/r2.mp3",
+                        "audio_path": "D:/tmp/audio2.mp3",
+                        "audio_download_status": "downloaded",
+                    }
+                ],
+                "summary": {"calls_total": 1},
+            },
+            "transcripts": [
+                {"call_id": "c2", "transcript_status": "ok", "transcript_text": "Короткий транскрипт", "transcript_error": ""}
+            ],
+            "roks_context": {"ok": True},
+        }
+
+    with patch("src.deal_analyzer.cli.build_deal_snapshot", side_effect=_fake_snapshot), patch(
+        "src.deal_analyzer.cli._analyze_one_with_isolation",
+        side_effect=lambda normalized, cfg, logger, *, deal_hint, backend_override: _analysis_for_deal(int(normalized["deal_id"]), score=55),
+    ):
+        _run_analyze_period(
+            _cfg(),
+            output_dir,
+            payload,
+            "period.json",
+            True,
+            logger,
+            period_mode=None,
+            date_from=None,
+            date_to=None,
+            limit=None,
+        )
+
+    run_dir = next((output_dir / "period_runs").iterdir())
+    summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    call_diag = summary["call_runtime_diagnostics"]
+    assert summary["deals_failed"] == 0
+    assert call_diag["deals_with_call_candidates"] == 2
+    assert call_diag["deals_with_recording_url"] == 2
+    assert call_diag["audio_downloaded"] == 1
+    assert call_diag["audio_failed"] == 1
+    assert call_diag["transcription_attempted"] == 2
+    assert call_diag["transcription_success"] == 1
+    assert call_diag["transcription_failed"] == 1
 
 
 def test_analyze_period_summary_counts_failed_deals():

@@ -60,7 +60,7 @@ class DealAnalyzerConfig:
     transcription_language: str = ""
     transcription_timeout_seconds: int = 60
     transcription_cache_dir: str = "workspace/deal_analyzer/transcripts_cache"
-    call_collection_mode: str = "disabled"
+    call_collection_mode: str = "api_first"
     call_backend: str = "amocrm_api"
     amocrm_auth_config_path: str = ""
     call_base_domain: str = ""
@@ -210,7 +210,7 @@ def load_deal_analyzer_config(config_path: str | None = None) -> DealAnalyzerCon
         raw.get("transcription_cache_dir", "workspace/deal_analyzer/transcripts_cache")
     ).strip() or "workspace/deal_analyzer/transcripts_cache"
 
-    call_collection_mode = str(raw.get("call_collection_mode", "disabled")).strip().lower() or "disabled"
+    call_collection_mode = str(raw.get("call_collection_mode", "api_first")).strip().lower() or "api_first"
     if call_collection_mode not in {"disabled", "api_first", "api_only", "raw_fallback", "raw_only"}:
         raise RuntimeError(
             "Unsupported call_collection_mode="
