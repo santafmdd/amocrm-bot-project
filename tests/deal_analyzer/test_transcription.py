@@ -7,6 +7,9 @@ from src.deal_analyzer.transcription import transcribe_call_evidence
 
 
 class _Logger:
+    def info(self, *_args, **_kwargs):
+        return None
+
     def warning(self, *_args, **_kwargs):
         return None
 

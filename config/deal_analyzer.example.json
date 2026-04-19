@@ -62,9 +62,13 @@
   "roks_sheet_candidates": [
     "???? 2026"
   ],
-  "transcription_backend": "disabled",
+  "transcription_backend": "faster_whisper",
   "transcription_base_url": "",
   "transcription_model": "",
+  "whisper_model_name": "whisper-large-v3-turbo",
+  "whisper_device": "auto",
+  "whisper_compute_type": "auto",
+  "transcription_language": "",
   "transcription_timeout_seconds": 60,
   "transcription_cache_dir": "workspace/deal_analyzer/transcripts_cache",
   "call_collection_mode": "disabled",

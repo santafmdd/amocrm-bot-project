@@ -33,6 +33,26 @@ Flow:
 
 This keeps period runs stable while still adding optional short insights when LLM response is valid.
 
+### Narrow LLM Overlay (current practical mode)
+LLM используется как узкий semantic-overlay поверх rules, не как замена deterministic анализа.
+
+Rules остаются источником истины для:
+- `score_0_100`
+- `risk_flags`
+- `data_quality_flags`
+- `owner_ambiguity_flag`
+- `analysis_confidence`
+- queue category (`why_in_queue`)
+
+LLM overlay заполняет только короткие поля:
+- `product_hypothesis_llm`
+- `loss_reason_short`
+- `manager_insight_short`
+- `coaching_hint_short`
+- `reanimation_reason_short_llm`
+
+Если LLM недоступна/ошибается, run не падает и остается rules-only fallback.
+
 ## Ollama Reliability: Preflight + Repair + Fallback
 For `analyze-period` with `analyzer_backend=ollama`:
 - CLI runs a short preflight probe (`/api/chat`, small JSON payload).
@@ -159,6 +179,12 @@ python -m src.deal_analyzer.cli --config config/deal_analyzer.local.json analyze
 python -m src.deal_analyzer.cli --config config/deal_analyzer.local.json analyze-period --input workspace/amocrm_collector/collect_period_2026-04-01_2026-04-07_latest.json --limit 20
 ```
 
+Фильтры очереди обсуждения (применяются после построения per-deal analysis records):
+
+```powershell
+python -m src.deal_analyzer.cli --config config/deal_analyzer.local.json analyze-period --input workspace/amocrm_collector/collect_period_2026-04-01_2026-04-07_latest.json --limit 20 --owner-contains "Илья" --product-contains "ИНФО" --status-contains "В работе" --exclude-low-confidence --discussion-limit 10
+```
+
 ### Period artifacts
 `analyze-period` теперь дополнительно создает batch run-папку:
 - `workspace/deal_analyzer/period_runs/<run_timestamp>/deals/deal_<id>.json` — per-deal snapshot+analysis artifacts;
@@ -166,6 +192,51 @@ python -m src.deal_analyzer.cli --config config/deal_analyzer.local.json analyze
 - `workspace/deal_analyzer/period_runs/<run_timestamp>/summary.md` — человекочитаемый итог run.
 - `workspace/deal_analyzer/period_runs/<run_timestamp>/top_risks.json` — быстрый риск-лист по сделкам.
 - `workspace/deal_analyzer/period_runs/<run_timestamp>/manager_brief.md` — короткий управленческий бриф для быстрого чтения.
+- `workspace/deal_analyzer/period_runs/<run_timestamp>/meeting_queue.json` — queue для обсуждения на встрече (с фильтрами/приоритетом).
+- `workspace/deal_analyzer/period_runs/<run_timestamp>/meeting_queue.md` — человекочитаемый meeting queue.
+
+Категории queue (`why_in_queue`):
+- `active_risk` — живой риск по активной сделке.
+- `won_handoff_check` — проверка передачи выигранной сделки.
+- `low_confidence_needs_manual_check` — ручная проверка из-за низкой надежности интерпретации/owner ambiguity.
+- `qualified_loss_for_pattern_review` — паттерн осознанной потери для разбора.
+- `closed_lost_cleanup_review` — закрытая потеря без qualified-loss, требующая closeout/cleanup разбора.
+
+Deterministic порядок queue:
+1. `active_risk`
+2. `won_handoff_check`
+3. `low_confidence_needs_manual_check`
+4. `qualified_loss_for_pattern_review`
+5. `closed_lost_cleanup_review`
+
+Человекочитаемая версия причины для операционного экспорта:
+- `why_in_queue_human` — текст для таблицы/разбора на встрече;
+- `why_in_queue` — технический код категории (оставлен для диагностики и фильтров).
+
+Reanimation layer для closed-lost (отдельно от queue category):
+- `reanimation_potential`: `none|low|medium|high`
+- `reanimation_reason_short`
+- `reanimation_next_step`
+- `reanimation_risk_note`
+
+Важно:
+- `why_in_queue` отвечает, почему кейс попал в очередь разбора.
+- reanimation-поля отвечают, есть ли смысл пытаться вернуть closed-lost кейс.
+- reanimation не меняет queue category напрямую.
+
+### Product Hypothesis Layer
+`product_name` (CRM факт) не заменяется и не перетирается.
+
+Отдельно в per-deal/queue артефактах добавляется гипотеза продукта:
+- `product_hypothesis`: `info|link|mixed|unknown`
+- `product_hypothesis_confidence`: `low|medium|high`
+- `product_hypothesis_sources`: список источников сигналов
+- `product_hypothesis_reason_short`: короткое объяснение
+
+Разница:
+- `CRM product` = то, что явно заполнено в CRM.
+- `product hypothesis` = best-effort интерпретация по совокупности сигналов (звонки/notes/tasks/tags/raw values/status).
+- `hypothesis confidence` = уверенность в гипотезе с понижением при low-confidence/owner-ambiguity кейсах.
 
 `summary.json` включает:
 - `run_timestamp`
@@ -177,6 +248,18 @@ python -m src.deal_analyzer.cli --config config/deal_analyzer.local.json analyze
 - `artifact_paths`
 - `score_aggregates` (`min/max/avg`)
 - `risk_flags_counts`
+- `transcript_runtime_diagnostics`:
+  - `deals_with_any_call_evidence`
+  - `deals_with_audio_path`
+  - `deals_with_transcript_text`
+  - `deals_with_transcript_excerpt`
+  - `deals_with_nonempty_call_signal_summary`
+  - `deals_with_transcription_error`
+  - `transcript_layer_effective`
+
+Как понять, что транскрибация реально участвовала в run:
+- `transcript_layer_effective=true`, и/или
+- в `summary.md`/`manager_brief.md` в секции `Проверка транскрибации` значение “Сделок реально дали смысл в анализе” больше нуля.
 
 `summary.md` — это операторский markdown-срез с ключевыми секциями:
 - run info;
@@ -195,6 +278,24 @@ python -m src.deal_analyzer.cli --config config/deal_analyzer.local.json analyze
 - 5 сделок внимания,
 - 5 сделок с лучшим потенциалом,
 - короткий блок "что делать дальше".
+
+## Weekly management layer
+Новый CLI-сценарий:
+
+```powershell
+python -m src.deal_analyzer.cli --config config/deal_analyzer.local.json analyze-weekly --input workspace/amocrm_collector/collect_period_2026-04-01_2026-04-07_latest.json --limit 10
+```
+
+Создает в `workspace/deal_analyzer/weekly_runs/<timestamp>/`:
+- `rustam_weekly.md` — недельная сводка по Рустаму (ранние этапы: ЛПР/квалификация/встреча);
+- `ilya_weekly.md` — недельная сводка по Илье (демо/тест/follow-up/счет/оплата);
+- `weekly_meeting_brief.md` — общий brief руководителя на weekly встречу;
+- `next_week_plan.md` — заготовка плана Monday-Friday;
+- `summary.json` — техническая сводка запуска (counts, backend, llm metrics, output paths).
+
+Guardrails сохраняются:
+- low-confidence / owner-ambiguity кейсы не используются для жестких персональных выводов;
+- quality limits явно выносятся в weekly markdown-артефакты.
 
 ### Rules quality slice (latest)
 - Rules scoring теперь учитывает не только demo/brief, но и контекст из CRM: notes/tasks/tags, контактные и company-данные, long-call сигналы.
@@ -256,4 +357,68 @@ python -m src.deal_analyzer.cli --config config/deal_analyzer.local.json analyze
   - no accusatory assumptions about manager inactivity;
   - focus on fact restoration, owner attribution check, and CRM cleanup.
 - Artifacts expose these markers in per-deal JSON and period markdown/csv outputs.
+
+### Weekly Meeting readability (manager artifacts)
+- `manager_brief.md` and `summary.md` now include explicit short sections for weekly review:
+  - **что просело сильнее всего** (top drop signals from risk patterns),
+  - **что можно исправить за 1 неделю** (short operational fixes),
+  - **что нельзя интерпретировать уверенно из-за качества CRM** (low-confidence / owner ambiguity / closed-lost noise).
+- These sections are advisory and avoid accusatory language when confidence is low.
+
+## Minimal transcript-aware analysis layer
+- Добавлен практичный MVP-слой сигналов из транскрипта звонка (keyword/phrase heuristics, без тяжелого NLP).
+- Новые поля в analysis/per-deal:
+  - `transcript_available`
+  - `transcript_text_excerpt`
+  - `call_signal_product_info`
+  - `call_signal_product_link`
+  - `call_signal_demo_discussed`
+  - `call_signal_test_discussed`
+  - `call_signal_budget_discussed`
+  - `call_signal_followup_discussed`
+  - `call_signal_objection_price`
+  - `call_signal_objection_no_need`
+  - `call_signal_objection_not_target`
+  - `call_signal_next_step_present`
+  - `call_signal_decision_maker_reached`
+- Если транскрипта нет, run не падает: `transcript_available=false`, сигналы пустые.
+- В markdown-артефактах добавлен call-aware срез:
+  - `summary.md` / `manager_brief.md` / `weekly_meeting_brief.md` — агрегаты по call-сигналам;
+  - `meeting_queue.md` — короткая строка “По звонку видно: ...” для кейсов с транскриптом.
+- Guardrails сохраняются: call-сигналы не заменяют deterministic score/risk/queue слой и не отменяют data-quality/owner-ambiguity ограничения.
+
+## Local speech-to-text via faster-whisper
+- Добавлен локальный backend `transcription_backend=faster_whisper`.
+- Дефолтная модель: `whisper-large-v3-turbo` (можно переключить на `whisper-large-v3` через `whisper_model_name`).
+- Новые настройки в конфиге:
+  - `whisper_model_name`
+  - `whisper_device` (`auto|cuda|cpu`)
+  - `whisper_compute_type` (`auto|...`)
+  - `transcription_language` (optional, например `ru`)
+- В analysis/per-deal артефактах дополнительно:
+  - `transcript_source`
+  - `transcript_error`
+- Если локальный audio path отсутствует или backend недоступен, pipeline не падает: возвращается controlled status, а анализ продолжает работать в прежнем режиме.
+
+Практическая установка и проверка:
+- Установка:
+  - `python -m pip install faster-whisper`
+- Проверка импорта:
+  - `python -c "import faster_whisper; print('ok', faster_whisper.__version__)"`
+- Если в конфиге выбран `transcription_backend=faster_whisper`, но пакет не установлен, в логах будет warning:
+  - `faster-whisper is not installed or unavailable; transcription backend will run with controlled fallback`
+  - run при этом не падает.
+
+### Automatic call recording download (audio cache)
+- Для call evidence добавлен авто-resolve аудио:
+  - если `audio_path` уже есть и файл существует -> используется как есть;
+  - иначе при наличии `recording_url` делается авто-скачивание в `workspace/deal_analyzer/audio_cache`;
+  - имя файла детерминированное: `deal_<id>__call_<id>__<url_hash>.<ext>`.
+- В call evidence сохраняются:
+  - `audio_path`
+  - `audio_source_url`
+  - `audio_download_status` (`local_exists|cached|downloaded|missing_url|failed|resolved_file_url`)
+  - `audio_download_error` (если download не удался)
+- Повторные прогоны используют cached audio и не скачивают повторно.
+- Ошибка download не валит run: транскрибация по такому звонку безопасно пропускается через текущий fallback.
 

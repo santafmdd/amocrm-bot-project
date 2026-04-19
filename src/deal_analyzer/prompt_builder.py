@@ -14,7 +14,7 @@ REPAIR_JSON_INSTRUCTION = (
 
 HYBRID_SHORT_JSON_INSTRUCTION = (
     "Верни только валидный JSON-объект без markdown/комментариев/объяснений. "
-    "Ровно поля: loss_reason_short, manager_insight_short, coaching_hint_short."
+    "Ровно поля: product_hypothesis_llm, loss_reason_short, manager_insight_short, coaching_hint_short, reanimation_reason_short_llm."
 )
 
 
@@ -74,7 +74,9 @@ def build_hybrid_short_messages(*, normalized_deal: dict[str, Any], config: Deal
         "Ты помогаешь с коротким уточнением анализа сделки. "
         "Не выдумывай факты, используй только входные данные. "
         "Нужен строго JSON без markdown и текста вокруг. "
-        "Разрешены только ключи: loss_reason_short, manager_insight_short, coaching_hint_short. "
+        "Разрешены только ключи: product_hypothesis_llm, loss_reason_short, manager_insight_short, coaching_hint_short, reanimation_reason_short_llm. "
+        "product_hypothesis_llm: одно из info|link|mixed|unknown. "
+        "Если данных мало/противоречиво, ставь unknown и коротко укажи ограничение в manager_insight_short. "
         "Каждое поле: короткая строка до 180 символов. "
         f"Профиль стиля: {config.style_profile_name}."
     )

@@ -8,9 +8,7 @@ from .llm_client import OllamaClient, OllamaClientError
 from .models import DealAnalysis
 from .prompt_builder import (
     append_hybrid_json_repair_instruction,
-    append_json_repair_instruction,
     build_hybrid_short_messages,
-    build_ollama_chat_messages,
 )
 from .rules import analyze_deal
 
@@ -39,22 +37,24 @@ def analyze_deal_with_ollama_outcome(
     config: DealAnalyzerConfig,
     client: OllamaClient | None = None,
 ) -> LlmAnalysisOutcome:
-    baseline = analyze_deal(normalized_deal, config)
+    baseline = analyze_deal(normalized_deal, config).to_dict()
     ollama = client or OllamaClient(
         base_url=config.ollama_base_url,
         model=config.ollama_model,
         timeout_seconds=config.ollama_timeout_seconds,
     )
 
-    base_messages = build_ollama_chat_messages(normalized_deal=normalized_deal, config=config)
+    base_messages = build_hybrid_short_messages(normalized_deal=normalized_deal, config=config)
 
     first_error: OllamaClientError | None = None
     try:
         parsed = ollama.chat_json(messages=base_messages)
-        merged = _merge_with_baseline(baseline.to_dict(), parsed.payload)
+        merged = _merge_narrow_overlay_fields(base=baseline, llm_payload=parsed.payload, normalized_deal=normalized_deal)
         merged["analysis_backend_requested"] = config.analyzer_backend
         merged["analysis_backend_used"] = "ollama"
         merged["llm_repair_applied"] = bool(parsed.repair_applied)
+        merged["llm_error"] = False
+        merged["llm_fallback"] = False
         return LlmAnalysisOutcome(
             analysis=DealAnalysis(**merged),
             backend_used="ollama",
@@ -65,13 +65,15 @@ def analyze_deal_with_ollama_outcome(
     except OllamaClientError as exc:
         first_error = exc
 
-    repair_messages = append_json_repair_instruction(base_messages)
+    repair_messages = append_hybrid_json_repair_instruction(base_messages)
     try:
         parsed = ollama.chat_json(messages=repair_messages)
-        merged = _merge_with_baseline(baseline.to_dict(), parsed.payload)
+        merged = _merge_narrow_overlay_fields(base=baseline, llm_payload=parsed.payload, normalized_deal=normalized_deal)
         merged["analysis_backend_requested"] = config.analyzer_backend
         merged["analysis_backend_used"] = "ollama"
         merged["llm_repair_applied"] = True
+        merged["llm_error"] = False
+        merged["llm_fallback"] = False
         return LlmAnalysisOutcome(
             analysis=DealAnalysis(**merged),
             backend_used="ollama",
@@ -84,10 +86,12 @@ def analyze_deal_with_ollama_outcome(
             "Ollama failed after retry. "
             f"first={first_error}; second={second}"
         )
-        fallback = baseline.to_dict()
+        fallback = dict(baseline)
         fallback["analysis_backend_requested"] = config.analyzer_backend
         fallback["analysis_backend_used"] = "rules_fallback"
         fallback["llm_repair_applied"] = False
+        fallback["llm_error"] = True
+        fallback["llm_fallback"] = True
         return LlmAnalysisOutcome(
             analysis=DealAnalysis(**fallback),
             backend_used="rules_fallback",
@@ -114,7 +118,7 @@ def analyze_deal_with_hybrid_outcome(
     first_error: OllamaClientError | None = None
     try:
         parsed = ollama.chat_json(messages=base_messages)
-        merged = _merge_hybrid_short_fields(baseline, parsed.payload)
+        merged = _merge_narrow_overlay_fields(base=baseline, llm_payload=parsed.payload, normalized_deal=normalized_deal)
         merged["analysis_backend_requested"] = config.analyzer_backend
         merged["analysis_backend_used"] = "hybrid"
         merged["llm_repair_applied"] = bool(parsed.repair_applied)
@@ -133,7 +137,7 @@ def analyze_deal_with_hybrid_outcome(
     repair_messages = append_hybrid_json_repair_instruction(base_messages)
     try:
         parsed = ollama.chat_json(messages=repair_messages)
-        merged = _merge_hybrid_short_fields(baseline, parsed.payload)
+        merged = _merge_narrow_overlay_fields(base=baseline, llm_payload=parsed.payload, normalized_deal=normalized_deal)
         merged["analysis_backend_requested"] = config.analyzer_backend
         merged["analysis_backend_used"] = "hybrid"
         merged["llm_repair_applied"] = True
@@ -219,7 +223,12 @@ def _coerce_text(value: Any, fallback: str) -> str:
     return txt or fallback
 
 
-def _merge_hybrid_short_fields(base: dict[str, Any], llm_payload: dict[str, Any]) -> dict[str, Any]:
+def _merge_narrow_overlay_fields(
+    *,
+    base: dict[str, Any],
+    llm_payload: dict[str, Any],
+    normalized_deal: dict[str, Any],
+) -> dict[str, Any]:
     out = dict(base)
     out["loss_reason_short"] = _coerce_text(llm_payload.get("loss_reason_short"), out.get("loss_reason_short", ""))
     out["manager_insight_short"] = _coerce_text(
@@ -228,4 +237,40 @@ def _merge_hybrid_short_fields(base: dict[str, Any], llm_payload: dict[str, Any]
     out["coaching_hint_short"] = _coerce_text(
         llm_payload.get("coaching_hint_short"), out.get("coaching_hint_short", "")
     )
+    out["product_hypothesis_llm"] = _normalize_product_hypothesis_llm(
+        llm_payload.get("product_hypothesis_llm"),
+        fallback=out.get("product_hypothesis_llm", "unknown"),
+        normalized_deal=normalized_deal,
+    )
+    out["reanimation_reason_short_llm"] = _coerce_text(
+        llm_payload.get("reanimation_reason_short_llm"),
+        out.get("reanimation_reason_short_llm", ""),
+    )
     return out
+
+
+def _normalize_product_hypothesis_llm(value: Any, *, fallback: str, normalized_deal: dict[str, Any]) -> str:
+    allowed = {"info", "link", "mixed", "unknown"}
+    candidate = str(value or "").strip().lower() or str(fallback or "unknown").strip().lower() or "unknown"
+    if candidate not in allowed:
+        candidate = "unknown"
+    if _is_sparse_context_for_product(normalized_deal) and candidate != "unknown":
+        return "unknown"
+    return candidate
+
+
+def _is_sparse_context_for_product(normalized_deal: dict[str, Any]) -> bool:
+    def _has_text(value: Any) -> bool:
+        return bool(" ".join(str(value or "").strip().split()))
+
+    if _has_text(normalized_deal.get("pain_text")) or _has_text(normalized_deal.get("business_tasks_text")):
+        return False
+    if _has_text(normalized_deal.get("company_comment")) or _has_text(normalized_deal.get("contact_comment")):
+        return False
+    for key in ("notes_summary_raw", "tasks_summary_raw", "tags", "source_values", "product_values"):
+        value = normalized_deal.get(key)
+        if isinstance(value, list) and any(_has_text(item.get("text") if isinstance(item, dict) else item) for item in value):
+            return False
+        if isinstance(value, str) and _has_text(value):
+            return False
+    return True

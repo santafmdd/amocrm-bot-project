@@ -55,24 +55,26 @@ def _cfg() -> DealAnalyzerConfig:
 
 
 def test_llm_backend_merges_llm_payload_into_baseline_contract():
-    row = {"deal_id": 1, "amo_lead_id": 1, "deal_name": "Demo"}
+    row = {
+        "deal_id": 1,
+        "amo_lead_id": 1,
+        "deal_name": "Demo",
+        "notes_summary_raw": [{"text": "Тендерный контур и сравнение КП"}],
+    }
     llm_payload = {
-        "score_0_100": 61,
-        "strong_sides": ["Есть контакт"],
-        "growth_zones": ["Добавить brief"],
-        "risk_flags": ["Мало данных"],
-        "recommended_actions_for_manager": ["Проверить next step"],
-        "recommended_training_tasks_for_employee": ["Тренинг по квалификации"],
-        "manager_message_draft": "Черновик менеджеру",
-        "employee_training_message_draft": "Черновик сотруднику",
-        "presentation_quality_flag": "needs_attention",
-        "followup_quality_flag": "ok",
-        "data_completeness_flag": "partial",
+        "product_hypothesis_llm": "link",
+        "loss_reason_short": "Потеря на позднем согласовании",
+        "manager_insight_short": "Нужен более ранний контроль критериев закупки",
+        "coaching_hint_short": "Отработать сценарий с возражением по тендеру",
+        "reanimation_reason_short_llm": "Есть шанс вернуться через короткий follow-up при изменении условий",
     }
 
     out = analyze_deal_with_ollama_outcome(normalized_deal=row, config=_cfg(), client=_FakeClient(llm_payload))
-    assert out.analysis.score_0_100 == 61
-    assert out.analysis.strong_sides == ["Есть контакт"]
+    baseline = out.analysis.to_dict()
+    assert isinstance(baseline["score_0_100"], int)
+    assert out.analysis.product_hypothesis_llm == "link"
+    assert out.analysis.loss_reason_short == "Потеря на позднем согласовании"
+    assert out.analysis.reanimation_reason_short_llm.startswith("Есть шанс")
     assert out.backend_used == "ollama"
     assert out.llm_error is False
     assert out.analysis.analysis_backend_used == "ollama"
@@ -128,11 +130,18 @@ def test_llm_backend_uses_timeout_from_config_when_creating_client():
 def test_hybrid_backend_success_adds_short_fields_without_overriding_rules_payload():
     cfg = _cfg()
     cfg = DealAnalyzerConfig(**{**cfg.__dict__, "analyzer_backend": "hybrid"})
-    row = {"deal_id": 5, "amo_lead_id": 5, "deal_name": "Hybrid Deal"}
+    row = {
+        "deal_id": 5,
+        "amo_lead_id": 5,
+        "deal_name": "Hybrid Deal",
+        "notes_summary_raw": [{"text": "Есть контекст по продукту INFO"}],
+    }
     payload = {
+        "product_hypothesis_llm": "info",
         "loss_reason_short": "Анти-fit по внедрению",
         "manager_insight_short": "Кейс не из целевого сегмента",
         "coaching_hint_short": "Ранний отсев по признакам anti-fit",
+        "reanimation_reason_short_llm": "Реанимация нецелесообразна без изменения fit",
     }
 
     out = analyze_deal_with_hybrid_outcome(normalized_deal=row, config=cfg, client=_FakeClient(payload))
@@ -142,6 +151,8 @@ def test_hybrid_backend_success_adds_short_fields_without_overriding_rules_paylo
     assert out.analysis.loss_reason_short == "Анти-fit по внедрению"
     assert out.analysis.manager_insight_short == "Кейс не из целевого сегмента"
     assert out.analysis.coaching_hint_short == "Ранний отсев по признакам anti-fit"
+    assert out.analysis.product_hypothesis_llm == "info"
+    assert out.analysis.reanimation_reason_short_llm == "Реанимация нецелесообразна без изменения fit"
     assert out.analysis.llm_fallback is False
     assert out.analysis.llm_error is False
 
@@ -159,5 +170,50 @@ def test_hybrid_backend_invalid_json_or_timeout_falls_back_to_rules_only():
     assert out.analysis.loss_reason_short == ""
     assert out.analysis.manager_insight_short == ""
     assert out.analysis.coaching_hint_short == ""
+    assert out.analysis.product_hypothesis_llm == "unknown"
+    assert out.analysis.reanimation_reason_short_llm == ""
     assert out.analysis.llm_fallback is True
     assert out.analysis.llm_error is True
+
+
+def test_hybrid_does_not_override_rules_score_or_risk_flags():
+    cfg = _cfg()
+    cfg = DealAnalyzerConfig(**{**cfg.__dict__, "analyzer_backend": "hybrid"})
+    row = {"deal_id": 7, "deal_name": "Stable rules source", "status_name": "В работе"}
+    payload = {
+        "loss_reason_short": "Любой текст",
+        "manager_insight_short": "Коротко",
+        "coaching_hint_short": "Подсказка",
+        "product_hypothesis_llm": "mixed",
+        "score_0_100": 3,
+        "risk_flags": ["fake"],
+    }
+    out = analyze_deal_with_hybrid_outcome(normalized_deal=row, config=cfg, client=_FakeClient(payload))
+    rules_ref = analyze_deal_with_hybrid_outcome(
+        normalized_deal=row,
+        config=cfg,
+        client=_FakeClient(
+            {
+                "loss_reason_short": "",
+                "manager_insight_short": "",
+                "coaching_hint_short": "",
+                "product_hypothesis_llm": "unknown",
+            }
+        ),
+    )
+    assert out.analysis.score_0_100 == rules_ref.analysis.score_0_100
+    assert out.analysis.risk_flags == rules_ref.analysis.risk_flags
+
+
+def test_hybrid_product_hypothesis_llm_is_unknown_on_sparse_context():
+    cfg = _cfg()
+    cfg = DealAnalyzerConfig(**{**cfg.__dict__, "analyzer_backend": "hybrid"})
+    row = {"deal_id": 8, "deal_name": "Sparse context", "notes_summary_raw": [], "tasks_summary_raw": []}
+    payload = {
+        "product_hypothesis_llm": "info",
+        "loss_reason_short": "Недостаточно данных",
+        "manager_insight_short": "Пусто",
+        "coaching_hint_short": "Пусто",
+    }
+    out = analyze_deal_with_hybrid_outcome(normalized_deal=row, config=cfg, client=_FakeClient(payload))
+    assert out.analysis.product_hypothesis_llm == "unknown"

@@ -29,6 +29,8 @@ class DealAnalysis:
     loss_reason_short: str = ""
     manager_insight_short: str = ""
     coaching_hint_short: str = ""
+    product_hypothesis_llm: str = "unknown"
+    reanimation_reason_short_llm: str = ""
     llm_error: bool = False
     llm_fallback: bool = False
     analysis_backend_requested: str = "rules"

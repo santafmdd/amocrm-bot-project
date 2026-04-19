@@ -30,6 +30,11 @@ def _cfg_payload(extra: str = "") -> str:
   "appointment_list_sheet_name": "",
   "matching_strategy": "priority_v1",
   "operator_outputs_enabled": true,
+  "transcription_backend": "faster_whisper",
+  "whisper_model_name": "whisper-large-v3-turbo",
+  "whisper_device": "auto",
+  "whisper_compute_type": "auto",
+  "transcription_language": "ru",
   "janitor_enabled": true,
   "janitor_dry_run_default": true,
   "retention_days_exports": 21,
@@ -81,6 +86,11 @@ def test_load_deal_analyzer_config_with_ollama_backend_and_period_fields():
     assert cfg.matching_strategy == "priority_v1"
     assert cfg.operator_outputs_enabled is True
     assert cfg.fields_mapping["client_list"]["deal_id"] == "ID сделки"
+    assert cfg.transcription_backend == "faster_whisper"
+    assert cfg.whisper_model_name == "whisper-large-v3-turbo"
+    assert cfg.whisper_device == "auto"
+    assert cfg.whisper_compute_type == "auto"
+    assert cfg.transcription_language == "ru"
 
 
 def test_load_deal_analyzer_config_rejects_unknown_backend():

@@ -144,6 +144,21 @@ def _csv_fields(*, include_executed_at: bool) -> list[str]:
         "transcription_backend",
         "call_collection_mode",
         "transcripts_total",
+        "transcript_available",
+        "transcript_source",
+        "transcript_error",
+        "call_signal_summary_short",
+        "call_signal_product_info",
+        "call_signal_product_link",
+        "call_signal_demo_discussed",
+        "call_signal_test_discussed",
+        "call_signal_budget_discussed",
+        "call_signal_followup_discussed",
+        "call_signal_objection_price",
+        "call_signal_objection_no_need",
+        "call_signal_objection_not_target",
+        "call_signal_next_step_present",
+        "call_signal_decision_maker_reached",
         "enriched_test_started",
         "enriched_test_completed",
         "enriched_test_status",
@@ -173,6 +188,8 @@ def _csv_fields(*, include_executed_at: bool) -> list[str]:
         "loss_reason_short",
         "manager_insight_short",
         "coaching_hint_short",
+        "product_hypothesis_llm",
+        "reanimation_reason_short_llm",
     ]
     if include_executed_at:
         fields.insert(1, "executed_at")
@@ -230,6 +247,10 @@ def build_markdown_report(
             lines.append(f"- Manager insight short: {row.get('manager_insight_short')}")
         if row.get("coaching_hint_short"):
             lines.append(f"- Coaching hint short: {row.get('coaching_hint_short')}")
+        if row.get("product_hypothesis_llm"):
+            lines.append(f"- Product hypothesis LLM: {row.get('product_hypothesis_llm')}")
+        if row.get("reanimation_reason_short_llm"):
+            lines.append(f"- Reanimation reason short LLM: {row.get('reanimation_reason_short_llm')}")
         lines.append(
             "- Enrichment: status={status}, source={source}, confidence={conf}".format(
                 status=row.get("enrichment_match_status", ""),

@@ -54,6 +54,10 @@ class DealAnalyzerConfig:
     transcription_backend: str = "disabled"
     transcription_base_url: str = ""
     transcription_model: str = ""
+    whisper_model_name: str = "whisper-large-v3-turbo"
+    whisper_device: str = "auto"
+    whisper_compute_type: str = "auto"
+    transcription_language: str = ""
     transcription_timeout_seconds: int = 60
     transcription_cache_dir: str = "workspace/deal_analyzer/transcripts_cache"
     call_collection_mode: str = "disabled"
@@ -186,14 +190,18 @@ def load_deal_analyzer_config(config_path: str | None = None) -> DealAnalyzerCon
     operator_outputs_enabled = bool(raw.get("operator_outputs_enabled", True))
 
     transcription_backend = str(raw.get("transcription_backend", "disabled")).strip().lower() or "disabled"
-    if transcription_backend not in {"disabled", "mock", "local_placeholder", "cloud_placeholder"}:
+    if transcription_backend not in {"disabled", "mock", "local_placeholder", "cloud_placeholder", "faster_whisper"}:
         raise RuntimeError(
             "Unsupported transcription_backend="
-            f"{transcription_backend!r}. Allowed values: ['disabled', 'mock', 'local_placeholder', 'cloud_placeholder']"
+            f"{transcription_backend!r}. Allowed values: ['disabled', 'mock', 'local_placeholder', 'cloud_placeholder', 'faster_whisper']"
         )
 
     transcription_base_url = str(raw.get("transcription_base_url", "")).strip()
     transcription_model = str(raw.get("transcription_model", "")).strip()
+    whisper_model_name = str(raw.get("whisper_model_name", "whisper-large-v3-turbo")).strip() or "whisper-large-v3-turbo"
+    whisper_device = str(raw.get("whisper_device", "auto")).strip().lower() or "auto"
+    whisper_compute_type = str(raw.get("whisper_compute_type", "auto")).strip().lower() or "auto"
+    transcription_language = str(raw.get("transcription_language", "")).strip().lower()
     try:
         transcription_timeout_seconds = max(1, int(raw.get("transcription_timeout_seconds", 60)))
     except (TypeError, ValueError):
@@ -268,6 +276,10 @@ def load_deal_analyzer_config(config_path: str | None = None) -> DealAnalyzerCon
         transcription_backend=transcription_backend,
         transcription_base_url=transcription_base_url,
         transcription_model=transcription_model,
+        whisper_model_name=whisper_model_name,
+        whisper_device=whisper_device,
+        whisper_compute_type=whisper_compute_type,
+        transcription_language=transcription_language,
         transcription_timeout_seconds=transcription_timeout_seconds,
         transcription_cache_dir=transcription_cache_dir,
         call_collection_mode=call_collection_mode,

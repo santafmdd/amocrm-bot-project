@@ -41,6 +41,8 @@ def test_build_hybrid_short_messages_uses_short_contract():
     assert len(messages) == 2
     assert "loss_reason_short" in messages[0]["content"]
     assert "coaching_hint_short" in messages[0]["content"]
+    assert "product_hypothesis_llm" in messages[0]["content"]
+    assert "reanimation_reason_short_llm" in messages[0]["content"]
     assert "Hybrid Demo" in messages[1]["content"]
 
 
@@ -50,3 +52,4 @@ def test_append_hybrid_json_repair_instruction_adds_repair_tail():
     assert len(repaired) == 2
     assert repaired[-1]["role"] == "user"
     assert "loss_reason_short" in repaired[-1]["content"]
+    assert "product_hypothesis_llm" in repaired[-1]["content"]

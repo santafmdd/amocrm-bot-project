@@ -2,3 +2,4 @@
 playwright>=1.54.0
 pydantic>=2.8.0
 PyYAML>=6.0.2
+faster-whisper>=1.0.3

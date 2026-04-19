@@ -19,6 +19,10 @@ class CallEvidence:
     recording_ref: str
     quality_flags: list[str]
     missing_recording: bool
+    audio_path: str = ""
+    audio_source_url: str = ""
+    audio_download_status: str = "not_attempted"
+    audio_download_error: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

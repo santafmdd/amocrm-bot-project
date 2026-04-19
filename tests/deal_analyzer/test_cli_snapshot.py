@@ -68,7 +68,14 @@ def test_run_analyze_snapshot_saves_json_artifact_and_handles_snapshot_warnings(
             "crm": {"deal_id": 101, "amo_lead_id": 101, "deal_name": "Deal 101"},
             "warnings": ["enrichment_failed:test"],
             "call_evidence": {"items": [], "summary": {"calls_total": 0}},
-            "transcripts": [],
+            "transcripts": [
+                {
+                    "call_id": "c1",
+                    "transcript_status": "ok",
+                    "transcript_backend": "mock",
+                    "transcript_text": "Обсудили демонстрацию и следующий шаг в пятницу.",
+                }
+            ],
             "roks_context": {"ok": False},
         }
     }
@@ -112,3 +119,7 @@ def test_run_analyze_snapshot_saves_json_artifact_and_handles_snapshot_warnings(
         "employee_training_message_draft",
     }
     assert required.issubset(set(analysis.keys()))
+    assert analysis.get("transcript_available") is True
+    assert isinstance(analysis.get("transcript_text_excerpt"), str) and analysis.get("transcript_text_excerpt")
+    assert analysis.get("call_signal_demo_discussed") is True
+    assert analysis.get("call_signal_next_step_present") is True
