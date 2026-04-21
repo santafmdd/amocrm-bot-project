@@ -35,6 +35,14 @@ def _cfg_payload(extra: str = "") -> str:
   "whisper_device": "auto",
   "whisper_compute_type": "auto",
   "transcription_language": "ru",
+  "deal_analyzer_sheet_url": "https://docs.google.com/spreadsheets/d/test123/edit#gid=0",
+  "deal_analyzer_sheet_name": "analytics_writer_test",
+  "deal_analyzer_start_cell": "A1",
+  "deal_analyzer_write_enabled": false,
+  "deal_analyzer_daily_sheet_name": "Дневной контроль",
+  "deal_analyzer_daily_start_cell": "A2",
+  "deal_analyzer_weekly_sheet_name": "Недельный свод менеджеров",
+  "deal_analyzer_weekly_start_cell": "A2",
   "janitor_enabled": true,
   "janitor_dry_run_default": true,
   "retention_days_exports": 21,
@@ -87,10 +95,18 @@ def test_load_deal_analyzer_config_with_ollama_backend_and_period_fields():
     assert cfg.operator_outputs_enabled is True
     assert cfg.fields_mapping["client_list"]["deal_id"] == "ID сделки"
     assert cfg.transcription_backend == "faster_whisper"
-    assert cfg.whisper_model_name == "whisper-large-v3-turbo"
+    assert cfg.whisper_model_name == "large-v3-turbo"
     assert cfg.whisper_device == "auto"
     assert cfg.whisper_compute_type == "auto"
     assert cfg.transcription_language == "ru"
+    assert cfg.deal_analyzer_sheet_url.startswith("https://docs.google.com/spreadsheets/d/")
+    assert cfg.deal_analyzer_sheet_name == "analytics_writer_test"
+    assert cfg.deal_analyzer_start_cell == "A1"
+    assert cfg.deal_analyzer_write_enabled is False
+    assert cfg.deal_analyzer_daily_sheet_name == "Дневной контроль"
+    assert cfg.deal_analyzer_daily_start_cell == "A2"
+    assert cfg.deal_analyzer_weekly_sheet_name == "Недельный свод менеджеров"
+    assert cfg.deal_analyzer_weekly_start_cell == "A2"
 
 
 def test_load_deal_analyzer_config_rejects_unknown_backend():

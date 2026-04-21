@@ -54,7 +54,7 @@ class DealAnalyzerConfig:
     transcription_backend: str = "disabled"
     transcription_base_url: str = ""
     transcription_model: str = ""
-    whisper_model_name: str = "whisper-large-v3-turbo"
+    whisper_model_name: str = "large-v3-turbo"
     whisper_device: str = "auto"
     whisper_compute_type: str = "auto"
     transcription_language: str = ""
@@ -62,8 +62,20 @@ class DealAnalyzerConfig:
     transcription_cache_dir: str = "workspace/deal_analyzer/transcripts_cache"
     call_collection_mode: str = "api_first"
     call_backend: str = "amocrm_api"
+    period_live_refresh_enabled: bool = True
     amocrm_auth_config_path: str = ""
     call_base_domain: str = ""
+    deal_analyzer_sheet_url: str = ""
+    deal_analyzer_spreadsheet_id: str = ""
+    deal_analyzer_sheet_name: str = ""
+    deal_analyzer_start_cell: str = ""
+    deal_analyzer_write_enabled: bool = False
+    deal_analyzer_daily_sheet_name: str = ""
+    deal_analyzer_daily_start_cell: str = "A2"
+    deal_analyzer_weekly_sheet_name: str = ""
+    deal_analyzer_weekly_start_cell: str = "A2"
+    deal_analyzer_overwrite_mode: bool = False
+    daily_manager_allowlist: tuple[str, ...] = ("Илья", "Рустам")
     janitor_enabled: bool = False
     janitor_dry_run_default: bool = True
     retention_days_exports: int = 30
@@ -198,7 +210,9 @@ def load_deal_analyzer_config(config_path: str | None = None) -> DealAnalyzerCon
 
     transcription_base_url = str(raw.get("transcription_base_url", "")).strip()
     transcription_model = str(raw.get("transcription_model", "")).strip()
-    whisper_model_name = str(raw.get("whisper_model_name", "whisper-large-v3-turbo")).strip() or "whisper-large-v3-turbo"
+    whisper_model_name = _normalize_whisper_model_name(
+        str(raw.get("whisper_model_name", "large-v3-turbo")).strip() or "large-v3-turbo"
+    )
     whisper_device = str(raw.get("whisper_device", "auto")).strip().lower() or "auto"
     whisper_compute_type = str(raw.get("whisper_compute_type", "auto")).strip().lower() or "auto"
     transcription_language = str(raw.get("transcription_language", "")).strip().lower()
@@ -218,8 +232,22 @@ def load_deal_analyzer_config(config_path: str | None = None) -> DealAnalyzerCon
         )
 
     call_backend = str(raw.get("call_backend", "amocrm_api")).strip().lower() or "amocrm_api"
+    period_live_refresh_enabled = bool(raw.get("period_live_refresh_enabled", True))
     amocrm_auth_config_path = str(raw.get("amocrm_auth_config_path", "")).strip()
     call_base_domain = str(raw.get("call_base_domain", "")).strip()
+    deal_analyzer_sheet_url = str(raw.get("deal_analyzer_sheet_url", "")).strip()
+    deal_analyzer_spreadsheet_id = str(raw.get("deal_analyzer_spreadsheet_id", "")).strip()
+    deal_analyzer_sheet_name = str(raw.get("deal_analyzer_sheet_name", "")).strip()
+    deal_analyzer_start_cell = str(raw.get("deal_analyzer_start_cell", "")).strip()
+    deal_analyzer_write_enabled = bool(raw.get("deal_analyzer_write_enabled", False))
+    deal_analyzer_daily_sheet_name = str(raw.get("deal_analyzer_daily_sheet_name", "")).strip()
+    deal_analyzer_daily_start_cell = str(raw.get("deal_analyzer_daily_start_cell", "A2")).strip() or "A2"
+    deal_analyzer_weekly_sheet_name = str(raw.get("deal_analyzer_weekly_sheet_name", "")).strip()
+    deal_analyzer_weekly_start_cell = str(raw.get("deal_analyzer_weekly_start_cell", "A2")).strip() or "A2"
+    deal_analyzer_overwrite_mode = bool(raw.get("deal_analyzer_overwrite_mode", False))
+    daily_manager_allowlist = tuple(
+        _parse_str_list(raw.get("daily_manager_allowlist", ["Илья", "Рустам"]))
+    ) or ("Илья", "Рустам")
 
     janitor_enabled = bool(raw.get("janitor_enabled", False))
     janitor_dry_run_default = bool(raw.get("janitor_dry_run_default", True))
@@ -284,8 +312,20 @@ def load_deal_analyzer_config(config_path: str | None = None) -> DealAnalyzerCon
         transcription_cache_dir=transcription_cache_dir,
         call_collection_mode=call_collection_mode,
         call_backend=call_backend,
+        period_live_refresh_enabled=period_live_refresh_enabled,
         amocrm_auth_config_path=amocrm_auth_config_path,
         call_base_domain=call_base_domain,
+        deal_analyzer_sheet_url=deal_analyzer_sheet_url,
+        deal_analyzer_spreadsheet_id=deal_analyzer_spreadsheet_id,
+        deal_analyzer_sheet_name=deal_analyzer_sheet_name,
+        deal_analyzer_start_cell=deal_analyzer_start_cell,
+        deal_analyzer_write_enabled=deal_analyzer_write_enabled,
+        deal_analyzer_daily_sheet_name=deal_analyzer_daily_sheet_name,
+        deal_analyzer_daily_start_cell=deal_analyzer_daily_start_cell,
+        deal_analyzer_weekly_sheet_name=deal_analyzer_weekly_sheet_name,
+        deal_analyzer_weekly_start_cell=deal_analyzer_weekly_start_cell,
+        deal_analyzer_overwrite_mode=deal_analyzer_overwrite_mode,
+        daily_manager_allowlist=daily_manager_allowlist,
         janitor_enabled=janitor_enabled,
         janitor_dry_run_default=janitor_dry_run_default,
         retention_days_exports=retention_days_exports,
@@ -412,3 +452,17 @@ def _parse_date(value: str, field_name: str) -> date:
 def _opt_str(value: Any) -> str | None:
     text = str(value).strip() if value is not None else ""
     return text or None
+
+
+def _normalize_whisper_model_name(value: str) -> str:
+    text = str(value or "").strip()
+    low = text.lower()
+    aliases = {
+        "whisper-large-v3-turbo": "large-v3-turbo",
+        "large-v3-turbo": "large-v3-turbo",
+        "turbo": "turbo",
+        "whisper-large-v3": "large-v3",
+    }
+    if low in aliases:
+        return aliases[low]
+    return text or "large-v3-turbo"

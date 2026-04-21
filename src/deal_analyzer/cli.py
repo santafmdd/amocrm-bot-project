@@ -2,13 +2,18 @@
 
 import argparse
 import json
+import re
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from src.config import load_config
+from src.integrations.google_sheets_api_client import GoogleSheetsApiClient, extract_spreadsheet_id
 from src.logger import setup_logging
+from src.amocrm_auth.config import load_amocrm_auth_config
+from src.amocrm_auth.state_store import load_auth_state
+from src.amocrm_collector.client import AmoCollectorClient
 from src.ops_storage.config import build_janitor_config_from_analyzer
 from src.ops_storage.janitor import run_janitor_clean, run_janitor_report
 from src.safety import ensure_inside_root
@@ -27,11 +32,72 @@ from .exporters import (
 from .llm_backend import analyze_deal_with_hybrid_outcome, analyze_deal_with_ollama_outcome
 from .llm_client import OllamaClient
 from .models import AnalysisRunMetadata
+from .prompt_builder import build_daily_table_messages, append_daily_table_json_repair_instruction
 from .roks_extractor import extract_roks_snapshot
 from .rules import analyze_deal
 from .snapshot_builder import build_deal_snapshot, build_period_snapshots
 from .transcript_signals import build_call_signal_aggregates, derive_transcript_signals
 from .transcription import transcribe_call_evidence
+
+DAILY_CONTROL_COLUMNS = [
+    "Неделя с",
+    "Неделя по",
+    "Дата контроля",
+    "День",
+    "Менеджер",
+    "Роль менеджера",
+    "Проанализировано сделок",
+    "Ссылки на сделки",
+    "Продукт / фокус",
+    "База микс",
+    "Ключевой вывод",
+    "Сильные стороны",
+    "Зоны роста",
+    "Почему это важно",
+    "Что закрепить",
+    "Что исправить",
+    "Что донес сотруднику",
+    "Ожидаемый эффект - количество",
+    "Ожидаемый эффект - качество",
+    "Оценка 0-100",
+    "Критичность",
+]
+
+DAILY_TEXT_COLUMN_KEYS = (
+    "Ключевой вывод",
+    "Сильные стороны",
+    "Зоны роста",
+    "Почему это важно",
+    "Что закрепить",
+    "Что исправить",
+    "Что донес сотруднику",
+    "Ожидаемый эффект - количество",
+    "Ожидаемый эффект - качество",
+)
+
+WEEKLY_MANAGER_COLUMNS = [
+    "Неделя с",
+    "Неделя по",
+    "Менеджер",
+    "Роль менеджера",
+    "Проанализировано сделок",
+    "Продукт / фокус недели",
+    "База микс недели",
+    "Итог недели",
+    "Что улучшилось",
+    "Что не улучшилось",
+    "Повторяющиеся ошибки",
+    "Обучение сотруднику",
+    "Ссылка на обучение",
+    "Задачи после обучения",
+    "Ссылка на задачи после обучения",
+    "Мои действия на следующую неделю",
+    "Ожидаемый эффект - количество",
+    "Ожидаемый эффект - качество",
+    "Формулировка для руководителя",
+    "Сообщение сотруднику",
+    "Средняя оценка 0-100",
+]
 
 
 def _parse_args() -> argparse.Namespace:
@@ -720,10 +786,32 @@ def _run_analyze_period(
         if preflight_forced_rules:
             effective_backend = "rules"
 
-    normalized_rows_all = _extract_period_normalized(payload)
-    normalized_rows = normalized_rows_all[: max(0, int(limit))] if isinstance(limit, int) and limit >= 0 else normalized_rows_all
-    raw_bundles_by_deal = _extract_raw_bundles_map(payload)
-
+    normalized_rows_input = _extract_period_normalized(payload)
+    raw_bundles_input = _extract_raw_bundles_map(payload)
+    normalized_rows_all, raw_bundles_by_deal, refresh_diag = _try_live_refresh_period_rows(
+        cfg=cfg,
+        logger=logger,
+        resolved=resolved,
+        fallback_rows=normalized_rows_input,
+        fallback_raw_bundles=raw_bundles_input,
+    )
+    logger.info(
+        "period source resolved: mode=%s api_refresh_success=%s fallback_used=%s rows_final=%s error=%s",
+        refresh_diag.get("mode", ""),
+        refresh_diag.get("api_refresh_success", False),
+        refresh_diag.get("fallback_used", True),
+        refresh_diag.get("rows_final", len(normalized_rows_all)),
+        refresh_diag.get("error", ""),
+    )
+    normalized_rows_ranked = sorted(
+        normalized_rows_all,
+        key=_period_deal_priority_key,
+    )
+    normalized_rows = (
+        normalized_rows_ranked[: max(0, int(limit))]
+        if isinstance(limit, int) and limit >= 0
+        else normalized_rows_ranked
+    )
     run_started_at = datetime.now(timezone.utc)
     run_dir, deals_dir = _prepare_period_run_dirs(output_dir=output_dir, run_started_at=run_started_at)
 
@@ -809,6 +897,12 @@ def _run_analyze_period(
                     artifact_path=str(deal_artifact),
                 )
             )
+            transcript_items = (
+                snapshot.get("transcripts", [])
+                if isinstance(snapshot.get("transcripts"), list)
+                else []
+            )
+            transcript_err_counts = _transcript_error_counters(transcript_items)
             period_deal_records.append(
                 {
                     "deal_id": analysis.get("deal_id") or crm.get("deal_id"),
@@ -819,8 +913,13 @@ def _run_analyze_period(
                         or _to_product_name(crm.get("product_name"))
                         or _to_product_name(crm.get("source_values"))
                     ),
+                    "source_values": crm.get("source_values") if isinstance(crm.get("source_values"), list) else [],
+                    "tags": crm.get("tags") if isinstance(crm.get("tags"), list) else [],
+                    "company_tags": crm.get("company_tags") if isinstance(crm.get("company_tags"), list) else [],
                     "status_name": crm.get("status_name") or "",
                     "pipeline_name": crm.get("pipeline_name") or "",
+                    "created_at": crm.get("created_at") or "",
+                    "updated_at": crm.get("updated_at") or "",
                     "status_or_stage": _compose_status_stage(
                         status_name=crm.get("status_name"),
                         pipeline_name=crm.get("pipeline_name"),
@@ -831,8 +930,11 @@ def _run_analyze_period(
                     "owner_ambiguity_flag": bool(analysis.get("owner_ambiguity_flag")),
                     "crm_hygiene_confidence": str(analysis.get("crm_hygiene_confidence") or ""),
                     "analysis_confidence": str(analysis.get("analysis_confidence") or ""),
+                    "strong_sides": analysis.get("strong_sides") if isinstance(analysis.get("strong_sides"), list) else [],
+                    "growth_zones": analysis.get("growth_zones") if isinstance(analysis.get("growth_zones"), list) else [],
                     "manager_insight_short": analysis.get("manager_insight_short", ""),
                     "manager_summary": analysis.get("manager_summary", ""),
+                    "employee_coaching": str(analysis.get("employee_coaching") or ""),
                     "product_hypothesis_llm": str(analysis.get("product_hypothesis_llm") or "unknown"),
                     "reanimation_reason_short_llm": str(analysis.get("reanimation_reason_short_llm") or ""),
                     "reanimation_potential": str(analysis.get("reanimation_potential") or "none"),
@@ -930,13 +1032,13 @@ def _run_analyze_period(
                     "transcription_failed_count": sum(
                         1
                         for t in (
-                            snapshot.get("transcripts", [])
-                            if isinstance(snapshot.get("transcripts"), list)
-                            else []
+                            transcript_items
                         )
                         if isinstance(t, dict)
                         and str(t.get("transcript_status") or "").strip().lower() not in {"ok", "cached", "disabled"}
                     ),
+                    "transcription_missing_audio_count": transcript_err_counts.get("missing_audio", 0),
+                    "transcription_backend_config_failed_count": transcript_err_counts.get("backend_config", 0),
                     "call_evidence_items_count": len(snapshot.get("call_evidence", {}).get("items", []))
                     if isinstance(snapshot.get("call_evidence"), dict)
                     and isinstance(snapshot.get("call_evidence", {}).get("items"), list)
@@ -993,6 +1095,8 @@ def _run_analyze_period(
                     "product_name": "",
                     "status_name": "",
                     "pipeline_name": "",
+                    "created_at": "",
+                    "updated_at": "",
                     "status_or_stage": "",
                     "score": None,
                     "risk_flags": ["analysis_failed"],
@@ -1000,8 +1104,11 @@ def _run_analyze_period(
                     "owner_ambiguity_flag": False,
                     "crm_hygiene_confidence": "",
                     "analysis_confidence": "",
+                    "strong_sides": [],
+                    "growth_zones": [],
                     "manager_insight_short": "",
                     "manager_summary": "",
+                    "employee_coaching": "",
                     "product_hypothesis_llm": "unknown",
                     "reanimation_reason_short_llm": "",
                     "reanimation_potential": "none",
@@ -1037,6 +1144,8 @@ def _run_analyze_period(
                     "transcription_attempted_count": 0,
                     "transcription_success_count": 0,
                     "transcription_failed_count": 0,
+                    "transcription_missing_audio_count": 0,
+                    "transcription_backend_config_failed_count": 0,
                     "call_evidence_items_count": 0,
                     "call_evidence_calls_total": 0,
                     "has_audio_path": False,
@@ -1097,11 +1206,15 @@ def _run_analyze_period(
         limit=limit,
         period_deal_records=period_deal_records,
     )
+    summary_payload["period_start"] = resolved.period_start.isoformat()
+    summary_payload["period_end"] = resolved.period_end.isoformat()
+    summary_payload["as_of_date"] = resolved.as_of_date.isoformat()
+    summary_payload["live_refresh"] = refresh_diag
     summary_path = run_dir / "summary.json"
     _write_json_path(summary_path, summary_payload)
     call_diag = summary_payload.get("call_runtime_diagnostics", {}) if isinstance(summary_payload.get("call_runtime_diagnostics"), dict) else {}
     logger.info(
-        "call runtime diagnostics: mode=%s deals_with_call_candidates=%s deals_with_recording_url=%s audio_downloaded=%s audio_cached=%s audio_failed=%s transcription_attempted=%s transcription_success=%s transcription_failed=%s",
+        "call runtime diagnostics: mode=%s deals_with_call_candidates=%s deals_with_recording_url=%s audio_downloaded=%s audio_cached=%s audio_failed=%s transcription_attempted=%s transcription_success=%s transcription_failed=%s transcription_failed_missing_audio=%s transcription_failed_backend_config=%s",
         call_diag.get("call_collection_mode_effective", cfg.call_collection_mode),
         call_diag.get("deals_with_call_candidates", 0),
         call_diag.get("deals_with_recording_url", 0),
@@ -1111,6 +1224,8 @@ def _run_analyze_period(
         call_diag.get("transcription_attempted", 0),
         call_diag.get("transcription_success", 0),
         call_diag.get("transcription_failed", 0),
+        call_diag.get("transcription_failed_missing_audio", 0),
+        call_diag.get("transcription_failed_backend_config", 0),
     )
     top_risks_payload = _build_top_risks_payload(period_deal_records=period_deal_records)
     top_risks_path = run_dir / "top_risks.json"
@@ -1153,21 +1268,58 @@ def _run_analyze_period(
         ),
         encoding="utf-8",
     )
+    transcription_impact_payload = _build_transcription_impact_payload(transcription_impact_rows=transcription_impact_rows)
     transcription_impact_json_path = run_dir / "transcription_impact.json"
-    _write_json_path(transcription_impact_json_path, transcription_impact_rows)
+    _write_json_path(transcription_impact_json_path, transcription_impact_payload)
     transcription_impact_md_path = run_dir / "transcription_impact.md"
     transcription_impact_md_path.write_text(
         _build_transcription_impact_markdown(transcription_impact_rows=transcription_impact_rows),
         encoding="utf-8",
     )
     sheets_dry_run_payload_path = run_dir / "meeting_queue_sheets_dry_run.json"
+    sheets_dry_run_payload = _build_meeting_queue_sheets_dry_run_payload(queue_items=meeting_queue_payload)
     _write_json_path(
         sheets_dry_run_payload_path,
-        _build_meeting_queue_sheets_dry_run_payload(queue_items=meeting_queue_payload),
+        sheets_dry_run_payload,
+    )
+    style_source_excerpt = _load_daily_style_source_excerpt(logger=logger)
+    daily_control_payload = _build_daily_control_sheet_payload(
+        summary=summary_payload,
+        period_deal_records=period_deal_records,
+        amo_base_domain=_resolve_amo_base_domain_for_links(cfg=cfg),
+        manager_allowlist=list(getattr(cfg, "daily_manager_allowlist", ()) or ()),
+        cfg=cfg,
+        logger=logger,
+        backend_effective=effective_backend,
+        style_source_excerpt=style_source_excerpt,
+    )
+    daily_control_payload_path = run_dir / "daily_control_sheet_payload.json"
+    _write_json_path(daily_control_payload_path, daily_control_payload)
+    meeting_queue_writer_status = _maybe_write_daily_control_sheet(
+        cfg=cfg,
+        logger=logger,
+        daily_payload=daily_control_payload,
+    )
+    summary_payload["daily_control_writer"] = meeting_queue_writer_status
+    summary_payload["meeting_queue_writer"] = meeting_queue_writer_status
+    _write_json_path(summary_path, summary_payload)
+    summary_md_path.write_text(
+        _build_period_summary_markdown(
+            summary=summary_payload,
+            period_deal_records=period_deal_records,
+        ),
+        encoding="utf-8",
+    )
+    manager_brief_path.write_text(
+        _build_manager_brief_markdown(
+            summary=summary_payload,
+            period_deal_records=period_deal_records,
+        ),
+        encoding="utf-8",
     )
 
     logger.info(
-        "analyze-period success: backend=%s deals_seen=%s deals_analyzed=%s deals_failed=%s llm_success=%s llm_success_repaired=%s llm_fallback=%s llm_error=%s effective=%s json=%s md=%s csv=%s run_summary=%s run_md=%s top_risks=%s manager_brief=%s meeting_queue_json=%s meeting_queue_md=%s transcription_impact_md=%s queue_sheets_dry_run=%s",
+        "analyze-period success: backend=%s deals_seen=%s deals_analyzed=%s deals_failed=%s llm_success=%s llm_success_repaired=%s llm_fallback=%s llm_error=%s effective=%s json=%s md=%s csv=%s run_summary=%s run_md=%s top_risks=%s manager_brief=%s meeting_queue_json=%s meeting_queue_md=%s transcription_impact_md=%s queue_sheets_dry_run=%s daily_sheet_payload=%s",
         cfg.analyzer_backend,
         len(normalized_rows_all),
         len(analyses),
@@ -1188,6 +1340,7 @@ def _run_analyze_period(
         meeting_queue_md_path,
         transcription_impact_md_path,
         sheets_dry_run_payload_path,
+        daily_control_payload_path,
     )
 
 
@@ -1279,8 +1432,12 @@ def _run_analyze_weekly(
                     "analysis_confidence": str(analysis.get("analysis_confidence") or ""),
                     "owner_ambiguity_flag": bool(analysis.get("owner_ambiguity_flag")),
                     "crm_hygiene_confidence": str(analysis.get("crm_hygiene_confidence") or ""),
+                    "strong_sides": analysis.get("strong_sides") if isinstance(analysis.get("strong_sides"), list) else [],
+                    "growth_zones": analysis.get("growth_zones") if isinstance(analysis.get("growth_zones"), list) else [],
                     "manager_summary": str(analysis.get("manager_summary") or ""),
                     "manager_insight_short": str(analysis.get("manager_insight_short") or ""),
+                    "employee_fix_tasks": analysis.get("employee_fix_tasks") if isinstance(analysis.get("employee_fix_tasks"), list) else [],
+                    "employee_coaching": str(analysis.get("employee_coaching") or ""),
                     "reanimation_potential": str(analysis.get("reanimation_potential") or "none"),
                     "reanimation_reason_short": str(analysis.get("reanimation_reason_short") or ""),
                     "product_hypothesis": str(analysis.get("product_hypothesis") or "unknown"),
@@ -1316,8 +1473,12 @@ def _run_analyze_weekly(
                     "analysis_confidence": "",
                     "owner_ambiguity_flag": False,
                     "crm_hygiene_confidence": "",
+                    "strong_sides": [],
+                    "growth_zones": [],
                     "manager_summary": "",
                     "manager_insight_short": "",
+                    "employee_fix_tasks": [],
+                    "employee_coaching": "",
                     "reanimation_potential": "none",
                     "reanimation_reason_short": "",
                     "product_hypothesis": "unknown",
@@ -1419,9 +1580,24 @@ def _run_analyze_weekly(
             "next_week_plan": str(plan_path),
         },
     }
+    weekly_sheet_payload = _build_weekly_manager_sheet_payload(
+        run_timestamp=run_started_at,
+        week_start=week_start or "",
+        week_end=week_end or "",
+        rustam_records=rustam_records,
+        ilya_records=ilya_records,
+    )
+    weekly_payload_path = weekly_dir / "weekly_manager_sheet_payload.json"
+    _write_json_path(weekly_payload_path, weekly_sheet_payload)
+    weekly_writer_status = _maybe_write_weekly_manager_sheet(
+        cfg=cfg,
+        logger=logger,
+        weekly_payload=weekly_sheet_payload,
+    )
+    summary_payload["weekly_manager_writer"] = weekly_writer_status
     _write_json_path(summary_path, summary_payload)
     logger.info(
-        "analyze-weekly success: deals_seen=%s deals_analyzed=%s failed=%s rustam=%s ilya=%s llm_success=%s llm_fallback=%s weekly_dir=%s",
+        "analyze-weekly success: deals_seen=%s deals_analyzed=%s failed=%s rustam=%s ilya=%s llm_success=%s llm_fallback=%s weekly_dir=%s weekly_sheet_payload=%s",
         len(normalized_rows_all),
         len(base_records),
         deals_failed,
@@ -1430,6 +1606,7 @@ def _run_analyze_weekly(
         llm_counts["llm_success_count"],
         llm_counts["llm_fallback_count"],
         weekly_dir,
+        weekly_payload_path,
     )
 
 
@@ -1758,6 +1935,186 @@ def _extract_raw_bundles_map(payload: dict[str, Any] | list[Any]) -> dict[str, d
     return {}
 
 
+def _try_live_refresh_period_rows(
+    *,
+    cfg: DealAnalyzerConfig,
+    logger,
+    resolved,
+    fallback_rows: list[dict[str, Any]],
+    fallback_raw_bundles: dict[str, dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], dict[str, Any]]:
+    diag: dict[str, Any] = {
+        "mode": "fallback_input_json",
+        "api_first_attempted": False,
+        "api_refresh_success": False,
+        "fallback_used": True,
+        "rows_from_api": 0,
+        "rows_final": len(fallback_rows),
+        "error": "",
+    }
+    if not bool(getattr(cfg, "period_live_refresh_enabled", True)):
+        diag["error"] = "period_live_refresh_disabled"
+        logger.info("live refresh skipped: reason=period_live_refresh_disabled")
+        return fallback_rows, fallback_raw_bundles, diag
+    if str(getattr(cfg, "call_collection_mode", "") or "").strip().lower() == "disabled":
+        diag["error"] = "call_collection_mode_disabled"
+        logger.info("live refresh skipped: reason=call_collection_mode_disabled")
+        return fallback_rows, fallback_raw_bundles, diag
+
+    try:
+        auth_cfg = load_amocrm_auth_config(getattr(cfg, "amocrm_auth_config_path", None))
+        auth_state = load_auth_state(auth_cfg.state_path)
+        access_token = str(getattr(auth_state, "access_token", "") or "").strip()
+        base_domain = str(getattr(cfg, "call_base_domain", "") or "").strip() or str(getattr(auth_cfg, "base_domain", "") or "").strip()
+        if not base_domain:
+            raise RuntimeError("missing_base_domain")
+        if not access_token:
+            raise RuntimeError("missing_access_token")
+
+        diag["api_first_attempted"] = True
+        client = AmoCollectorClient(base_domain=base_domain, access_token=access_token)
+        date_from_unix = int(
+            datetime(
+                resolved.period_start.year,
+                resolved.period_start.month,
+                resolved.period_start.day,
+                0,
+                0,
+                0,
+                tzinfo=timezone.utc,
+            ).timestamp()
+        )
+        date_to_unix = int(
+            datetime(
+                resolved.period_end.year,
+                resolved.period_end.month,
+                resolved.period_end.day,
+                23,
+                59,
+                59,
+                tzinfo=timezone.utc,
+            ).timestamp()
+        )
+
+        fetched: list[dict[str, Any]] = []
+        page = 1
+        users_cache = client.get_users_cache()
+        status_cache = client.get_status_cache()
+        pipeline_names: dict[int, str] = {
+            int(p.get("id")): str(p.get("name") or "").strip()
+            for p in client.get_pipelines_cache()
+            if isinstance(p, dict) and isinstance(p.get("id"), int)
+        }
+        while True:
+            batch = client.get_leads_by_period(
+                date_from_unix=date_from_unix,
+                date_to_unix=date_to_unix,
+                page=page,
+                limit=250,
+            )
+            if not batch:
+                break
+            fetched.extend(batch)
+            if len(batch) < 250:
+                break
+            page += 1
+
+        existing_by_id: dict[str, dict[str, Any]] = {
+            str(row.get("deal_id") or row.get("amo_lead_id") or ""): dict(row)
+            for row in fallback_rows
+            if isinstance(row, dict)
+        }
+        refreshed: list[dict[str, Any]] = []
+        for lead in fetched:
+            did = str(lead.get("id") or "").strip()
+            if not did:
+                continue
+            base = existing_by_id.get(did, {"deal_id": int(did), "amo_lead_id": int(did)})
+            pipeline_id = int(lead.get("pipeline_id")) if isinstance(lead.get("pipeline_id"), int) else None
+            status_id = int(lead.get("status_id")) if isinstance(lead.get("status_id"), int) else None
+            responsible_user_id = int(lead.get("responsible_user_id")) if isinstance(lead.get("responsible_user_id"), int) else None
+            responsible_name = ""
+            if isinstance(responsible_user_id, int):
+                responsible_name = str(users_cache.get(responsible_user_id, {}).get("name") or "").strip()
+            status_name = ""
+            if isinstance(pipeline_id, int) and isinstance(status_id, int):
+                status_name = str(status_cache.get((pipeline_id, status_id), {}).get("name") or "").strip()
+            if not status_name:
+                status_name = str(base.get("status_name") or "").strip()
+
+            base.update(
+                {
+                    "deal_id": int(did),
+                    "amo_lead_id": int(did),
+                    "deal_name": str(lead.get("name") or base.get("deal_name") or "").strip(),
+                    "created_at": lead.get("created_at") or base.get("created_at") or "",
+                    "updated_at": lead.get("updated_at") or base.get("updated_at") or "",
+                    "pipeline_id": pipeline_id if pipeline_id is not None else base.get("pipeline_id"),
+                    "pipeline_name": pipeline_names.get(pipeline_id, str(base.get("pipeline_name") or "")),
+                    "status_id": status_id if status_id is not None else base.get("status_id"),
+                    "status_name": status_name,
+                    "responsible_user_id": responsible_user_id if responsible_user_id is not None else base.get("responsible_user_id"),
+                    "responsible_user_name": responsible_name or str(base.get("responsible_user_name") or "").strip(),
+                }
+            )
+            refreshed.append(base)
+
+        if refreshed:
+            diag["mode"] = "live_refresh_amocrm_api"
+            diag["api_refresh_success"] = True
+            diag["fallback_used"] = False
+            diag["rows_from_api"] = len(refreshed)
+            diag["rows_final"] = len(refreshed)
+            logger.info(
+                "live refresh success: source=amocrm_api period=%s..%s rows=%s",
+                resolved.period_start.isoformat(),
+                resolved.period_end.isoformat(),
+                len(refreshed),
+            )
+            return refreshed, fallback_raw_bundles, diag
+
+        diag["error"] = "live_refresh_empty_batch"
+        logger.warning(
+            "live refresh fallback: reason=empty_batch period=%s..%s",
+            resolved.period_start.isoformat(),
+            resolved.period_end.isoformat(),
+        )
+    except Exception as exc:
+        diag["error"] = str(exc)
+        logger.warning("live refresh fallback: reason=api_failed error=%s", exc)
+
+    diag["rows_final"] = len(fallback_rows)
+    return fallback_rows, fallback_raw_bundles, diag
+
+
+def _period_deal_priority_key(row: dict[str, Any]) -> tuple[int, int, int, int, str]:
+    call_priority = 0
+    if bool(row.get("long_call_detected")) or int(row.get("longest_call_duration_seconds", 0) or 0) > 0:
+        call_priority = 2
+    elif str(row.get("brief_url") or "").strip() or str(row.get("demo_result_text") or "").strip():
+        call_priority = 1
+
+    context_priority = 0
+    if isinstance(row.get("notes_summary_raw"), list) and row.get("notes_summary_raw"):
+        context_priority += 1
+    if isinstance(row.get("tasks_summary_raw"), list) and row.get("tasks_summary_raw"):
+        context_priority += 1
+    if str(row.get("company_comment") or "").strip() or str(row.get("contact_comment") or "").strip():
+        context_priority += 1
+
+    updated_score = 0
+    updated_raw = row.get("updated_at")
+    if isinstance(updated_raw, (int, float)):
+        updated_score = int(updated_raw)
+    else:
+        text = str(updated_raw or "").strip()
+        if text.isdigit():
+            updated_score = int(text)
+
+    did = str(row.get("deal_id") or row.get("amo_lead_id") or "")
+    return (-call_priority, -context_priority, -updated_score, 0 if did else 1, did)
+
+
 def _prepare_period_run_dirs(*, output_dir: Path, run_started_at: datetime) -> tuple[Path, Path]:
     run_id = run_started_at.strftime("%Y%m%d_%H%M%S")
     run_dir = output_dir / "period_runs" / run_id
@@ -1874,6 +2231,24 @@ def _build_transcript_runtime_diagnostics(period_deal_records: list[dict[str, An
     }
 
 
+def _transcript_error_counters(transcripts: list[dict[str, Any]]) -> dict[str, int]:
+    missing_audio = 0
+    backend_config = 0
+    for item in transcripts:
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get("transcript_status") or "").strip().lower()
+        err = str(item.get("transcript_error") or "").strip().lower()
+        if status in {"missing_audio_file", "missing_recording"} or "audio_path_not_found" in err:
+            missing_audio += 1
+        if status in {"backend_unavailable", "not_configured"} or "import_failed" in err or "model" in err:
+            backend_config += 1
+    return {
+        "missing_audio": missing_audio,
+        "backend_config": backend_config,
+    }
+
+
 def _build_call_runtime_diagnostics(
     period_deal_records: list[dict[str, Any]],
     *,
@@ -1895,6 +2270,8 @@ def _build_call_runtime_diagnostics(
         "transcription_attempted": sum(int(x.get("transcription_attempted_count", 0) or 0) for x in deals),
         "transcription_success": sum(int(x.get("transcription_success_count", 0) or 0) for x in deals),
         "transcription_failed": sum(int(x.get("transcription_failed_count", 0) or 0) for x in deals),
+        "transcription_failed_missing_audio": sum(int(x.get("transcription_missing_audio_count", 0) or 0) for x in deals),
+        "transcription_failed_backend_config": sum(int(x.get("transcription_backend_config_failed_count", 0) or 0) for x in deals),
     }
 
 
@@ -1985,6 +2362,8 @@ def _build_period_summary_markdown(*, summary: dict[str, Any], period_deal_recor
     lines.append(f"- Найдено записей: {call_diag.get('deals_with_recording_url', 0)} сделок с recording_url")
     lines.append(f"- Скачано: {call_diag.get('audio_downloaded', 0)}")
     lines.append(f"- Расшифровано: {call_diag.get('transcription_success', 0)}")
+    lines.append(f"- Не дошло до текста из-за отсутствия аудио: {call_diag.get('transcription_failed_missing_audio', 0)}")
+    lines.append(f"- Ошибки модели/бэкенда: {call_diag.get('transcription_failed_backend_config', 0)}")
     if int(call_diag.get("transcription_success", 0) or 0) > 0:
         lines.append("- Итог: call-layer реально работает.")
     else:
@@ -1997,6 +2376,24 @@ def _build_period_summary_markdown(*, summary: dict[str, Any], period_deal_recor
     lines.append(f"- Deals seen: {summary.get('total_deals_seen', 0)}")
     lines.append(f"- Deals analyzed: {summary.get('total_deals_analyzed', 0)}")
     lines.append(f"- Deals failed: {summary.get('deals_failed', 0)}")
+    live_refresh = summary.get("live_refresh", {}) if isinstance(summary.get("live_refresh"), dict) else {}
+    if live_refresh:
+        lines.append(
+            "- Live refresh: "
+            f"mode={live_refresh.get('mode','')} api_refresh_success={live_refresh.get('api_refresh_success', False)} "
+            f"rows_final={live_refresh.get('rows_final', 0)}"
+        )
+        if str(live_refresh.get("error") or "").strip():
+            lines.append(f"- Live refresh fallback reason: {live_refresh.get('error')}")
+    mq_writer = summary.get("meeting_queue_writer", {}) if isinstance(summary.get("meeting_queue_writer"), dict) else {}
+    lines.append(
+        "- Meeting queue writer: mode={mode} rows={rows} target={sheet}:{cell}".format(
+            mode=mq_writer.get("mode", "dry_run"),
+            rows=mq_writer.get("rows_written", 0),
+            sheet=mq_writer.get("sheet_name", "") or "-",
+            cell=mq_writer.get("start_cell", "") or "-",
+        )
+    )
     lines.append("")
 
     agg = summary.get("score_aggregates", {}) if isinstance(summary.get("score_aggregates"), dict) else {}
@@ -3101,7 +3498,7 @@ def _queue_reason_label(reason: str) -> str:
 def _queue_reason_human(reason: str) -> str:
     labels = {
         "active_risk": "нужен ближайший следующий шаг",
-        "low_confidence_needs_manual_check": "перепроверить / переслушать на свежую голову",
+        "low_confidence_needs_manual_check": "перепроверить на свежую голову, переслушать звонок, уточнить по CRM и сверить фактического ведущего сделки",
         "qualified_loss_for_pattern_review": "проверить, это разовая потеря или повторяющийся паттерн",
         "closed_lost_cleanup_review": "уточнить причину потери и решить, есть ли смысл аккуратно вернуться",
         "won_handoff_check": "проверить передачу после победы",
@@ -3305,11 +3702,17 @@ def _extract_transcription_compare_view(analysis: dict[str, Any]) -> dict[str, A
                     break
     return {
         "product_hypothesis": str(analysis.get("product_hypothesis") or "unknown"),
+        "product_hypothesis_confidence": str(analysis.get("product_hypothesis_confidence") or "low"),
+        "product_hypothesis_reason_short": str(analysis.get("product_hypothesis_reason_short") or ""),
         "call_signal_summary_short": str(analysis.get("call_signal_summary_short") or ""),
         "reanimation_potential": str(analysis.get("reanimation_potential") or "none"),
+        "reanimation_reason_short": str(analysis.get("reanimation_reason_short") or ""),
         "top_risk_flags": [str(x) for x in risk_flags[:3]],
         "key_risk": str(risk_flags[0]) if risk_flags else "",
         "manager_one_liner": manager_one_liner,
+        "manager_summary": str(analysis.get("manager_summary") or ""),
+        "employee_coaching": str(analysis.get("employee_coaching") or ""),
+        "employee_fix_tasks": [str(x) for x in (analysis.get("employee_fix_tasks") if isinstance(analysis.get("employee_fix_tasks"), list) else [])],
         "next_step": next_step,
     }
 
@@ -3328,18 +3731,20 @@ def _build_transcription_impact_row(
     artifact_path: str,
 ) -> dict[str, Any]:
     changed_fields: list[str] = []
-    for key in (
+    meaningful_keys = (
         "product_hypothesis",
+        "product_hypothesis_confidence",
+        "product_hypothesis_reason_short",
         "call_signal_summary_short",
         "reanimation_potential",
-        "key_risk",
-        "manager_one_liner",
-        "next_step",
-    ):
+        "reanimation_reason_short",
+        "manager_summary",
+        "employee_coaching",
+        "employee_fix_tasks",
+    )
+    for key in meaningful_keys:
         if (without_view.get(key) or "") != (with_view.get(key) or ""):
             changed_fields.append(key)
-    if without_view.get("top_risk_flags") != with_view.get("top_risk_flags"):
-        changed_fields.append("top_risk_flags")
 
     transcripts = snapshot.get("transcripts") if isinstance(snapshot.get("transcripts"), list) else []
     transcript_available = bool(analysis.get("transcript_available")) or bool(transcripts)
@@ -3371,6 +3776,9 @@ def _build_transcription_impact_row(
         "changed": bool(changed_fields),
         "impact_bucket": impact_bucket,
         "why_in_queue": str(analysis.get("why_in_queue") or ""),
+        "baseline_summary": str(without_view.get("manager_summary") or without_view.get("manager_one_liner") or "").strip(),
+        "transcript_summary": str(with_view.get("manager_summary") or with_view.get("manager_one_liner") or "").strip(),
+        "transcript_excerpt": str(analysis.get("transcript_text_excerpt") or "").strip(),
         "artifact_path": artifact_path,
     }
 
@@ -3438,6 +3846,1359 @@ def _build_transcription_impact_markdown(*, transcription_impact_rows: list[dict
     return "\n".join(lines).strip() + "\n"
 
 
+def _build_transcription_impact_payload(*, transcription_impact_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    rows = [x for x in transcription_impact_rows if isinstance(x, dict)]
+    deals_with_transcript = sum(1 for x in rows if bool(x.get("transcript_available")))
+    changed_deals = [x for x in rows if bool(x.get("changed"))]
+    changed_payload: list[dict[str, Any]] = []
+    for item in changed_deals:
+        changed_payload.append(
+            {
+                "deal_id": item.get("deal_id"),
+                "deal_name": item.get("deal_name", ""),
+                "owner_name": item.get("owner_name", ""),
+                "baseline_summary": item.get("baseline_summary", ""),
+                "transcript_summary": item.get("transcript_summary", ""),
+                "changed_fields": item.get("changed_fields", []) if isinstance(item.get("changed_fields"), list) else [],
+                "transcript_excerpt": item.get("transcript_excerpt", ""),
+                "artifact_path": item.get("artifact_path", ""),
+            }
+        )
+    return {
+        "total_deals_analyzed": len(rows),
+        "deals_with_transcript": deals_with_transcript,
+        "deals_changed_by_transcript": len(changed_payload),
+        "deals_unchanged_by_transcript": max(0, len(rows) - len(changed_payload)),
+        "changed_deals": changed_payload,
+    }
+
+
+def _build_daily_control_sheet_payload(
+    *,
+    summary: dict[str, Any],
+    period_deal_records: list[dict[str, Any]],
+    amo_base_domain: str = "",
+    manager_allowlist: list[str] | tuple[str, ...] | None = None,
+    cfg: DealAnalyzerConfig | None = None,
+    logger: Any | None = None,
+    backend_effective: str | None = None,
+    style_source_excerpt: str = "",
+) -> dict[str, Any]:
+    records = [x for x in period_deal_records if isinstance(x, dict) and x.get("score") is not None]
+    allowlist = _resolve_daily_manager_allowlist(manager_allowlist)
+    allowset = {x.lower() for x in allowlist}
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for item in records:
+        manager = _normalize_manager_for_dropdown(" ".join(str(item.get("owner_name") or "").strip().split()))
+        if not manager:
+            manager = "Не указан"
+        if manager.lower() not in allowset:
+            continue
+        grouped.setdefault(manager, []).append(item)
+
+    period_start = str(summary.get("period_start") or "")
+    period_end = str(summary.get("period_end") or "")
+    run_date = str(summary.get("run_timestamp") or "").split("T", 1)[0]
+    control_days = _resolve_daily_control_days(
+        period_start=period_start,
+        period_end=period_end,
+        records=records,
+        run_date=run_date,
+    )
+
+    rows: list[dict[str, Any]] = []
+    used_deal_ids_by_manager: dict[str, set[str]] = {m: set() for m in grouped}
+    for control_day in control_days:
+        for manager, manager_records in sorted(grouped.items(), key=lambda x: _manager_sort_key(x[0], allowlist=allowlist)):
+            role = _manager_role_label(manager)
+            used_deal_ids = used_deal_ids_by_manager.setdefault(manager, set())
+            package_items = _select_daily_package_records(
+                manager_records=manager_records,
+                control_day=control_day,
+                package_target=6,
+                carryover_days=7,
+                exclude_deal_ids=used_deal_ids,
+            )
+            if not package_items:
+                package_items = _select_daily_package_records_relaxed(
+                    manager_records=manager_records,
+                    package_target=3,
+                    exclude_deal_ids=used_deal_ids,
+                )
+            if not package_items:
+                continue
+            for item in package_items:
+                did = str(item.get("deal_id") or "").strip()
+                if did:
+                    used_deal_ids.add(did)
+
+            scores = [int(x.get("score")) for x in package_items if isinstance(x.get("score"), int)]
+            avg_score = _daily_weighted_score(package_items) if package_items else (round(sum(scores) / len(scores)) if scores else None)
+            links = _build_daily_deal_links(items=package_items, base_domain=amo_base_domain)
+            top_risks_raw = _collect_top_risk_flags(package_items, limit=5)
+            strong = _collect_short_list(package_items, "strong_sides", limit=3)
+            growth = _collect_short_list(package_items, "growth_zones", limit=5)
+            filtered_growth, role_note = _filter_growth_for_role(
+                role=role,
+                growth=growth,
+                top_risks=top_risks_raw,
+                items=package_items,
+            )
+            manager_msgs = _collect_short_text(package_items, "manager_summary", limit=2)
+            employee_msgs = _collect_short_text(package_items, "employee_coaching", limit=1)
+            focus = _top_product_focus(package_items)
+            quality_mix = _build_base_mix_text(package_items)
+            selection_reason = _daily_selection_reason(package_items)
+            fallback_key_takeaway = _daily_user_text(
+                _build_daily_key_takeaway(
+                    manager=manager,
+                    role=role,
+                    items=package_items,
+                    manager_msgs=manager_msgs,
+                    growth=filtered_growth,
+                )
+            )
+            criticality = _score_to_criticality(avg_score, risk_count=sum(len(x.get("risk_flags", [])) for x in package_items))
+            fallback_strong_text = _daily_user_text(_build_daily_strong_sides(items=package_items, strong=strong))
+            growth_compact = _daily_growth_compact(filtered_growth)
+            fallback_reinforce = _daily_user_text(_build_daily_reinforce(items=package_items, role=role, strong=strong))
+            fallback_fix = _daily_user_text(_build_daily_fix_action(items=package_items, role=role, growth=growth_compact))
+            fallback_why_important = _daily_user_text(
+                _build_daily_why_important(role=role, items=package_items, role_note=role_note)
+            )
+            fallback_expected_qty = _daily_user_text(
+                _expected_quantity_text(avg_score=avg_score, deals=len(package_items), role=role)
+            )
+            fallback_expected_quality = _daily_user_text(_expected_quality_text(criticality=criticality, role=role))
+            fallback_coaching_text = _daily_user_text(
+                _build_daily_coaching_list(
+                    items=package_items,
+                    role=role,
+                    growth=growth_compact,
+                    employee_msgs=employee_msgs,
+                )
+            )
+            fallback_columns = {
+                "Ключевой вывод": fallback_key_takeaway,
+                "Сильные стороны": fallback_strong_text,
+                "Зоны роста": _daily_user_text("; ".join(str(x) for x in growth_compact)),
+                "Почему это важно": fallback_why_important,
+                "Что закрепить": fallback_reinforce,
+                "Что исправить": fallback_fix,
+                "Что донес сотруднику": fallback_coaching_text,
+                "Ожидаемый эффект - количество": fallback_expected_qty,
+                "Ожидаемый эффект - качество": fallback_expected_quality,
+            }
+            llm_text_columns = _generate_daily_table_text_columns(
+                cfg=cfg,
+                logger=logger,
+                backend_effective=backend_effective,
+                manager=manager,
+                role=role,
+                control_day=control_day,
+                period_start=period_start,
+                period_end=period_end,
+                package_items=package_items,
+                links=links,
+                focus=focus,
+                base_mix=quality_mix,
+                avg_score=avg_score,
+                criticality=criticality,
+                selection_reason=selection_reason,
+                growth_candidates=growth_compact,
+                fallback_columns=fallback_columns,
+                style_source_excerpt=style_source_excerpt,
+            )
+
+            rows.append(
+                {
+                    "Неделя с": period_start,
+                    "Неделя по": period_end,
+                    "Дата контроля": control_day,
+                    "День": _weekday_ru_from_iso(control_day),
+                    "Менеджер": _normalize_manager_for_dropdown(manager),
+                    "Роль менеджера": role,
+                    "Проанализировано сделок": len(package_items),
+                    "Ссылки на сделки": links,
+                    "Продукт / фокус": focus,
+                    "База микс": quality_mix,
+                    "Ключевой вывод": llm_text_columns.get("Ключевой вывод", fallback_key_takeaway),
+                    "Сильные стороны": llm_text_columns.get("Сильные стороны", fallback_strong_text),
+                    "Зоны роста": llm_text_columns.get("Зоны роста", _daily_user_text("; ".join(str(x) for x in growth_compact))),
+                    "Почему это важно": llm_text_columns.get("Почему это важно", fallback_why_important),
+                    "Что закрепить": llm_text_columns.get("Что закрепить", fallback_reinforce),
+                    "Что исправить": llm_text_columns.get("Что исправить", fallback_fix),
+                    "Что донес сотруднику": llm_text_columns.get("Что донес сотруднику", fallback_coaching_text),
+                    "Ожидаемый эффект - количество": llm_text_columns.get("Ожидаемый эффект - количество", fallback_expected_qty),
+                    "Ожидаемый эффект - качество": llm_text_columns.get("Ожидаемый эффект - качество", fallback_expected_quality),
+                    "Оценка 0-100": avg_score if avg_score is not None else "",
+                    "Критичность": criticality,
+                    "selection_reason": selection_reason,
+                }
+            )
+
+    return {
+        "mode": "daily_control",
+        "sheet_name": "Дневной контроль",
+        "start_cell": "A2",
+        "columns": list(DAILY_CONTROL_COLUMNS),
+        "rows": rows,
+        "rows_count": len(rows),
+    }
+
+
+def _load_daily_style_source_excerpt(*, logger: Any | None) -> str:
+    app = load_config()
+    style_path = app.project_root / "docs" / "мой паттерн общения.txt"
+    try:
+        text = style_path.read_text(encoding="utf-8")
+    except Exception as exc:
+        if logger is not None:
+            logger.warning("daily style source unavailable: path=%s error=%s", style_path, exc)
+        return ""
+    compact = " ".join(text.split())
+    return compact[:1400]
+
+
+def _generate_daily_table_text_columns(
+    *,
+    cfg: DealAnalyzerConfig | None,
+    logger: Any | None,
+    backend_effective: str | None,
+    manager: str,
+    role: str,
+    control_day: str,
+    period_start: str,
+    period_end: str,
+    package_items: list[dict[str, Any]],
+    links: str,
+    focus: str,
+    base_mix: str,
+    avg_score: int | None,
+    criticality: str,
+    selection_reason: str,
+    growth_candidates: list[str],
+    fallback_columns: dict[str, str],
+    style_source_excerpt: str,
+) -> dict[str, str]:
+    if cfg is None:
+        return dict(fallback_columns)
+    if (backend_effective or cfg.analyzer_backend) not in {"ollama", "hybrid"}:
+        return dict(fallback_columns)
+
+    factual_payload = _build_daily_table_factual_payload(
+        manager=manager,
+        role=role,
+        control_day=control_day,
+        period_start=period_start,
+        period_end=period_end,
+        package_items=package_items,
+        links=links,
+        focus=focus,
+        base_mix=base_mix,
+        avg_score=avg_score,
+        criticality=criticality,
+        selection_reason=selection_reason,
+        growth_candidates=growth_candidates,
+        fallback_columns=fallback_columns,
+    )
+    messages = build_daily_table_messages(
+        factual_payload=factual_payload,
+        config=cfg,
+        style_source_excerpt=style_source_excerpt,
+    )
+    client = OllamaClient(
+        base_url=cfg.ollama_base_url,
+        model=cfg.ollama_model,
+        timeout_seconds=cfg.ollama_timeout_seconds,
+    )
+    try:
+        parsed = client.chat_json(messages=messages)
+        payload = parsed.payload
+        if logger is not None:
+            logger.info(
+                "daily llm text generated: manager=%s day=%s backend=%s repaired=%s",
+                manager,
+                control_day,
+                backend_effective or cfg.analyzer_backend,
+                bool(parsed.repair_applied),
+            )
+    except Exception as exc:
+        if logger is not None:
+            logger.warning(
+                "daily llm text generation failed, retrying strict json: manager=%s day=%s error=%s",
+                manager,
+                control_day,
+                exc,
+            )
+        try:
+            parsed = client.chat_json(messages=append_daily_table_json_repair_instruction(messages))
+            payload = parsed.payload
+        except Exception as retry_exc:
+            if logger is not None:
+                logger.warning(
+                    "daily llm text generation fallback to deterministic: manager=%s day=%s error=%s",
+                    manager,
+                    control_day,
+                    retry_exc,
+                )
+            return dict(fallback_columns)
+
+    return _sanitize_daily_llm_columns(
+        payload=payload if isinstance(payload, dict) else {},
+        fallback=fallback_columns,
+        role=role,
+    )
+
+
+def _build_daily_table_factual_payload(
+    *,
+    manager: str,
+    role: str,
+    control_day: str,
+    period_start: str,
+    period_end: str,
+    package_items: list[dict[str, Any]],
+    links: str,
+    focus: str,
+    base_mix: str,
+    avg_score: int | None,
+    criticality: str,
+    selection_reason: str,
+    growth_candidates: list[str],
+    fallback_columns: dict[str, str],
+) -> dict[str, Any]:
+    short_deals: list[dict[str, Any]] = []
+    for item in package_items[:6]:
+        short_deals.append(
+            {
+                "deal_id": item.get("deal_id"),
+                "status": item.get("status_name", ""),
+                "pipeline": item.get("pipeline_name", ""),
+                "risk_flags": (item.get("risk_flags", []) if isinstance(item.get("risk_flags"), list) else [])[:4],
+                "call_summary": str(item.get("call_signal_summary_short") or ""),
+                "transcript_excerpt": str(item.get("transcript_text_excerpt") or "")[:280],
+                "manager_summary": str(item.get("manager_summary") or "")[:220],
+                "employee_coaching": str(item.get("employee_coaching") or "")[:220],
+            }
+        )
+    role_forbidden_topics = (
+        [
+            "презентация",
+            "демонстрация",
+            "бриф",
+            "тест",
+        ]
+        if "телемаркетолог" in str(role).lower()
+        else []
+    )
+    return {
+        "manager_name": manager,
+        "role": role,
+        "control_day": control_day,
+        "period_start": period_start,
+        "period_end": period_end,
+        "deal_links": links,
+        "product_focus": focus,
+        "base_mix": base_mix,
+        "score_0_100": avg_score,
+        "criticality": criticality,
+        "selection_reason": selection_reason,
+        "deals": short_deals,
+        "growth_candidates": growth_candidates,
+        "role_forbidden_topics": role_forbidden_topics,
+        "fallback_reference": fallback_columns,
+        "data_confidence_hint": _daily_confidence_hint(package_items),
+    }
+
+
+def _daily_confidence_hint(items: list[dict[str, Any]]) -> str:
+    low = sum(1 for x in items if _is_low_confidence_record(x))
+    if not items:
+        return "low"
+    if low >= max(1, len(items) // 2):
+        return "low"
+    return "normal"
+
+
+def _sanitize_daily_llm_columns(*, payload: dict[str, Any], fallback: dict[str, str], role: str) -> dict[str, str]:
+    mapped = {
+        "Ключевой вывод": _daily_user_text(str(payload.get("key_takeaway") or fallback.get("Ключевой вывод", ""))),
+        "Сильные стороны": _daily_user_text(str(payload.get("strong_sides") or fallback.get("Сильные стороны", ""))),
+        "Зоны роста": _daily_user_text(str(payload.get("growth_zones") or fallback.get("Зоны роста", ""))),
+        "Почему это важно": _daily_user_text(str(payload.get("why_important") or fallback.get("Почему это важно", ""))),
+        "Что закрепить": _daily_user_text(str(payload.get("reinforce") or fallback.get("Что закрепить", ""))),
+        "Что исправить": _daily_user_text(str(payload.get("fix_action") or fallback.get("Что исправить", ""))),
+        "Что донес сотруднику": _daily_user_text(str(payload.get("coaching_list") or fallback.get("Что донес сотруднику", ""))),
+        "Ожидаемый эффект - количество": _daily_user_text(
+            str(payload.get("expected_quantity") or fallback.get("Ожидаемый эффект - количество", ""))
+        ),
+        "Ожидаемый эффект - качество": _daily_user_text(
+            str(payload.get("expected_quality") or fallback.get("Ожидаемый эффект - качество", ""))
+        ),
+    }
+    mapped["Ключевой вывод"] = _strip_forbidden_daily_phrases(mapped["Ключевой вывод"])
+    mapped["Почему это важно"] = _strip_forbidden_daily_phrases(mapped["Почему это важно"])
+    mapped["Что закрепить"] = _strip_forbidden_daily_phrases(mapped["Что закрепить"])
+    mapped["Что исправить"] = _strip_forbidden_daily_phrases(mapped["Что исправить"]).replace("на ближайший цикл", "")
+
+    growth = _sanitize_daily_growth(role=role, value=mapped["Зоны роста"], fallback=fallback.get("Зоны роста", ""))
+    mapped["Зоны роста"] = growth
+    if mapped["Что исправить"].strip() == growth.strip():
+        mapped["Что исправить"] = fallback.get("Что исправить", mapped["Что исправить"])
+
+    mapped["Что донес сотруднику"] = _sanitize_daily_coaching_text(
+        value=mapped["Что донес сотруднику"],
+        fallback=fallback.get("Что донес сотруднику", ""),
+    )
+    mapped["Ожидаемый эффект - количество"] = _sanitize_daily_expected_quantity(
+        value=mapped["Ожидаемый эффект - количество"],
+        fallback=fallback.get("Ожидаемый эффект - количество", ""),
+    )
+    mapped["Ожидаемый эффект - качество"] = _sanitize_daily_expected_quality(
+        value=mapped["Ожидаемый эффект - качество"],
+        fallback=fallback.get("Ожидаемый эффект - качество", ""),
+    )
+    return mapped
+
+
+def _strip_forbidden_daily_phrases(value: str) -> str:
+    text = " ".join(str(value or "").split()).strip()
+    replacements = {
+        "qualified loss": "не наш кейс",
+        "anti-fit": "не наш кейс",
+        "market mismatch": "не наш кейс",
+        "owner ambiguity": "по этой сделке выводы пока предварительные",
+        "follow-up": "следующий шаг",
+        "closeout": "закрытие причины отказа",
+        "ограниченная надежность выводов": "выводы пока предварительные",
+        "контекст последних касаний": "что было зафиксировано в CRM",
+        "проверить фактуру в crm": "перепроверить по CRM",
+        "сверить кто по факту вел": "уточнить фактическое ведение",
+    }
+    low = text.lower()
+    for old, new in replacements.items():
+        if old in low:
+            pattern = re.compile(re.escape(old), flags=re.IGNORECASE)
+            text = pattern.sub(new, text)
+            low = text.lower()
+    return text
+
+
+def _sanitize_daily_growth(*, role: str, value: str, fallback: str) -> str:
+    parts = [x.strip(" .;-") for x in re.split(r"[;\n]+", value or "") if x.strip(" .;-")]
+    out: list[str] = []
+    warm_markers = ("презентац", "демо", "демонстрац", "бриф", "тест")
+    for part in parts:
+        low = part.lower()
+        if "телемаркетолог" in str(role).lower() and any(m in low for m in warm_markers):
+            continue
+        if part not in out:
+            out.append(part)
+    if not out:
+        out = [x.strip() for x in str(fallback or "").split(";") if x.strip()]
+    return "; ".join(out[:2])
+
+
+def _sanitize_daily_coaching_text(*, value: str, fallback: str) -> str:
+    text = str(value or "").replace("Донес:", "").replace("донес:", "").strip()
+    lines = [x.strip(" -") for x in text.splitlines() if x.strip()]
+    numbered = [x for x in lines if re.match(r"^[1-3]\)", x)]
+    if len(numbered) >= 3:
+        return "\n".join(numbered[:3])
+    chunks = re.split(r"[.;]+", text)
+    chunks = [x.strip(" -") for x in chunks if x.strip()]
+    if len(chunks) < 3:
+        fallback_lines = [x.strip() for x in str(fallback or "").splitlines() if x.strip()]
+        fb_num = [x for x in fallback_lines if re.match(r"^[1-3]\)", x)]
+        if len(fb_num) >= 3:
+            return "\n".join(fb_num[:3])
+    built: list[str] = []
+    for idx, chunk in enumerate(chunks[:3], start=1):
+        chunk_clean = re.sub(r"^[1-3]\)\s*", "", chunk).strip()
+        built.append(f"{idx}) {chunk_clean}")
+    while len(built) < 3:
+        built.append(f"{len(built)+1}) Уточнить по 2-3 свежим звонкам и закрепить в работе.")
+    return "\n".join(built)
+
+
+def _sanitize_daily_expected_quantity(*, value: str, fallback: str) -> str:
+    text = " ".join(str(value or "").split()).strip()
+    if not text:
+        return fallback
+    low = text.lower()
+    if "%" in low or "конверси" in low:
+        return fallback
+    if "этап" in low and not any(ch.isdigit() for ch in low):
+        return fallback
+    if re.fullmatch(r"[+\-]?\d+(?:-\d+)?", low):
+        return fallback
+    if not any(token in low for token in ("+1", "+2", "1-2", "-1", "1 дополнитель")) and not any(
+        ch.isdigit() for ch in low
+    ):
+        return fallback
+    return text
+
+
+def _sanitize_daily_expected_quality(*, value: str, fallback: str) -> str:
+    text = " ".join(str(value or "").split()).strip()
+    if not text:
+        return fallback
+    return _strip_forbidden_daily_phrases(text)
+
+
+def _build_weekly_manager_sheet_payload(
+    *,
+    run_timestamp: datetime,
+    week_start: str,
+    week_end: str,
+    rustam_records: list[dict[str, Any]],
+    ilya_records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    control_date = run_timestamp.date().isoformat()
+    day_label = _weekday_ru_from_iso(control_date)
+    rows = [
+        _build_weekly_manager_row_dict(
+            manager_name="Рустам",
+            role_focus="Холодный этап",
+            records=rustam_records,
+            week_start=week_start,
+            week_end=week_end,
+            control_date=control_date,
+            day_label=day_label,
+        ),
+        _build_weekly_manager_row_dict(
+            manager_name="Илья",
+            role_focus="Теплый этап",
+            records=ilya_records,
+            week_start=week_start,
+            week_end=week_end,
+            control_date=control_date,
+            day_label=day_label,
+        ),
+    ]
+    return {
+        "mode": "weekly_manager_summary",
+        "sheet_name": "Недельный свод менеджеров",
+        "start_cell": "A2",
+        "columns": list(WEEKLY_MANAGER_COLUMNS),
+        "rows": rows,
+        "rows_count": len(rows),
+    }
+
+
+def _build_weekly_manager_row_dict(
+    *,
+    manager_name: str,
+    role_focus: str,
+    records: list[dict[str, Any]],
+    week_start: str,
+    week_end: str,
+    control_date: str,
+    day_label: str,
+) -> dict[str, Any]:
+    analyzed = len(records)
+    scores = [int(x.get("score")) for x in records if isinstance(x.get("score"), int)]
+    avg_score = round(sum(scores) / len(scores)) if scores else ""
+    top_risks = _collect_top_risk_flags(records, limit=3)
+    strong = _collect_short_list(records, "strong_sides", limit=3)
+    growth = _collect_short_list(records, "growth_zones", limit=3)
+    manager_note = _humanize_work_text(_collect_short_text(records, "manager_summary", limit=1))
+    employee_note = _humanize_work_text(_collect_short_text(records, "employee_coaching", limit=1))
+    repeated_errors = _humanize_work_text("; ".join(str(x) for x in top_risks))
+    training_tasks = _humanize_work_text(_collect_short_tasks(records, field="employee_fix_tasks", limit=3))
+    improved = _humanize_work_text("; ".join(str(x) for x in strong))
+    not_improved = _humanize_work_text("; ".join(str(x) for x in growth) if growth else repeated_errors)
+    manager_next_week = _humanize_work_text(_weekly_manager_actions_line(records=records, manager_name=manager_name))
+    return {
+        "Неделя с": week_start,
+        "Неделя по": week_end,
+        "Менеджер": manager_name,
+        "Роль менеджера": role_focus,
+        "Проанализировано сделок": analyzed,
+        "Продукт / фокус недели": _top_product_focus(records),
+        "База микс недели": _build_base_mix_text(records),
+        "Итог недели": manager_note or _humanize_work_text(top_risks[0] if top_risks else ""),
+        "Что улучшилось": improved,
+        "Что не улучшилось": not_improved,
+        "Повторяющиеся ошибки": repeated_errors,
+        "Обучение сотруднику": employee_note,
+        "Ссылка на обучение": "",
+        "Задачи после обучения": training_tasks,
+        "Ссылка на задачи после обучения": "",
+        "Мои действия на следующую неделю": manager_next_week,
+        "Ожидаемый эффект - количество": _expected_quantity_text(
+            avg_score=avg_score if isinstance(avg_score, int) else None,
+            deals=analyzed,
+            role=role_focus,
+        ),
+        "Ожидаемый эффект - качество": _expected_quality_text(
+            criticality=_score_to_criticality(avg_score if isinstance(avg_score, int) else None, risk_count=len(top_risks)),
+            role=role_focus,
+        ),
+        "Формулировка для руководителя": manager_note,
+        "Сообщение сотруднику": employee_note,
+        "Средняя оценка 0-100": avg_score,
+    }
+
+
+def _collect_top_risk_flags(records: list[dict[str, Any]], *, limit: int) -> list[str]:
+    risk_counts: Counter[str] = Counter()
+    for item in records:
+        flags = item.get("risk_flags") if isinstance(item.get("risk_flags"), list) else []
+        for flag in flags:
+            text = str(flag).strip()
+            if text:
+                risk_counts[text] += 1
+    return [k for k, _ in risk_counts.most_common(max(1, int(limit)))]
+
+
+def _collect_short_list(records: list[dict[str, Any]], field: str, *, limit: int) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in records:
+        values = item.get(field) if isinstance(item.get(field), list) else []
+        for value in values:
+            text = " ".join(str(value or "").split()).strip()
+            if not text:
+                continue
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(text)
+            if len(out) >= max(1, int(limit)):
+                return out
+    return out
+
+
+def _collect_short_text(records: list[dict[str, Any]], field: str, *, limit: int) -> str:
+    parts: list[str] = []
+    seen: set[str] = set()
+    for item in records:
+        text = " ".join(str(item.get(field) or "").split()).strip()
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        parts.append(text)
+        if len(parts) >= max(1, int(limit)):
+            break
+    return " ".join(parts)
+
+
+def _collect_short_tasks(records: list[dict[str, Any]], *, field: str, limit: int) -> str:
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in records:
+        values = item.get(field) if isinstance(item.get(field), list) else []
+        for value in values:
+            text = " ".join(str(value or "").split()).strip()
+            if not text:
+                continue
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(text)
+            if len(out) >= max(1, int(limit)):
+                return _humanize_work_text("; ".join(out))
+    return _humanize_work_text("; ".join(out))
+
+
+def _weekly_manager_actions_line(*, records: list[dict[str, Any]], manager_name: str) -> str:
+    low_conf = sum(1 for x in records if _is_low_confidence_record(x))
+    has_losses = any(_is_loss_like_record(x) for x in records)
+    if "рустам" in str(manager_name).lower():
+        base = "Сверить, кто по факту ведет ключевые сделки, и дожать следующий шаг по активным кейсам."
+    else:
+        base = "Переслушать спорные звонки, сверить их с CRM и закрыть провалы в фиксации результата."
+    if low_conf > 0:
+        base += " По шумным кейсам сначала перепроверить на свежую голову."
+    if has_losses:
+        base += " По потерям отдельно подсветить причину, а не оставлять в каше."
+    return _humanize_work_text(base)
+
+
+def _top_product_focus(records: list[dict[str, Any]]) -> str:
+    info_hits = 0
+    link_hits = 0
+    unknown_hits = 0
+    for item in records:
+        hypothesis = str(item.get("product_hypothesis") or "").strip().lower()
+        if hypothesis == "info":
+            info_hits += 1
+            continue
+        if hypothesis == "link":
+            link_hits += 1
+            continue
+        if hypothesis == "mixed":
+            info_hits += 1
+            link_hits += 1
+            continue
+
+        text = " ".join(str(item.get("product_name") or "").split()).strip().lower()
+        if any(token in text for token in ("info", "инфо")):
+            info_hits += 1
+        elif any(token in text for token in ("link", "линк", "закуп", "тендер")):
+            link_hits += 1
+        else:
+            unknown_hits += 1
+
+    if info_hits and link_hits:
+        return "оба"
+    if info_hits:
+        return "инфо"
+    if link_hits:
+        return "линк"
+    if unknown_hits > 0:
+        return "до продукта разговор не дошел"
+    return "до продукта разговор не дошел"
+
+
+def _build_base_mix_text(records: list[dict[str, Any]]) -> str:
+    segments: Counter[str] = Counter()
+    for item in records:
+        # 1) deal tags
+        for key in ("tags",):
+            values = item.get(key)
+            if not isinstance(values, list):
+                continue
+            for raw in values:
+                text = " ".join(str(raw or "").split()).strip()
+                if text:
+                    segments[text] += 1
+        # 2) company tags
+        for key in ("company_tags",):
+            values = item.get(key)
+            if not isinstance(values, list):
+                continue
+            for raw in values:
+                text = " ".join(str(raw or "").split()).strip()
+                if text:
+                    segments[text] += 1
+        # 3) source / utm / pipeline hints
+        for key in ("source_values",):
+            values = item.get(key)
+            if not isinstance(values, list):
+                continue
+            for raw in values:
+                text = " ".join(str(raw or "").split()).strip()
+                if text:
+                    segments[text] += 1
+        for raw_hint in (item.get("status_name"), item.get("pipeline_name")):
+            hint = " ".join(str(raw_hint or "").split()).strip()
+            if hint:
+                segments[hint] += 1
+        # 4) comments / notes / okved hints
+        notes = item.get("notes_summary_raw") if isinstance(item.get("notes_summary_raw"), list) else []
+        for note in notes:
+            if not isinstance(note, dict):
+                continue
+            raw = str(note.get("text") or "").strip().lower()
+            if "оквэд" in raw:
+                segments["ОКВЭД/сегмент из комментариев"] += 1
+            if "тендер" in raw:
+                segments["тендерные"] += 1
+            if "закуп" in raw:
+                segments["закупки"] += 1
+        for key in ("company_comment", "contact_comment"):
+            raw_comment = str(item.get(key) or "").strip().lower()
+            if "оквэд" in raw_comment:
+                segments["ОКВЭД/сегмент из комментариев"] += 1
+            if "тендер" in raw_comment:
+                segments["тендерные"] += 1
+            if "закуп" in raw_comment:
+                segments["закупки"] += 1
+    if segments:
+        top = [name for name, _ in segments.most_common(3)]
+        return "; ".join(top)
+    return "солянка"
+
+
+def _manager_role_label(manager_name: str) -> str:
+    text = str(manager_name or "").lower()
+    if "рустам" in text:
+        return "телемаркетолог"
+    if "илья" in text:
+        return "менеджер по продажам"
+    return "менеджер по продажам"
+
+
+def _parse_record_activity_dt(record: dict[str, Any]) -> datetime | None:
+    for key in ("updated_at", "created_at"):
+        raw = record.get(key)
+        if raw in (None, ""):
+            continue
+        if isinstance(raw, (int, float)):
+            try:
+                return datetime.fromtimestamp(float(raw), tz=timezone.utc)
+            except Exception:
+                continue
+        text = str(raw).strip()
+        if not text:
+            continue
+        if text.isdigit():
+            try:
+                return datetime.fromtimestamp(float(text), tz=timezone.utc)
+            except Exception:
+                pass
+        try:
+            if text.endswith("Z"):
+                text = text[:-1] + "+00:00"
+            dt = datetime.fromisoformat(text)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            continue
+    return None
+
+
+def _resolve_daily_control_days(
+    *,
+    period_start: str,
+    period_end: str,
+    records: list[dict[str, Any]],
+    run_date: str,
+) -> list[str]:
+    try:
+        start = datetime.fromisoformat(period_start).date()
+        end = datetime.fromisoformat(period_end).date()
+    except Exception:
+        fallback = str(run_date or "").strip()
+        if fallback:
+            return [fallback]
+        return []
+    if end < start:
+        start, end = end, start
+
+    out: list[str] = []
+    has_saturday_activity = False
+    saturday_set: set[str] = set()
+    for item in records:
+        dt = _parse_record_activity_dt(item)
+        if not dt:
+            continue
+        day = dt.date()
+        if day.weekday() == 5:
+            saturday_set.add(day.isoformat())
+            has_saturday_activity = True
+
+    cur = start
+    while cur <= end:
+        wd = cur.weekday()
+        if wd <= 4:
+            out.append(cur.isoformat())
+        elif wd == 5 and has_saturday_activity and cur.isoformat() in saturday_set:
+            out.append(cur.isoformat())
+        cur = cur + timedelta(days=1)
+    return out
+
+
+def _select_daily_package_records(
+    *,
+    manager_records: list[dict[str, Any]],
+    control_day: str,
+    package_target: int,
+    carryover_days: int,
+    exclude_deal_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    try:
+        day = datetime.fromisoformat(control_day).date()
+    except Exception:
+        return manager_records[: max(1, package_target)]
+
+    cutoff = datetime(day.year, day.month, day.day, 14, 0, 0, tzinfo=timezone.utc)
+    carry_floor = cutoff.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=max(0, int(carryover_days)))
+
+    ranked: list[tuple[tuple[int, int, int, int, int, str], dict[str, Any]]] = []
+    excluded = exclude_deal_ids or set()
+    for item in manager_records:
+        did = str(item.get("deal_id") or "").strip()
+        if did and did in excluded:
+            continue
+        dt = _parse_record_activity_dt(item)
+        if dt and dt > cutoff:
+            continue
+        if dt and dt < carry_floor:
+            continue
+        freshness = _freshness_rank_for_day(dt=dt, control_day=day)
+        evidence = _evidence_rank(item)
+        mgmt = _management_value_rank(item)
+        carry_penalty = 0 if (dt and dt.date() == day) else 1
+        score_val = int(item.get("score")) if isinstance(item.get("score"), int) else 50
+        tie_id = did
+        key = (-freshness, -evidence, -mgmt, carry_penalty, score_val, tie_id)
+        ranked.append((key, item))
+
+    ranked.sort(key=lambda x: x[0])
+    selected: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for _, item in ranked:
+        did = str(item.get("deal_id") or "")
+        if did and did in seen:
+            continue
+        if did:
+            seen.add(did)
+        selected.append(item)
+        if len(selected) >= max(1, int(package_target)):
+            break
+    return selected
+
+
+def _select_daily_package_records_relaxed(
+    *,
+    manager_records: list[dict[str, Any]],
+    package_target: int,
+    exclude_deal_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    excluded = exclude_deal_ids or set()
+    ranked: list[tuple[tuple[int, int, int, str], dict[str, Any]]] = []
+    for item in manager_records:
+        did = str(item.get("deal_id") or "").strip()
+        if did and did in excluded:
+            continue
+        evidence = _evidence_rank(item)
+        mgmt = _management_value_rank(item)
+        score_val = int(item.get("score")) if isinstance(item.get("score"), int) else 50
+        ranked.append(((-evidence, -mgmt, score_val, did), item))
+    ranked.sort(key=lambda x: x[0])
+    selected: list[dict[str, Any]] = []
+    for _, item in ranked:
+        selected.append(item)
+        if len(selected) >= max(1, int(package_target)):
+            break
+    return selected
+
+
+def _build_daily_deal_links(*, items: list[dict[str, Any]], base_domain: str) -> str:
+    links: list[str] = []
+    root = str(base_domain or "").strip().rstrip("/")
+    seen: set[str] = set()
+    for item in items:
+        did = str(item.get("deal_id") or "").strip()
+        if not did:
+            continue
+        if root:
+            url = f"{root}/leads/detail/{did}"
+        else:
+            url = did
+        if url in seen:
+            continue
+        seen.add(url)
+        links.append(url)
+    return "\n".join(links)
+
+
+def _freshness_rank_for_day(*, dt: datetime | None, control_day) -> int:
+    if not dt:
+        return 0
+    d = dt.date()
+    if d == control_day:
+        return 3
+    delta = (control_day - d).days
+    if delta == 1:
+        return 2
+    if 2 <= delta <= 7:
+        return 1
+    return 0
+
+
+def _evidence_rank(item: dict[str, Any]) -> int:
+    rank = 0
+    if bool(item.get("transcript_available")):
+        rank += 2
+    if str(item.get("call_signal_summary_short") or "").strip():
+        rank += 2
+    if str(item.get("manager_summary") or "").strip():
+        rank += 1
+    if str(item.get("employee_coaching") or "").strip():
+        rank += 1
+    return rank
+
+
+def _management_value_rank(item: dict[str, Any]) -> int:
+    flags = item.get("risk_flags") if isinstance(item.get("risk_flags"), list) else []
+    rank = len(flags)
+    if any(str(flag).startswith("qualified_loss:") for flag in flags):
+        rank += 2
+    if bool(item.get("owner_ambiguity_flag")):
+        rank += 1
+    if str(item.get("analysis_confidence") or "").lower() == "low":
+        rank += 1
+    return rank
+
+
+def _filter_growth_for_role(
+    *,
+    role: str,
+    growth: list[str],
+    top_risks: list[str],
+    items: list[dict[str, Any]],
+) -> tuple[list[str], str]:
+    warm_markers = (
+        "презентац",
+        "демо",
+        "бриф",
+        "тест",
+        "счет",
+        "оплат",
+    )
+    role_norm = str(role or "").lower()
+    if "телемаркетолог" not in role_norm:
+        base = growth or top_risks
+        return ([_humanize_work_text(x) for x in base[:3]] or ["Дожать следующий шаг и не терять ритм по активным сделкам."], "")
+
+    explicit_warm_evidence = any(
+        bool(item.get("call_signal_demo_discussed"))
+        or bool(item.get("call_signal_test_discussed"))
+        or any(marker in str(item.get("status_or_stage") or "").lower() for marker in warm_markers)
+        for item in items
+    )
+    raw = growth or top_risks
+    if explicit_warm_evidence:
+        return ([_humanize_work_text(x) for x in raw[:3]] or ["Дожать следующий шаг и закрыть зависание по активным кейсам."], "")
+
+    filtered = []
+    for text in raw:
+        low = str(text or "").lower()
+        if any(marker in low for marker in warm_markers):
+            continue
+        filtered.append(_humanize_work_text(text))
+    if filtered:
+        return filtered[:3], ""
+    return ["Подтянуть квалификацию и дожать назначение встречи.", "Проверить, что после звонка фиксируется конкретный следующий шаг."], "warm_signals_out_of_scope"
+
+
+def _build_daily_why_important(*, role: str, items: list[dict[str, Any]], role_note: str) -> str:
+    if role_note == "warm_signals_out_of_scope":
+        return "Если это не разделить по ролям, сотрудник теряет фокус и звонки идут вхолостую."
+    low_conf = sum(1 for x in items if _is_low_confidence_record(x))
+    if low_conf > 0:
+        return "Сотруднику проще вести сделки, когда в CRM не каша. Отделу это дает ровную воронку без провалов."
+    if "телемаркетолог" in str(role).lower():
+        return "Сотруднику легче дожимать контакт, когда после звонка сразу понятен следующий шаг. Для отдела это плюс к конверсии в встречу."
+    return "Сотруднику проще держать темп, когда каждая встреча закрыта по результату. Для отдела это меньше зависаний на теплом этапе."
+
+
+def _expected_quantity_text(*, avg_score: int | None, deals: int, role: str) -> str:
+    if deals <= 0:
+        return ""
+    role_norm = str(role or "").lower()
+    if "телемаркетолог" in role_norm:
+        if avg_score is None:
+            return "1 дополнительный следующий шаг в работе за неделю."
+        if avg_score < 40:
+            return "+1-2 качественных ЛПР за неделю."
+        if avg_score < 70:
+            return "+1 встреча в неделю."
+        return "1-2 сделки меньше будут зависать в работе."
+    if avg_score is None:
+        return "1 дополнительный следующий шаг в работе за неделю."
+    if avg_score < 40:
+        return "-1 потеря в неделю за счет раннего дожима."
+    if avg_score < 70:
+        return "+1 подтвержденная встреча в неделю."
+    return "1-2 сделки меньше будут зависать в работе."
+
+
+def _expected_quality_text(*, criticality: str, role: str) -> str:
+    role_norm = str(role or "").lower()
+    if criticality == "высокая":
+        if "телемаркетолог" in role_norm:
+            return "Квалификация станет чище: меньше шумных ЛПР, боль и бизнес-задача будут фиксироваться внятнее."
+        return "После встречи будет понятнее, что делать дальше: меньше потерянных договоренностей, стабильнее перевод в следующий шаг."
+    if criticality == "средняя":
+        if "телемаркетолог" in role_norm:
+            return "Фиксация разговора станет аккуратнее: меньше пустых карточек, легче отделить реальный интерес от шума."
+        return "Качество фиксации после встречи станет ровнее; перевод в следующий этап может вырасти, но это пока рабочая гипотеза."
+    return "Сохраним рабочий ритм и ровное качество ведения сделок."
+
+
+def _weekday_ru_from_iso(value: str) -> str:
+    names = {
+        0: "Понедельник",
+        1: "Вторник",
+        2: "Среда",
+        3: "Четверг",
+        4: "Пятница",
+        5: "Суббота",
+        6: "Воскресенье",
+    }
+    try:
+        dt = datetime.fromisoformat(str(value)).date()
+    except Exception:
+        return ""
+    return names.get(dt.weekday(), "")
+
+
+def _score_to_criticality(avg_score: int | None, *, risk_count: int) -> str:
+    if avg_score is None:
+        return ""
+    if avg_score < 35 or risk_count >= 8:
+        return "высокая"
+    if avg_score < 65 or risk_count >= 4:
+        return "средняя"
+    return "низкая"
+
+
+def _humanize_work_text(value: str) -> str:
+    text = " ".join(str(value or "").split()).strip()
+    if not text:
+        return ""
+    replacements = {
+        "нужен ручной контроль": "перепроверить на свежую голову",
+        "требуется дополнительная верификация": "переслушать звонок и сверить с CRM",
+        "необходимо провести follow-up": "дожать следующий шаг",
+        "follow-up": "следующий шаг",
+        "требуется дальнейшая проработка": "нормально зафиксировать причину потери и решить, как двигаться дальше",
+        "это влияет на предсказуемость недели": "если это не дожать, воронка дальше опять поедет вслепую",
+        "qualified loss": "не наш кейс",
+        "anti-fit": "не наш кейс",
+        "market mismatch": "не тот сценарий",
+        "owner attribution": "кто по факту вел сделку",
+        "owner ambiguity": "неясно, кто по факту вел сделку",
+        "owner": "ответственный",
+        "closeout cleanup": "нормально закрыть причину отказа и дочистить CRM",
+        "closeout-cleanup": "нормально закрыть причину отказа и дочистить CRM",
+        "closeout": "закрытие причины отказа",
+        "pressure": "лишнее давление",
+        "notes": "комментарии",
+        "атрибуция owner": "кто по факту вел сделку",
+        "проверить фактуру в crm": "переслушать звонок и сверить с CRM",
+        "factual layer": "фактура",
+        "fact pattern": "картина по сделке",
+        "process hygiene": "дисциплина процесса",
+        "evidence context": "контекст разговора",
+        "ограниченная надежность выводов": "выводы пока предварительные",
+        "ограниченная надежность": "предварительно",
+        "подтвердить фактического ведущего": "сверить, кто по факту вел сделку",
+        "контекст последних касаний": "что было в последних касаниях",
+        "необходимо": "нужно",
+        "требуется": "нужно",
+    }
+    lowered = text.lower()
+    for old, new in replacements.items():
+        if old in lowered:
+            text = re.sub(re.escape(old), new, text, flags=re.IGNORECASE)
+            lowered = text.lower()
+    return text
+
+
+def _daily_user_text(value: str) -> str:
+    text = _humanize_work_text(value)
+    rewrite = {
+        "кейс не про дожим": "здесь не давим, сначала нормально разбираем причину",
+        "приоритет — корректная фиксация причины потери и нормально закрыть причину отказа и дочистить crm": "приоритет — нормально закрыть причину отказа и дочистить CRM",
+        "интерпретация ограничена качеством crm-данных": "здесь выводы ограничены, сначала перепроверить фактуру в CRM",
+        "без pressure следующего шага": "без лишнего давления по сделке",
+        "без лишнее давление следующий шаг": "без лишнего дожима",
+        "закрытая потеря кейс": "закрытая потеря",
+        "корректная закрытие причины отказа-классификация": "нормально зафиксировать причину потери",
+        "closed-lost": "закрытая потеря",
+        "process_hygiene:": "дисциплина процесса:",
+        "disabled": "выключено",
+        "anti-pattern": "повторяющийся сбой",
+        "атрибуцию ответственный": "кто по факту вел сделку",
+        "проверить фактуру в crm": "переслушать звонок и сверить с CRM",
+        "дисциплина процесса:": "",
+        "контекст разговора:": "",
+    }
+    lowered = text.lower()
+    for old, new in rewrite.items():
+        if old in lowered:
+            text = re.sub(re.escape(old), new, text, flags=re.IGNORECASE)
+            lowered = text.lower()
+    text = re.sub(r"закрытая потеря кейс", "закрытая потеря", text, flags=re.IGNORECASE)
+    text = re.sub(r"корректн\w*\s+закрыти\w+\s+причин\w+\s+отказ\w+-классификаци\w+", "нормально зафиксировать причину потери", text, flags=re.IGNORECASE)
+    text = re.sub(r"нужна\s+нормально\s+зафиксировать", "нужно нормально зафиксировать", text, flags=re.IGNORECASE)
+    text = re.sub(r"перепереслушать", "переслушать", text, flags=re.IGNORECASE)
+    return text
+
+
+def _resolve_daily_manager_allowlist(values: list[str] | tuple[str, ...] | None) -> list[str]:
+    values = list(values or ["Илья", "Рустам"])
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        name = _normalize_manager_for_dropdown(str(raw or "").strip())
+        if not name:
+            continue
+        low = name.lower()
+        if low in seen:
+            continue
+        seen.add(low)
+        normalized.append(name)
+    return normalized or ["Илья", "Рустам"]
+
+
+def _daily_selection_reason(items: list[dict[str, Any]]) -> str:
+    if any(bool(x.get("transcript_available")) or str(x.get("call_signal_summary_short") or "").strip() for x in items):
+        return "has_call_priority"
+    if any(
+        isinstance(x.get("notes_summary_raw"), list) and x.get("notes_summary_raw")
+        or isinstance(x.get("tasks_summary_raw"), list) and x.get("tasks_summary_raw")
+        or str(x.get("manager_summary") or "").strip()
+        for x in items
+    ):
+        return "rich_context_priority"
+    return "fallback_fill"
+
+
+def _daily_growth_compact(growth: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for g in growth:
+        text = _daily_user_text(g)
+        key = text.lower().strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
+        if len(out) >= 2:
+            break
+    return out
+
+
+def _build_daily_key_takeaway(
+    *,
+    manager: str,
+    role: str,
+    items: list[dict[str, Any]],
+    manager_msgs: str,
+    growth: list[str],
+) -> str:
+    with_call = any(bool(x.get("transcript_available")) or str(x.get("call_signal_summary_short") or "").strip() for x in items)
+    low_conf = sum(1 for x in items if _is_low_confidence_record(x))
+    if with_call:
+        core = manager_msgs or "По звонкам видно живой материал: есть за что зацепиться и что дожать."
+    else:
+        core = manager_msgs or "По CRM видно только часть картины, поэтому выводы держим рабочими и без перегибов."
+    if low_conf > 0:
+        tail = "По части сделок выводы предварительные, работаем только от зафиксированных фактов."
+    elif growth:
+        tail = f"Главный рычаг на ближайший цикл: {growth[0]}."
+    else:
+        tail = "Держим ритм и не отпускаем следующий шаг после каждого касания."
+    return f"{core} {tail}"
+
+
+def _build_daily_strong_sides(*, items: list[dict[str, Any]], strong: list[str]) -> str:
+    with_call = any(bool(x.get("transcript_available")) for x in items)
+    call_signal = any(str(x.get("call_signal_summary_short") or "").strip() for x in items)
+    if with_call or call_signal:
+        return "По разговору есть рабочие моменты: держит контакт и доводит до понятного следующего шага."
+    if strong:
+        return "; ".join(str(x) for x in strong[:2])
+    has_crm_fixation = any(str(x.get("manager_summary") or "").strip() for x in items)
+    if has_crm_fixation:
+        return "Хорошо фиксирует суть сделки и не теряет ход в CRM."
+    return ""
+
+
+def _build_daily_reinforce(*, items: list[dict[str, Any]], role: str, strong: list[str]) -> str:
+    role_norm = str(role or "").lower()
+    if strong:
+        return f"Закрепить: {strong[0]}"
+    if "телемаркетолог" in role_norm:
+        return "Закрепить модуль выхода на ЛПР и короткую фиксацию следующего шага сразу после звонка."
+    return "Закрепить модуль закрытия встречи: результат, следующий шаг и срок сразу в CRM."
+
+
+def _build_daily_fix_action(*, items: list[dict[str, Any]], role: str, growth: list[str]) -> str:
+    if growth:
+        main = growth[0]
+        return f"Починить в работе: {main.lower()}"
+    role_norm = str(role or "").lower()
+    if "телемаркетолог" in role_norm:
+        return "Дожать назначение и сразу фиксировать понятный следующий шаг."
+    return "Закрывать итог встречи и следующий шаг в тот же день."
+
+
+def _build_daily_coaching_list(
+    *,
+    items: list[dict[str, Any]],
+    role: str,
+    growth: list[str],
+    employee_msgs: str,
+) -> str:
+    role_norm = str(role or "").lower()
+    line1 = "разобрали 2-3 кейса дня и где именно утекает шаг."
+    if "телемаркетолог" in role_norm:
+        line2 = "дали модуль: выход на ЛПР + назначение встречи без провисания."
+    else:
+        line2 = "дали модуль: итог встречи + четкий следующий шаг с датой."
+    if growth:
+        line3 = f"в следующих звонках пробует: {growth[0].lower()}."
+    elif employee_msgs:
+        line3 = employee_msgs.strip().rstrip(".") + "."
+    else:
+        line3 = "если не выровняется за цикл, выносим в полноценное обучение."
+    return "1) " + line1 + "\n2) " + line2 + "\n3) " + line3
+
+
+def _normalize_manager_for_dropdown(value: str) -> str:
+    text = " ".join(str(value or "").split()).strip()
+    low = text.lower()
+    if "илья" in low:
+        return "Илья"
+    if "рустам" in low:
+        return "Рустам"
+    return text
+
+
+def _manager_sort_key(manager_name: str, *, allowlist: list[str] | None = None) -> tuple[int, str]:
+    text = str(manager_name or "").strip()
+    low = text.lower()
+    if allowlist:
+        for idx, name in enumerate(allowlist):
+            if low == str(name).strip().lower():
+                return (idx, text)
+    if "илья" in low:
+        return (0, text)
+    if "рустам" in low:
+        return (1, text)
+    return (2, text)
+
+
+def _daily_weighted_score(items: list[dict[str, Any]]) -> int | None:
+    if not items:
+        return None
+    scores: list[float] = []
+    for item in items:
+        negotiation = 40.0
+        if bool(item.get("transcript_available")):
+            negotiation += 20.0
+        if str(item.get("call_signal_summary_short") or "").strip():
+            negotiation += 15.0
+        if bool(item.get("call_signal_next_step_present")):
+            negotiation += 10.0
+        if bool(item.get("call_signal_decision_maker_reached")):
+            negotiation += 5.0
+        if bool(item.get("call_signal_objection_not_target")):
+            negotiation -= 10.0
+        negotiation = max(0.0, min(100.0, negotiation))
+
+        crm = 30.0
+        confidence = str(item.get("analysis_confidence") or "").strip().lower()
+        if confidence == "high":
+            crm += 35.0
+        elif confidence == "medium":
+            crm += 20.0
+        else:
+            crm += 8.0
+        if isinstance(item.get("risk_flags"), list) and item.get("risk_flags"):
+            crm += 7.0
+        crm = max(0.0, min(100.0, crm))
+
+        total = (negotiation * 0.8) + (crm * 0.2)
+        scores.append(total)
+    return int(round(sum(scores) / len(scores)))
+
+
 def _build_meeting_queue_sheets_dry_run_payload(*, queue_items: list[dict[str, Any]]) -> dict[str, Any]:
     columns = [
         "deal_id",
@@ -3447,7 +5208,6 @@ def _build_meeting_queue_sheets_dry_run_payload(*, queue_items: list[dict[str, A
         "score_0_100",
         "analysis_confidence",
         "why_in_queue_human",
-        "why_in_queue_technical",
         "call_signal_summary_short",
         "reanimation_potential",
         "reanimation_next_step",
@@ -3459,7 +5219,6 @@ def _build_meeting_queue_sheets_dry_run_payload(*, queue_items: list[dict[str, A
             continue
         row = {col: item.get(col, "") for col in columns}
         row["why_in_queue_human"] = item.get("why_in_queue_human", "") or _queue_reason_human(str(item.get("why_in_queue") or ""))
-        row["why_in_queue_technical"] = item.get("why_in_queue", "")
         rows.append(row)
     return {
         "mode": "dry_run",
@@ -3472,6 +5231,441 @@ def _build_meeting_queue_sheets_dry_run_payload(*, queue_items: list[dict[str, A
         "rows_count": len(rows),
         "note": "Fill sheet_name/start_cell to enable real table write in next step.",
     }
+
+
+def _maybe_write_daily_control_sheet(
+    *,
+    cfg: DealAnalyzerConfig,
+    logger,
+    daily_payload: dict[str, Any],
+) -> dict[str, Any]:
+    rows = daily_payload.get("rows", []) if isinstance(daily_payload.get("rows"), list) else []
+    columns = daily_payload.get("columns", []) if isinstance(daily_payload.get("columns"), list) else []
+    rows_dict = [x for x in rows if isinstance(x, dict)]
+    values_rows = [[row.get(col, "") for col in columns] for row in rows_dict]
+
+    sheet_name = str(getattr(cfg, "deal_analyzer_daily_sheet_name", "") or "").strip()
+    if not sheet_name:
+        sheet_name = str(getattr(cfg, "deal_analyzer_sheet_name", "") or "").strip()
+    if not sheet_name:
+        sheet_name = str(daily_payload.get("sheet_name") or "").strip() or "Дневной контроль"
+
+    start_cell = str(getattr(cfg, "deal_analyzer_daily_start_cell", "") or "").strip()
+    if not start_cell:
+        start_cell = str(getattr(cfg, "deal_analyzer_start_cell", "") or "").strip()
+    if not start_cell:
+        start_cell = str(daily_payload.get("start_cell") or "").strip() or "A2"
+
+    return _maybe_write_rows_to_sheet(
+        cfg=cfg,
+        logger=logger,
+        values_rows=values_rows,
+        sheet_name=sheet_name,
+        start_cell=start_cell,
+        writer_tag="daily_control_writer",
+        append_mode=not bool(getattr(cfg, "deal_analyzer_overwrite_mode", False)),
+    )
+
+
+def _maybe_write_weekly_manager_sheet(
+    *,
+    cfg: DealAnalyzerConfig,
+    logger,
+    weekly_payload: dict[str, Any],
+) -> dict[str, Any]:
+    rows = weekly_payload.get("rows", []) if isinstance(weekly_payload.get("rows"), list) else []
+    rows_dict = [x for x in rows if isinstance(x, dict)]
+    columns = weekly_payload.get("columns", []) if isinstance(weekly_payload.get("columns"), list) else list(WEEKLY_MANAGER_COLUMNS)
+    values_rows = [[row.get(col, "") for col in columns] for row in rows_dict]
+    default_sheet_name = str(weekly_payload.get("sheet_name") or "").strip() or "Недельный свод менеджеров"
+    default_start_cell = str(weekly_payload.get("start_cell") or "").strip() or "A2"
+
+    sheet_name = str(getattr(cfg, "deal_analyzer_weekly_sheet_name", "") or "").strip() or default_sheet_name
+    start_cell = str(getattr(cfg, "deal_analyzer_weekly_start_cell", "") or "").strip() or default_start_cell
+
+    status = {
+        "enabled": bool(getattr(cfg, "deal_analyzer_write_enabled", False)),
+        "mode": "dry_run",
+        "sheet_name": sheet_name,
+        "start_cell": start_cell,
+        "rows_prepared": len(rows_dict),
+        "rows_written": 0,
+        "error": "",
+    }
+    if not status["enabled"]:
+        logger.info(
+            "weekly manager writer disabled: mode=dry_run rows_prepared=%s sheet_name=%s start_cell=%s",
+            status["rows_prepared"],
+            sheet_name or "<empty>",
+            start_cell or "<empty>",
+        )
+        return status
+
+    return _maybe_write_rows_to_sheet(
+        cfg=cfg,
+        logger=logger,
+        values_rows=values_rows,
+        sheet_name=sheet_name,
+        start_cell=start_cell,
+        writer_tag="weekly_manager_writer",
+        append_mode=False,
+    )
+
+
+def _resolve_spreadsheet_id_from_config(*, cfg: DealAnalyzerConfig) -> str:
+    spreadsheet_id = str(getattr(cfg, "deal_analyzer_spreadsheet_id", "") or "").strip()
+    if spreadsheet_id:
+        return spreadsheet_id
+    sheet_url = str(getattr(cfg, "deal_analyzer_sheet_url", "") or "").strip()
+    if not sheet_url:
+        return ""
+    try:
+        return extract_spreadsheet_id(sheet_url)
+    except Exception:
+        return ""
+
+
+def _resolve_amo_base_domain_for_links(*, cfg: DealAnalyzerConfig) -> str:
+    candidates: list[str] = []
+    direct = str(getattr(cfg, "call_base_domain", "") or "").strip()
+    if direct:
+        candidates.append(direct)
+    try:
+        auth_cfg = load_amocrm_auth_config(getattr(cfg, "amocrm_auth_config_path", None))
+        auth_domain = str(getattr(auth_cfg, "base_domain", "") or "").strip()
+        if auth_domain:
+            candidates.append(auth_domain)
+    except Exception:
+        pass
+
+    for raw in candidates:
+        text = str(raw).strip().rstrip("/")
+        if not text:
+            continue
+        if not text.startswith(("http://", "https://")):
+            text = f"https://{text}"
+        return text
+    return ""
+
+
+def _maybe_write_rows_to_sheet(
+    *,
+    cfg: DealAnalyzerConfig,
+    logger,
+    values_rows: list[list[Any]],
+    sheet_name: str,
+    start_cell: str,
+    writer_tag: str,
+    spreadsheet_id_override: str = "",
+    append_mode: bool = False,
+) -> dict[str, Any]:
+    write_enabled = bool(getattr(cfg, "deal_analyzer_write_enabled", False))
+    rows_prepared = len(values_rows)
+    cols_total = max((len(r) for r in values_rows), default=0)
+    status = {
+        "enabled": write_enabled,
+        "mode": "dry_run",
+        "write_mode": "append" if append_mode else "overwrite",
+        "sheet_name": sheet_name,
+        "start_cell": start_cell,
+        "rows_prepared": rows_prepared,
+        "rows_written": 0,
+        "write_start_row": 0,
+        "write_end_row": 0,
+        "error": "",
+    }
+    if not write_enabled:
+        logger.info(
+            "%s disabled: mode=dry_run rows_prepared=%s sheet_name=%s start_cell=%s",
+            writer_tag,
+            rows_prepared,
+            sheet_name or "<empty>",
+            start_cell or "<empty>",
+        )
+        return status
+    if not sheet_name or not start_cell:
+        status["error"] = "write_skipped_target_not_set"
+        logger.warning(
+            "%s skipped: reason=target_not_set sheet_name=%s start_cell=%s rows_prepared=%s",
+            writer_tag,
+            sheet_name or "<empty>",
+            start_cell or "<empty>",
+            rows_prepared,
+        )
+        return status
+
+    spreadsheet_id = str(spreadsheet_id_override or "").strip() or _resolve_spreadsheet_id_from_config(cfg=cfg)
+    if not spreadsheet_id:
+        status["error"] = "write_skipped_spreadsheet_not_set"
+        logger.warning("%s skipped: reason=spreadsheet_not_set", writer_tag)
+        return status
+
+    if cols_total <= 0:
+        cols_total = 1
+        values_rows = []
+
+    try:
+        app_cfg = load_config()
+        client = GoogleSheetsApiClient(project_root=app_cfg.project_root, logger=logger)
+        existing_rows_to_clear = _detect_existing_rows_to_clear(
+            client=client,
+            spreadsheet_id=spreadsheet_id,
+            sheet_name=sheet_name,
+            start_cell=start_cell,
+            cols=cols_total,
+            scan_rows=max(max(rows_prepared, 1), 500),
+            logger=logger,
+        )
+        write_start_cell = start_cell
+        clear_rows = max(rows_prepared, existing_rows_to_clear)
+        if append_mode:
+            start_col, start_row = _parse_a1_cell(start_cell)
+            write_row = start_row + max(0, existing_rows_to_clear)
+            write_start_cell = f"{start_col}{write_row}"
+            clear_rows = 0
+        logger.info(
+            "%s started: spreadsheet_id=%s sheet_name=%s start_cell=%s write_start_cell=%s rows_prepared=%s cols=%s clear_rows=%s write_mode=%s",
+            writer_tag,
+            spreadsheet_id,
+            sheet_name,
+            start_cell,
+            write_start_cell,
+            rows_prepared,
+            cols_total,
+            clear_rows,
+            "append" if append_mode else "overwrite",
+        )
+        if clear_rows > 0:
+            clear_range = _build_target_a1_range(start_cell=start_cell, rows=clear_rows, cols=cols_total)
+            tabbed_clear_range = client.build_tab_a1_range(tab_title=sheet_name, range_suffix=clear_range)
+            empty_values = [["" for _ in range(cols_total)] for _ in range(clear_rows)]
+            client.batch_update_values(
+                spreadsheet_id=spreadsheet_id,
+                data=[{"range": tabbed_clear_range, "values": empty_values}],
+            )
+        if rows_prepared > 0:
+            write_range = _build_target_a1_range(start_cell=write_start_cell, rows=rows_prepared, cols=cols_total)
+            tabbed_write_range = client.build_tab_a1_range(tab_title=sheet_name, range_suffix=write_range)
+            normalized_rows = [list(r) + [""] * max(0, cols_total - len(r)) for r in values_rows]
+            client.batch_update_values(
+                spreadsheet_id=spreadsheet_id,
+                data=[{"range": tabbed_write_range, "values": normalized_rows}],
+            )
+        status["mode"] = "real_write"
+        status["rows_written"] = rows_prepared
+        _, status["write_start_row"] = _parse_a1_cell(write_start_cell)
+        status["write_end_row"] = status["write_start_row"] + max(0, rows_prepared) - 1 if rows_prepared > 0 else status["write_start_row"]
+        logger.info(
+            "%s completed: mode=real_write rows_prepared=%s rows_written=%s sheet=%s start_cell=%s write_start_row=%s write_end_row=%s",
+            writer_tag,
+            rows_prepared,
+            status["rows_written"],
+            sheet_name,
+            write_start_cell,
+            status["write_start_row"],
+            status["write_end_row"],
+        )
+        return status
+    except Exception as exc:
+        status["error"] = str(exc)
+        logger.warning(
+            "%s failed: spreadsheet_id=%s sheet=%s start_cell=%s rows_prepared=%s error=%s",
+            writer_tag,
+            spreadsheet_id,
+            sheet_name,
+            start_cell,
+            rows_prepared,
+            exc,
+        )
+        return status
+
+
+def _maybe_write_meeting_queue_sheet(
+    *,
+    cfg: DealAnalyzerConfig,
+    logger,
+    dry_run_payload: dict[str, Any],
+) -> dict[str, Any]:
+    rows = dry_run_payload.get("rows", []) if isinstance(dry_run_payload.get("rows"), list) else []
+    columns = dry_run_payload.get("columns", []) if isinstance(dry_run_payload.get("columns"), list) else []
+    rows_prepared = len(rows)
+    sheet_name = str(getattr(cfg, "deal_analyzer_sheet_name", "") or "").strip()
+    start_cell = str(getattr(cfg, "deal_analyzer_start_cell", "") or "").strip()
+    write_enabled = bool(getattr(cfg, "deal_analyzer_write_enabled", False))
+
+    status = {
+        "enabled": write_enabled,
+        "mode": "dry_run",
+        "sheet_name": sheet_name,
+        "start_cell": start_cell,
+        "rows_prepared": rows_prepared,
+        "rows_written": 0,
+        "error": "",
+    }
+    if not write_enabled:
+        logger.info(
+            "meeting queue writer disabled: mode=dry_run rows_prepared=%s spreadsheet_id=%s sheet_name=%s start_cell=%s",
+            rows_prepared,
+            str(getattr(cfg, "deal_analyzer_spreadsheet_id", "") or "").strip() or "<empty>",
+            sheet_name or "<empty>",
+            start_cell or "<empty>",
+        )
+        return status
+    if not sheet_name or not start_cell:
+        status["error"] = "write_skipped_target_not_set"
+        logger.warning(
+            "meeting queue write skipped: reason=target_not_set sheet_name=%s start_cell=%s rows_prepared=%s",
+            sheet_name or "<empty>",
+            start_cell or "<empty>",
+            rows_prepared,
+        )
+        return status
+
+    spreadsheet_id = str(getattr(cfg, "deal_analyzer_spreadsheet_id", "") or "").strip()
+    sheet_url = str(getattr(cfg, "deal_analyzer_sheet_url", "") or "").strip()
+    if not spreadsheet_id and sheet_url:
+        try:
+            spreadsheet_id = extract_spreadsheet_id(sheet_url)
+        except Exception as exc:
+            status["error"] = f"invalid_sheet_url:{exc}"
+            logger.warning("meeting queue write skipped: reason=invalid_sheet_url error=%s", exc)
+            return status
+    if not spreadsheet_id:
+        status["error"] = "write_skipped_spreadsheet_not_set"
+        logger.warning(
+            "meeting queue write skipped: reason=spreadsheet_not_set rows_prepared=%s sheet_name=%s start_cell=%s",
+            rows_prepared,
+            sheet_name or "<empty>",
+            start_cell or "<empty>",
+        )
+        return status
+
+    try:
+        app_cfg = load_config()
+        client = GoogleSheetsApiClient(project_root=app_cfg.project_root, logger=logger)
+        values_matrix: list[list[Any]] = []
+        values_matrix.append([str(col) for col in columns])
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            values_matrix.append([row.get(col, "") for col in columns])
+        rows_total = len(values_matrix)
+        cols_total = len(columns)
+        if rows_total <= 0 or cols_total <= 0:
+            logger.info("meeting queue write skipped: reason=no_values rows_prepared=%s", rows_prepared)
+            return status
+        existing_rows_to_clear = _detect_existing_rows_to_clear(
+            client=client,
+            spreadsheet_id=spreadsheet_id,
+            sheet_name=sheet_name,
+            start_cell=start_cell,
+            cols=cols_total,
+            scan_rows=max(rows_total, 500),
+            logger=logger,
+        )
+        clear_rows = max(rows_total, existing_rows_to_clear)
+        clear_range = _build_target_a1_range(start_cell=start_cell, rows=clear_rows, cols=cols_total)
+        tabbed_range = client.build_tab_a1_range(tab_title=sheet_name, range_suffix=clear_range)
+        empty_values = [["" for _ in range(cols_total)] for _ in range(clear_rows)]
+        logger.info(
+            "meeting queue write started: spreadsheet_id=%s sheet_name=%s start_cell=%s rows_prepared=%s clear_rows=%s cols=%s",
+            spreadsheet_id,
+            sheet_name,
+            start_cell,
+            rows_prepared,
+            clear_rows,
+            cols_total,
+        )
+        client.batch_update_values(
+            spreadsheet_id=spreadsheet_id,
+            data=[{"range": tabbed_range, "values": empty_values}],
+        )
+        client.batch_update_values(
+            spreadsheet_id=spreadsheet_id,
+            data=[{"range": tabbed_range, "values": values_matrix}],
+        )
+        status["mode"] = "real_write"
+        status["rows_written"] = max(0, rows_total - 1)
+        logger.info(
+            "meeting queue write completed: mode=real_write spreadsheet_id=%s sheet=%s start_cell=%s rows_prepared=%s rows_written=%s",
+            spreadsheet_id,
+            sheet_name,
+            start_cell,
+            rows_prepared,
+            status["rows_written"],
+        )
+        return status
+    except Exception as exc:
+        status["error"] = str(exc)
+        logger.warning(
+            "meeting queue write failed: spreadsheet_id=%s sheet=%s start_cell=%s rows_prepared=%s error=%s",
+            spreadsheet_id,
+            sheet_name,
+            start_cell,
+            rows_prepared,
+            exc,
+        )
+        return status
+
+
+def _build_target_a1_range(*, start_cell: str, rows: int, cols: int) -> str:
+    col_letters, row_number = _parse_a1_cell(start_cell)
+    start_col = _column_letters_to_number(col_letters)
+    end_col = start_col + max(0, cols) - 1
+    end_row = row_number + max(0, rows) - 1
+    return f"{col_letters.upper()}{row_number}:{_number_to_column_letters(end_col)}{end_row}"
+
+
+def _detect_existing_rows_to_clear(
+    *,
+    client: GoogleSheetsApiClient,
+    spreadsheet_id: str,
+    sheet_name: str,
+    start_cell: str,
+    cols: int,
+    scan_rows: int,
+    logger,
+) -> int:
+    try:
+        scan_rows_safe = max(1, int(scan_rows))
+        scan_range_suffix = _build_target_a1_range(start_cell=start_cell, rows=scan_rows_safe, cols=cols)
+        tabbed_scan_range = client.build_tab_a1_range(tab_title=sheet_name, range_suffix=scan_range_suffix)
+        matrix = client.get_values(spreadsheet_id=spreadsheet_id, range_a1=tabbed_scan_range)
+        used_rows = 0
+        for idx, row in enumerate(matrix):
+            row_cells = row if isinstance(row, list) else []
+            if any(str(cell).strip() for cell in row_cells):
+                used_rows = idx + 1
+        return used_rows
+    except Exception as exc:
+        logger.warning("meeting queue clear scan failed, fallback to payload-size clear: error=%s", exc)
+        return 0
+
+
+def _parse_a1_cell(value: str) -> tuple[str, int]:
+    text = str(value or "").strip().upper()
+    m = re.match(r"^([A-Z]+)([0-9]+)$", text)
+    if not m:
+        raise RuntimeError(f"Invalid A1 start cell: {value!r}")
+    return m.group(1), int(m.group(2))
+
+
+def _column_letters_to_number(col: str) -> int:
+    n = 0
+    for ch in col.upper():
+        n = (n * 26) + (ord(ch) - ord("A") + 1)
+    return n
+
+
+def _number_to_column_letters(index: int) -> str:
+    if index <= 0:
+        raise RuntimeError(f"Invalid column index: {index}")
+    out = ""
+    n = index
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        out = chr(ord("A") + rem) + out
+    return out
 
 
 def _build_calls_markdown(*, results: list[dict[str, Any]], title: str) -> str:

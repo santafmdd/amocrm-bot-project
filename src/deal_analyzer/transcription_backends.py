@@ -231,7 +231,7 @@ def create_transcription_backend(*, backend_name: str, logger, config=None) -> T
         model_name = str(
             getattr(config, "whisper_model_name", "")
             or getattr(config, "transcription_model", "")
-            or "whisper-large-v3-turbo"
+            or "large-v3-turbo"
         ).strip()
         device = _resolve_whisper_device(str(getattr(config, "whisper_device", "auto") or "auto"))
         compute_type = _resolve_whisper_compute_type(

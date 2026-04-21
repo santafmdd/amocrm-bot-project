@@ -1,10 +1,18 @@
 ﻿import json
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from src.config import load_config
-from src.deal_analyzer.cli import _derive_product_hypothesis, _run_analyze_period
+from src.deal_analyzer.cli import (
+    _build_daily_control_sheet_payload,
+    _build_transcription_impact_row,
+    _derive_product_hypothesis,
+    _expected_quality_text,
+    _expected_quantity_text,
+    _run_analyze_period,
+)
 from src.deal_analyzer.config import DealAnalyzerConfig
 
 
@@ -40,13 +48,20 @@ def _cfg() -> DealAnalyzerConfig:
         ollama_model="gemma4:e4b",
         ollama_timeout_seconds=60,
         style_profile_name="manager_ru_v1",
+        period_live_refresh_enabled=False,
     )
 
 
 def _snapshot_for_deal(deal_id: int, *, warnings=None, status_name: str = "Р’ СЂР°Р±РѕС‚Рµ"):
     return {
         "snapshot_generated_at": "2026-04-18T12:00:00+00:00",
-        "crm": {"deal_id": deal_id, "amo_lead_id": deal_id, "deal_name": f"Deal {deal_id}", "status_name": status_name},
+        "crm": {
+            "deal_id": deal_id,
+            "amo_lead_id": deal_id,
+            "deal_name": f"Deal {deal_id}",
+            "status_name": status_name,
+            "responsible_user_name": "Илья",
+        },
         "warnings": list(warnings or []),
         "call_evidence": {"items": [], "summary": {"calls_total": 0}},
         "transcripts": [],
@@ -169,6 +184,7 @@ def test_analyze_period_creates_run_dir_and_summary_json():
     assert "call_signal_aggregates" in summary
     assert "call_runtime_diagnostics" in summary
     assert "transcript_runtime_diagnostics" in summary
+    assert "meeting_queue_writer" in summary
     call_diag = summary["call_runtime_diagnostics"]
     assert "call_collection_mode_effective" in call_diag
     assert "deals_with_call_candidates" in call_diag
@@ -179,6 +195,8 @@ def test_analyze_period_creates_run_dir_and_summary_json():
     assert "transcription_attempted" in call_diag
     assert "transcription_success" in call_diag
     assert "transcription_failed" in call_diag
+    assert "transcription_failed_missing_audio" in call_diag
+    assert "transcription_failed_backend_config" in call_diag
     tx_diag = summary["transcript_runtime_diagnostics"]
     assert "deals_with_any_call_evidence" in tx_diag
     assert "deals_with_audio_path" in tx_diag
@@ -203,6 +221,7 @@ def test_analyze_period_creates_run_dir_and_summary_json():
     assert "## Qualified Loss / Market Mismatch" in md
     assert "## Top 10 Most Risky Deals" in md
     assert "## Top 10 Highest Score Deals" in md
+    assert "Meeting queue writer:" in md
     top_risks = json.loads(top_risks_path.read_text(encoding="utf-8"))
     assert isinstance(top_risks, list)
     assert len(top_risks) == 2
@@ -246,21 +265,26 @@ def test_analyze_period_creates_run_dir_and_summary_json():
     assert "## Где транскрипт сомнительный/шумный" in tx_impact_md
     assert "## Топ-10 сделок для собрания именно по звонкам" in tx_impact_md
     tx_impact_json = json.loads(transcription_impact_json_path.read_text(encoding="utf-8"))
-    assert isinstance(tx_impact_json, list)
-    if tx_impact_json:
-        assert "without_transcript_aware" in tx_impact_json[0]
-        assert "with_transcript_aware" in tx_impact_json[0]
-        assert "changed_fields" in tx_impact_json[0]
+    assert isinstance(tx_impact_json, dict)
+    assert "total_deals_analyzed" in tx_impact_json
+    assert "deals_changed_by_transcript" in tx_impact_json
+    assert "changed_deals" in tx_impact_json
+    if tx_impact_json.get("changed_deals"):
+        sample_changed = tx_impact_json["changed_deals"][0]
+        assert "deal_id" in sample_changed
+        assert "baseline_summary" in sample_changed
+        assert "transcript_summary" in sample_changed
+        assert "changed_fields" in sample_changed
+        assert "transcript_excerpt" in sample_changed
     queue_dry_run = json.loads(queue_sheets_dry_run_path.read_text(encoding="utf-8"))
     assert queue_dry_run["mode"] == "dry_run"
     assert queue_dry_run["writer_scope"] == "deal_analyzer_only"
     assert "columns" in queue_dry_run and "rows" in queue_dry_run
     assert "why_in_queue_human" in queue_dry_run["columns"]
-    assert "why_in_queue_technical" in queue_dry_run["columns"]
+    assert "why_in_queue_technical" not in queue_dry_run["columns"]
     if queue_dry_run["rows"]:
         first_row = queue_dry_run["rows"][0]
         assert first_row.get("why_in_queue_human")
-        assert first_row.get("why_in_queue_technical")
     brief = manager_brief_path.read_text(encoding="utf-8")
     assert "# Manager Brief" in brief
     assert "Backend requested:" in brief
@@ -944,7 +968,53 @@ def test_meeting_queue_sheets_dry_run_uses_human_reason():
     assert queue_dry_run["rows_count"] == 1
     row = queue_dry_run["rows"][0]
     assert row["why_in_queue_human"] == "нужен ближайший следующий шаг"
-    assert row["why_in_queue_technical"] == "active_risk"
+    assert "why_in_queue_technical" not in row
+
+
+def test_transcription_compare_diff_only_for_meaningful_fields():
+    row = _build_transcription_impact_row(
+        deal_id=1,
+        deal_name="Deal 1",
+        owner_name="Owner",
+        status_or_stage="В работе",
+        score=55,
+        without_view={
+            "product_hypothesis": "unknown",
+            "product_hypothesis_confidence": "low",
+            "product_hypothesis_reason_short": "",
+            "call_signal_summary_short": "",
+            "reanimation_potential": "none",
+            "reanimation_reason_short": "",
+            "manager_summary": "A",
+            "employee_coaching": "X",
+            "employee_fix_tasks": ["1"],
+            "top_risk_flags": ["a"],
+        },
+        with_view={
+            "product_hypothesis": "info",
+            "product_hypothesis_confidence": "medium",
+            "product_hypothesis_reason_short": "reason",
+            "call_signal_summary_short": "call",
+            "reanimation_potential": "low",
+            "reanimation_reason_short": "r",
+            "manager_summary": "B",
+            "employee_coaching": "Y",
+            "employee_fix_tasks": ["2"],
+            "top_risk_flags": ["DIFFERENT_BUT_NOT_MEANINGFUL"],
+        },
+        analysis={
+            "transcript_available": True,
+            "transcript_text_excerpt": "excerpt",
+            "transcript_error": "",
+            "why_in_queue": "active_risk",
+        },
+        snapshot={"transcripts": [{"transcript_text": "long enough text for stable interpretation " * 5}]},
+        artifact_path="artifact.json",
+    )
+    assert row["changed"] is True
+    assert "top_risk_flags" not in row["changed_fields"]
+    assert "product_hypothesis" in row["changed_fields"]
+    assert "manager_summary" in row["changed_fields"]
 
 
 def test_product_hypothesis_mixed_and_unknown():
@@ -1108,3 +1178,676 @@ def test_period_summary_reports_real_llm_overlay_usage():
     summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
     assert summary["analysis_backend_used"] == "hybrid"
     assert summary["llm_overlay_deals"] == 2
+
+
+def test_meeting_queue_writer_real_write_path_via_mock():
+    output_dir = _fresh_output_dir("period_batch_writer_real_write")
+    payload = {"normalized_deals": [{"deal_id": 1}]}
+    logger = _Logger()
+    base_cfg = _cfg()
+    cfg = base_cfg.__class__(
+        **{
+            **base_cfg.__dict__,
+            "deal_analyzer_write_enabled": True,
+            "deal_analyzer_spreadsheet_id": "sheet123",
+            "deal_analyzer_sheet_name": "analytics_writer_test",
+            "deal_analyzer_start_cell": "A1",
+        }
+    )
+
+    class _FakeSheetsClient:
+        def __init__(self, project_root, logger):
+            self.calls = []
+
+        def build_tab_a1_range(self, *, tab_title, range_suffix):
+            return f"'{tab_title}'!{range_suffix}"
+
+        def get_values(self, spreadsheet_id, range_a1):
+            return []
+
+        def batch_update_values(self, spreadsheet_id, data):
+            self.calls.append((spreadsheet_id, data))
+            return {"ok": True}
+
+    fake_client = _FakeSheetsClient(None, None)
+
+    with patch("src.deal_analyzer.cli.GoogleSheetsApiClient", return_value=fake_client), patch(
+        "src.deal_analyzer.cli.load_config",
+        return_value=SimpleNamespace(project_root=Path("D:/AI_Automation/amocrm_bot/project")),
+    ), patch(
+        "src.deal_analyzer.cli.build_deal_snapshot",
+        side_effect=lambda **kw: _snapshot_for_deal(int(kw["normalized_deal"]["deal_id"])),
+    ), patch(
+        "src.deal_analyzer.cli._analyze_one_with_isolation",
+        side_effect=lambda normalized, cfg, logger, *, deal_hint, backend_override: _analysis_for_deal(int(normalized["deal_id"]), score=55),
+    ):
+        _run_analyze_period(
+            cfg,
+            output_dir,
+            payload,
+            "period.json",
+            True,
+            logger,
+            period_mode=None,
+            date_from=None,
+            date_to=None,
+            limit=None,
+        )
+
+    run_dir = next((output_dir / "period_runs").iterdir())
+    summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    writer = summary.get("meeting_queue_writer", {})
+    assert writer.get("enabled") is True
+    assert writer.get("mode") == "real_write"
+    assert writer.get("rows_prepared", 0) >= 1
+    assert writer.get("rows_written") == writer.get("rows_prepared")
+    assert writer.get("write_mode") == "append"
+    assert len(fake_client.calls) == 1
+
+
+def test_meeting_queue_writer_safe_skip_when_target_missing():
+    output_dir = _fresh_output_dir("period_batch_writer_safe_skip")
+    payload = {"normalized_deals": [{"deal_id": 1}]}
+    logger = _Logger()
+    base_cfg = _cfg()
+    cfg = base_cfg.__class__(
+        **{
+            **base_cfg.__dict__,
+            "deal_analyzer_write_enabled": True,
+            "deal_analyzer_spreadsheet_id": "",
+            "deal_analyzer_sheet_name": "",
+            "deal_analyzer_start_cell": "",
+        }
+    )
+
+    with patch(
+        "src.deal_analyzer.cli.build_deal_snapshot",
+        side_effect=lambda **kw: _snapshot_for_deal(int(kw["normalized_deal"]["deal_id"])),
+    ), patch(
+        "src.deal_analyzer.cli._analyze_one_with_isolation",
+        side_effect=lambda normalized, cfg, logger, *, deal_hint, backend_override: _analysis_for_deal(int(normalized["deal_id"]), score=55),
+    ):
+        _run_analyze_period(
+            cfg,
+            output_dir,
+            payload,
+            "period.json",
+            True,
+            logger,
+            period_mode=None,
+            date_from=None,
+            date_to=None,
+            limit=None,
+        )
+
+    run_dir = next((output_dir / "period_runs").iterdir())
+    summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    writer = summary.get("meeting_queue_writer", {})
+    assert writer.get("enabled") is True
+    assert writer.get("mode") == "dry_run"
+    assert writer.get("rows_prepared", 0) >= 1
+    assert writer.get("rows_written") == 0
+    assert writer.get("error")
+
+
+def test_meeting_queue_writer_appends_below_existing_rows():
+    output_dir = _fresh_output_dir("period_batch_writer_tail_clear")
+    payload = {"normalized_deals": [{"deal_id": 1}]}
+    logger = _Logger()
+    base_cfg = _cfg()
+    cfg = base_cfg.__class__(
+        **{
+            **base_cfg.__dict__,
+            "deal_analyzer_write_enabled": True,
+            "deal_analyzer_spreadsheet_id": "sheet123",
+            "deal_analyzer_sheet_name": "analytics_writer_test",
+            "deal_analyzer_start_cell": "A1",
+        }
+    )
+
+    class _FakeSheetsClient:
+        def __init__(self, project_root, logger):
+            self.calls = []
+
+        def build_tab_a1_range(self, *, tab_title, range_suffix):
+            return f"'{tab_title}'!{range_suffix}"
+
+        def get_values(self, spreadsheet_id, range_a1):
+            # Existing block has 5 non-empty rows (header + 4 data rows)
+            return [["h1"], ["r1"], ["r2"], ["r3"], ["r4"]]
+
+        def batch_update_values(self, spreadsheet_id, data):
+            self.calls.append((spreadsheet_id, data))
+            return {"ok": True}
+
+    fake_client = _FakeSheetsClient(None, None)
+
+    with patch("src.deal_analyzer.cli.GoogleSheetsApiClient", return_value=fake_client), patch(
+        "src.deal_analyzer.cli.load_config",
+        return_value=SimpleNamespace(project_root=Path("D:/AI_Automation/amocrm_bot/project")),
+    ), patch(
+        "src.deal_analyzer.cli.build_deal_snapshot",
+        side_effect=lambda **kw: _snapshot_for_deal(int(kw["normalized_deal"]["deal_id"])),
+    ), patch(
+        "src.deal_analyzer.cli._analyze_one_with_isolation",
+        side_effect=lambda normalized, cfg, logger, *, deal_hint, backend_override: _analysis_for_deal(int(normalized["deal_id"]), score=55),
+    ):
+        _run_analyze_period(
+            cfg,
+            output_dir,
+            payload,
+            "period.json",
+            True,
+            logger,
+            period_mode=None,
+            date_from=None,
+            date_to=None,
+            limit=None,
+        )
+
+    run_dir = next((output_dir / "period_runs").iterdir())
+    summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    writer = summary.get("meeting_queue_writer", {})
+    assert writer.get("mode") == "real_write"
+    assert writer.get("write_mode") == "append"
+    assert writer.get("write_start_row", 0) >= 6
+
+
+def test_daily_control_payload_uses_business_columns_only():
+    summary = {
+        "period_start": "2026-04-14",
+        "period_end": "2026-04-20",
+        "run_timestamp": "2026-04-19T10:10:00+00:00",
+    }
+    records = [
+        {
+            "deal_id": 101,
+            "owner_name": "Рустам",
+            "product_name": "ИНФО",
+            "score": 55,
+            "risk_flags": ["process_hygiene: missing follow-up"],
+            "manager_summary": "Нужно дожать фиксацию следующего шага.",
+            "growth_zones": ["Не всегда фиксируется следующий шаг"],
+            "strong_sides": ["Есть нормальный контакт с ЛПР"],
+            "employee_coaching": "Переслушать звонок и сверить с CRM.",
+            "status_name": "В работе",
+        }
+    ]
+    payload = _build_daily_control_sheet_payload(summary=summary, period_deal_records=records)
+    assert payload["sheet_name"] == "Дневной контроль"
+    assert payload["start_cell"] == "A2"
+    assert "deal_id" not in payload["columns"]
+    assert "artifact_path" not in payload["columns"]
+    assert payload["columns"][0] == "Неделя с"
+    assert payload["columns"][-1] == "Критичность"
+    row = payload["rows"][0]
+    assert "Ссылки на сделки" in row
+    assert "Что донес сотруднику" in row
+    assert isinstance(row["Оценка 0-100"], int)
+    assert 0 <= row["Оценка 0-100"] <= 100
+    joined = " ".join(
+        str(row.get(k) or "")
+        for k in ("Ключевой вывод", "Сильные стороны", "Зоны роста", "Почему это важно", "Что закрепить", "Что исправить", "Что донес сотруднику")
+    ).lower()
+    for bad in ("qualified loss", "anti-fit", "owner", "closeout", "follow-up"):
+        assert bad not in joined
+
+
+def test_daily_control_writer_starts_from_a2_and_does_not_write_header_row():
+    output_dir = _fresh_output_dir("period_batch_daily_writer_a2")
+    payload = {"normalized_deals": [{"deal_id": 1}]}
+    logger = _Logger()
+    base_cfg = _cfg()
+    cfg = base_cfg.__class__(
+        **{
+            **base_cfg.__dict__,
+            "deal_analyzer_write_enabled": True,
+            "deal_analyzer_spreadsheet_id": "sheet123",
+            "deal_analyzer_daily_sheet_name": "Дневной контроль",
+            "deal_analyzer_daily_start_cell": "A2",
+        }
+    )
+
+    class _FakeSheetsClient:
+        def __init__(self, project_root, logger):
+            self.calls = []
+
+        def build_tab_a1_range(self, *, tab_title, range_suffix):
+            return f"'{tab_title}'!{range_suffix}"
+
+        def get_values(self, spreadsheet_id, range_a1):
+            return []
+
+        def batch_update_values(self, spreadsheet_id, data):
+            self.calls.append((spreadsheet_id, data))
+            return {"ok": True}
+
+    fake_client = _FakeSheetsClient(None, None)
+    with patch("src.deal_analyzer.cli.GoogleSheetsApiClient", return_value=fake_client), patch(
+        "src.deal_analyzer.cli.load_config",
+        return_value=SimpleNamespace(project_root=Path("D:/AI_Automation/amocrm_bot/project")),
+    ), patch(
+        "src.deal_analyzer.cli.build_deal_snapshot",
+        side_effect=lambda **kw: _snapshot_for_deal(int(kw["normalized_deal"]["deal_id"])),
+    ), patch(
+        "src.deal_analyzer.cli._analyze_one_with_isolation",
+        side_effect=lambda normalized, cfg, logger, *, deal_hint, backend_override: _analysis_for_deal(int(normalized["deal_id"]), score=55),
+    ):
+        _run_analyze_period(
+            cfg,
+            output_dir,
+            payload,
+            "period.json",
+            True,
+            logger,
+            period_mode=None,
+            date_from=None,
+            date_to=None,
+            limit=None,
+        )
+
+    assert len(fake_client.calls) == 1
+    write_range = fake_client.calls[0][1][0]["range"]
+    assert "A2:" in write_range
+    written_values = fake_client.calls[0][1][0]["values"]
+    assert len(written_values) >= 1
+
+
+def test_daily_control_writer_uses_append_mode_by_default():
+    output_dir = _fresh_output_dir("period_batch_daily_writer_tail")
+    payload = {"normalized_deals": [{"deal_id": 1}]}
+    logger = _Logger()
+    base_cfg = _cfg()
+    cfg = base_cfg.__class__(
+        **{
+            **base_cfg.__dict__,
+            "deal_analyzer_write_enabled": True,
+            "deal_analyzer_spreadsheet_id": "sheet123",
+            "deal_analyzer_daily_sheet_name": "Дневной контроль",
+            "deal_analyzer_daily_start_cell": "A2",
+        }
+    )
+
+    class _FakeSheetsClient:
+        def __init__(self, project_root, logger):
+            self.calls = []
+
+        def build_tab_a1_range(self, *, tab_title, range_suffix):
+            return f"'{tab_title}'!{range_suffix}"
+
+        def get_values(self, spreadsheet_id, range_a1):
+            return [["row1"], ["row2"], ["row3"], ["row4"]]
+
+        def batch_update_values(self, spreadsheet_id, data):
+            self.calls.append((spreadsheet_id, data))
+            return {"ok": True}
+
+    fake_client = _FakeSheetsClient(None, None)
+    with patch("src.deal_analyzer.cli.GoogleSheetsApiClient", return_value=fake_client), patch(
+        "src.deal_analyzer.cli.load_config",
+        return_value=SimpleNamespace(project_root=Path("D:/AI_Automation/amocrm_bot/project")),
+    ), patch(
+        "src.deal_analyzer.cli.build_deal_snapshot",
+        side_effect=lambda **kw: _snapshot_for_deal(int(kw["normalized_deal"]["deal_id"])),
+    ), patch(
+        "src.deal_analyzer.cli._analyze_one_with_isolation",
+        side_effect=lambda normalized, cfg, logger, *, deal_hint, backend_override: _analysis_for_deal(int(normalized["deal_id"]), score=55),
+    ):
+        _run_analyze_period(
+            cfg,
+            output_dir,
+            payload,
+            "period.json",
+            True,
+            logger,
+            period_mode=None,
+            date_from=None,
+            date_to=None,
+            limit=None,
+        )
+
+    run_dir = next((output_dir / "period_runs").iterdir())
+    summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    writer = summary.get("daily_control_writer", {})
+    assert writer.get("write_mode") == "append"
+    assert writer.get("rows_written", 0) >= 1
+    assert writer.get("write_start_row", 0) >= 6
+
+
+def test_daily_control_payload_uses_weekday_packages_not_runtime_sunday():
+    summary = {
+        "period_start": "2026-04-13",
+        "period_end": "2026-04-19",
+        "run_timestamp": "2026-04-19T10:10:00+00:00",
+    }
+    records = [
+        {
+            "deal_id": 101,
+            "owner_name": "Рустам",
+            "product_name": "ИНФО",
+            "score": 55,
+            "risk_flags": ["process_hygiene: missing follow-up"],
+            "manager_summary": "Дожать следующий шаг.",
+            "growth_zones": ["Не всегда фиксируется следующий шаг"],
+            "strong_sides": ["Есть контакт с ЛПР"],
+            "employee_coaching": "Переслушать звонок и сверить с CRM.",
+            "status_name": "В работе",
+            "updated_at": "2026-04-17T11:00:00+00:00",
+        }
+    ]
+    payload = _build_daily_control_sheet_payload(summary=summary, period_deal_records=records)
+    dates = [row.get("Дата контроля") for row in payload.get("rows", [])]
+    days = [str(row.get("День") or "") for row in payload.get("rows", [])]
+    assert "2026-04-19" not in dates
+    assert "Воскресенье" not in days
+    assert payload.get("rows_count", 0) >= 1
+
+
+def test_daily_control_role_aware_filters_warm_growth_for_rustam():
+    summary = {
+        "period_start": "2026-04-13",
+        "period_end": "2026-04-19",
+        "run_timestamp": "2026-04-19T10:10:00+00:00",
+    }
+    records = [
+        {
+            "deal_id": 202,
+            "owner_name": "Рустам",
+            "product_name": "ИНФО",
+            "score": 42,
+            "risk_flags": ["demo_missing", "brief_missing", "process_hygiene: missing follow-up"],
+            "growth_zones": ["Не подтверждена презентация", "Не заполнен бриф", "Не фиксируется следующий шаг"],
+            "strong_sides": ["Вышел на ЛПР"],
+            "manager_summary": "Есть движение, но провисает фиксация следующего шага.",
+            "employee_coaching": "Сверить звонок с CRM и дожать следующий шаг.",
+            "status_name": "В работе",
+            "updated_at": "2026-04-16T11:00:00+00:00",
+            "call_signal_demo_discussed": False,
+            "call_signal_test_discussed": False,
+            "status_or_stage": "В работе / Привлечение",
+        }
+    ]
+    payload = _build_daily_control_sheet_payload(summary=summary, period_deal_records=records)
+    assert payload.get("rows")
+    growth = str(payload["rows"][0].get("Зоны роста") or "").lower()
+    role = str(payload["rows"][0].get("Роль менеджера") or "").lower()
+    assert role == "телемаркетолог"
+    assert "презентац" not in growth
+    assert "бриф" not in growth
+
+
+def test_daily_control_links_are_full_urls_with_newlines():
+    summary = {
+        "period_start": "2026-04-13",
+        "period_end": "2026-04-19",
+        "run_timestamp": "2026-04-19T10:10:00+00:00",
+    }
+    records = [
+        {
+            "deal_id": 301,
+            "owner_name": "Илья",
+            "score": 58,
+            "risk_flags": ["process_hygiene: missing follow-up"],
+            "growth_zones": ["Не всегда фиксируется следующий шаг"],
+            "strong_sides": ["Есть контакт с ЛПР"],
+            "manager_summary": "Дожать следующий шаг и не терять темп.",
+            "employee_coaching": "Сверить звонок и CRM.",
+            "status_name": "В работе",
+        },
+        {
+            "deal_id": 302,
+            "owner_name": "Илья",
+            "score": 57,
+            "risk_flags": ["process_hygiene: missing follow-up"],
+            "growth_zones": ["Не всегда фиксируется следующий шаг"],
+            "strong_sides": ["Есть контакт с ЛПР"],
+            "manager_summary": "Дожать следующий шаг и не терять темп.",
+            "employee_coaching": "Сверить звонок и CRM.",
+            "status_name": "В работе",
+        },
+    ]
+    payload = _build_daily_control_sheet_payload(
+        summary=summary,
+        period_deal_records=records,
+        amo_base_domain="https://example.amocrm.ru",
+    )
+    assert payload.get("rows")
+    links = str(payload["rows"][0].get("Ссылки на сделки") or "")
+    assert "https://example.amocrm.ru/leads/detail/301" in links
+    assert "https://example.amocrm.ru/leads/detail/302" in links
+    assert "\n" in links
+
+
+def test_daily_control_spreads_rows_across_multiple_weekdays_when_enough_material():
+    summary = {
+        "period_start": "2026-04-13",
+        "period_end": "2026-04-19",
+        "run_timestamp": "2026-04-19T10:10:00+00:00",
+    }
+    records = []
+    for idx in range(1, 9):
+        records.append(
+            {
+                "deal_id": 500 + idx,
+                "owner_name": "Рустам",
+                "score": 45 + idx,
+                "risk_flags": ["process_hygiene: missing follow-up"],
+                "growth_zones": ["Не всегда фиксируется следующий шаг"],
+                "strong_sides": ["Есть контакт с ЛПР"],
+                "manager_summary": "Дожать следующий шаг и не терять темп.",
+                "employee_coaching": "Перепроверить на свежую голову и сверить с CRM.",
+                "status_name": "В работе",
+                "updated_at": "",
+            }
+        )
+    payload = _build_daily_control_sheet_payload(summary=summary, period_deal_records=records)
+    rows = payload.get("rows", [])
+    dates = [str(row.get("Дата контроля") or "") for row in rows]
+    assert len(rows) >= 2
+    assert len(set(dates)) >= 2
+
+
+def test_daily_control_default_allowlist_excludes_non_target_managers():
+    summary = {
+        "period_start": "2026-04-13",
+        "period_end": "2026-04-19",
+        "run_timestamp": "2026-04-19T10:10:00+00:00",
+    }
+    records = [
+        {"deal_id": 801, "owner_name": "Илья", "score": 60, "status_name": "В работе"},
+        {"deal_id": 802, "owner_name": "Рустам", "score": 61, "status_name": "В работе"},
+        {"deal_id": 803, "owner_name": "Антон Коломоец", "score": 62, "status_name": "В работе"},
+        {"deal_id": 804, "owner_name": "Гордиенко Кирилл", "score": 63, "status_name": "В работе"},
+    ]
+    payload = _build_daily_control_sheet_payload(summary=summary, period_deal_records=records)
+    managers = {str(r.get("Менеджер") or "") for r in payload.get("rows", [])}
+    assert "Илья" in managers
+    assert "Рустам" in managers
+    assert "Антон Коломоец" not in managers
+    assert "Гордиенко Кирилл" not in managers
+
+
+def test_daily_control_base_mix_never_uses_segment_not_defined():
+    summary = {
+        "period_start": "2026-04-13",
+        "period_end": "2026-04-19",
+        "run_timestamp": "2026-04-19T10:10:00+00:00",
+    }
+    records = [{"deal_id": 901, "owner_name": "Илья", "score": 51, "status_name": "В работе"}]
+    payload = _build_daily_control_sheet_payload(summary=summary, period_deal_records=records)
+    assert payload.get("rows")
+    mix = str(payload["rows"][0].get("База микс") or "").strip().lower()
+    assert mix != "сегмент не определен"
+    assert mix
+
+
+def test_daily_control_what_fix_is_not_same_as_growth():
+    summary = {
+        "period_start": "2026-04-13",
+        "period_end": "2026-04-19",
+        "run_timestamp": "2026-04-19T10:10:00+00:00",
+    }
+    records = [
+        {
+            "deal_id": 910,
+            "owner_name": "Рустам",
+            "score": 50,
+            "status_name": "В работе",
+            "growth_zones": ["Не зафиксирована боль клиента"],
+        }
+    ]
+    payload = _build_daily_control_sheet_payload(summary=summary, period_deal_records=records)
+    row = payload["rows"][0]
+    growth = str(row.get("Зоны роста") or "").strip()
+    fix = str(row.get("Что исправить") or "").strip()
+    assert growth
+    assert fix
+    assert growth != fix
+    assert "на ближайший цикл" not in fix.lower()
+
+
+def test_daily_control_coaching_has_numbered_list_format():
+    summary = {
+        "period_start": "2026-04-13",
+        "period_end": "2026-04-19",
+        "run_timestamp": "2026-04-19T10:10:00+00:00",
+    }
+    records = [{"deal_id": 920, "owner_name": "Илья", "score": 55, "status_name": "В работе"}]
+    payload = _build_daily_control_sheet_payload(summary=summary, period_deal_records=records)
+    coaching = str(payload["rows"][0].get("Что донес сотруднику") or "")
+    assert "донес" not in coaching.lower()
+    assert "1)" in coaching and "2)" in coaching and "3)" in coaching
+
+
+def test_daily_control_text_columns_can_be_llm_authored_not_template():
+    summary = {
+        "period_start": "2026-04-13",
+        "period_end": "2026-04-19",
+        "run_timestamp": "2026-04-19T10:10:00+00:00",
+    }
+    records = [{"deal_id": 921, "owner_name": "Илья", "score": 55, "status_name": "В работе"}]
+    llm_columns = {
+        "Ключевой вывод": "Фактура собрана нормально, провисает только фиксация следующего шага.",
+        "Сильные стороны": "Держит структуру разговора и не теряет клиента в середине диалога.",
+        "Зоны роста": "Сразу закрывать договоренность датой; Не оставлять размытый следующий шаг",
+        "Почему это важно": "Менеджеру проще дожимать, когда шаг зафиксирован. Руководителю видно, что реально движется.",
+        "Что закрепить": "Держать связку вопрос -> уточнение -> договоренность с датой.",
+        "Что исправить": "После звонка сразу фиксировать шаг и срок в карточке.",
+        "Что донес сотруднику": "1) Сверить шаг в двух свежих звонках.\n2) Проговорить формулировку следующего шага.\n3) Закрепить шаблон фиксации в CRM.",
+        "Ожидаемый эффект - количество": "+1 подтвержденная встреча в неделю.",
+        "Ожидаемый эффект - качество": "Шаги будут фиксироваться чище; переход между этапами станет стабильнее.",
+    }
+
+    with patch("src.deal_analyzer.cli._generate_daily_table_text_columns", return_value=llm_columns):
+        payload = _build_daily_control_sheet_payload(summary=summary, period_deal_records=records)
+    row = payload["rows"][0]
+    assert row["Ключевой вывод"] == llm_columns["Ключевой вывод"]
+    assert row["Что закрепить"] == llm_columns["Что закрепить"]
+    assert row["Ожидаемый эффект - количество"] == llm_columns["Ожидаемый эффект - количество"]
+
+
+def test_daily_control_rows_are_sorted_by_day_then_manager():
+    summary = {
+        "period_start": "2026-04-13",
+        "period_end": "2026-04-19",
+        "run_timestamp": "2026-04-19T10:10:00+00:00",
+    }
+    records = [
+        {
+            "deal_id": 701,
+            "owner_name": "Рустам",
+            "score": 55,
+            "risk_flags": [],
+            "growth_zones": ["Не терять следующий шаг"],
+            "strong_sides": ["Вышел на ЛПР"],
+            "manager_summary": "Собрал нормальный контекст по звонкам.",
+            "employee_coaching": "Закрепить рабочий скрипт.",
+            "status_name": "В работе",
+            "updated_at": "2026-04-14T10:00:00+00:00",
+        },
+        {
+            "deal_id": 702,
+            "owner_name": "Илья",
+            "score": 65,
+            "risk_flags": [],
+            "growth_zones": ["Не отпускать фиксацию результата"],
+            "strong_sides": ["Есть зафиксированный следующий шаг"],
+            "manager_summary": "Хорошо дожимает результат встречи.",
+            "employee_coaching": "Продолжать в том же темпе.",
+            "status_name": "В работе",
+            "updated_at": "2026-04-14T09:00:00+00:00",
+        },
+        {
+            "deal_id": 703,
+            "owner_name": "Рустам",
+            "score": 51,
+            "risk_flags": [],
+            "growth_zones": ["Дожимать назначение"],
+            "strong_sides": ["Есть контакт с ЛПР"],
+            "manager_summary": "По холодному контуру есть рабочая динамика.",
+            "employee_coaching": "Сверять шаг с CRM в день звонка.",
+            "status_name": "В работе",
+            "updated_at": "2026-04-15T09:00:00+00:00",
+        },
+        {
+            "deal_id": 704,
+            "owner_name": "Илья",
+            "score": 69,
+            "risk_flags": [],
+            "growth_zones": ["Фиксировать результат встречи"],
+            "strong_sides": ["Двигает сделки по теплому этапу"],
+            "manager_summary": "По встречам держит нужный темп.",
+            "employee_coaching": "Дожимать следующий шаг после встречи.",
+            "status_name": "В работе",
+            "updated_at": "2026-04-15T08:00:00+00:00",
+        },
+    ]
+    payload = _build_daily_control_sheet_payload(summary=summary, period_deal_records=records)
+    order = [(str(x.get("Дата контроля") or ""), str(x.get("Менеджер") or "")) for x in payload.get("rows", [])]
+    assert order == sorted(order, key=lambda x: (x[0], x[1]))
+
+
+def test_daily_expected_quantity_has_no_percent_and_no_conversion_wording():
+    qty_rustam = _expected_quantity_text(avg_score=35, deals=4, role="телемаркетолог")
+    qty_ilya = _expected_quantity_text(avg_score=55, deals=4, role="менеджер по продажам")
+
+    for value in (qty_rustam, qty_ilya):
+        low = value.lower()
+        assert "%" not in value
+        assert "конверси" not in low
+        assert "этап" not in low
+        assert any(token in low for token in ("+1", "1-2", "-1", "1 дополнительный"))
+
+
+def test_daily_expected_quality_allows_stage_or_conversion_hypothesis():
+    quality_sales = _expected_quality_text(criticality="средняя", role="менеджер по продажам").lower()
+    assert "этап" in quality_sales or "конверси" in quality_sales
+
+
+def test_daily_expected_quantity_rustam_and_ilya_are_absolute_not_percent():
+    qty_rustam = _expected_quantity_text(avg_score=60, deals=3, role="телемаркетолог").lower()
+    qty_ilya = _expected_quantity_text(avg_score=60, deals=3, role="менеджер по продажам").lower()
+
+    assert "%" not in qty_rustam
+    assert "%" not in qty_ilya
+    assert "встреч" in qty_rustam or "лпр" in qty_rustam or "сделк" in qty_rustam
+    assert "встреч" in qty_ilya or "следующ" in qty_ilya or "сделк" in qty_ilya
+
+
+def test_daily_payload_expected_quantity_is_absolute_and_no_percent():
+    summary = {
+        "period_start": "2026-04-13",
+        "period_end": "2026-04-19",
+        "run_timestamp": "2026-04-19T10:10:00+00:00",
+    }
+    records = [
+        {"deal_id": 931, "owner_name": "Илья", "score": 53, "status_name": "В работе"},
+        {"deal_id": 932, "owner_name": "Рустам", "score": 48, "status_name": "В работе"},
+    ]
+    payload = _build_daily_control_sheet_payload(summary=summary, period_deal_records=records)
+    for row in payload["rows"]:
+        qty = str(row.get("Ожидаемый эффект - количество") or "")
+        low = qty.lower()
+        assert "%" not in qty
+        assert "конверси" not in low
+
