@@ -58,6 +58,31 @@ def derive_transcript_signals(*, deal: dict[str, Any], snapshot: dict[str, Any] 
         ),
     )
     signal_dmr = _has_any(norm, ("лпр", "лицо принимающее решение", "директор", "собственник", "руководител"))
+    signal_score = int(
+        sum(
+            1
+            for flag in (
+                signal_info,
+                signal_link,
+                signal_demo,
+                signal_test,
+                signal_budget,
+                signal_followup,
+                signal_objection_price,
+                signal_objection_no_need,
+                signal_objection_not_target,
+                signal_next_step,
+                signal_dmr,
+            )
+            if flag
+        )
+    )
+
+    text_len, nonempty_ratio, noise_score, repeat_score, usability_score, usability_label = _compute_transcript_usability(
+        norm=norm,
+        raw_text=combined,
+        signal_score=signal_score,
+    )
 
     excerpt = _make_excerpt(combined)
     summary = _build_signal_summary(
@@ -88,6 +113,13 @@ def derive_transcript_signals(*, deal: dict[str, Any], snapshot: dict[str, Any] 
         "call_signal_next_step_present": signal_next_step,
         "call_signal_decision_maker_reached": signal_dmr,
         "call_signal_summary_short": summary,
+        "transcript_text_len": text_len,
+        "transcript_nonempty_ratio": nonempty_ratio,
+        "transcript_noise_score": noise_score,
+        "transcript_repeat_score": repeat_score,
+        "transcript_signal_score": signal_score,
+        "transcript_usability_score_final": usability_score,
+        "transcript_usability_label": usability_label,
     }
 
 
@@ -219,3 +251,60 @@ def _norm(text: Any) -> str:
 
 def _has_any(text: str, needles: tuple[str, ...]) -> bool:
     return any(needle in text for needle in needles)
+
+
+def _compute_transcript_usability(*, norm: str, raw_text: str, signal_score: int) -> tuple[int, float, int, int, int, str]:
+    if not norm:
+        return 0, 0.0, 100, 0, 0, "empty"
+
+    words = [w for w in norm.split() if w]
+    text_len = len(raw_text)
+    total_words = max(1, len(words))
+    meaningful_words = sum(1 for w in words if any(ch.isalnum() for ch in w) and len(w) > 1)
+    nonempty_ratio = round(meaningful_words / total_words, 3)
+
+    noise_markers = (
+        "шум",
+        "неразборчив",
+        "обрыв",
+        "тишин",
+        "пусто",
+        "непонят",
+        "помех",
+    )
+    noise_hits = sum(1 for marker in noise_markers if marker in norm)
+    short_token_ratio = sum(1 for w in words if len(w) <= 2) / total_words
+    noise_score = int(
+        min(
+            100,
+            max(
+                0,
+                round((noise_hits * 20) + (max(0.0, short_token_ratio - 0.3) * 100) + (15 if text_len < 80 else 0)),
+            ),
+        )
+    )
+
+    freq = Counter(words)
+    repeated_words = sum(1 for _, cnt in freq.items() if cnt >= 4)
+    dominant_repeat_ratio = (max(freq.values()) / total_words) if freq else 0.0
+    repeat_score = int(min(100, max(0, round((repeated_words * 10) + (dominant_repeat_ratio * 70)))))
+
+    usability_raw = (
+        min(30, text_len // 10)
+        + int(nonempty_ratio * 25)
+        + min(25, signal_score * 4)
+        - int(noise_score * 0.35)
+        - int(repeat_score * 0.25)
+    )
+    usability_score = int(min(100, max(0, usability_raw)))
+
+    if text_len < 20 or nonempty_ratio < 0.2:
+        label = "empty"
+    elif noise_score >= 70 or repeat_score >= 75:
+        label = "noisy"
+    elif usability_score >= 45 and signal_score >= 1 and text_len >= 60:
+        label = "usable"
+    else:
+        label = "weak"
+
+    return text_len, nonempty_ratio, noise_score, repeat_score, usability_score, label

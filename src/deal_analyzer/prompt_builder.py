@@ -17,6 +17,18 @@ HYBRID_SHORT_JSON_INSTRUCTION = (
     "Ровно поля: product_hypothesis_llm, loss_reason_short, manager_insight_short, coaching_hint_short, reanimation_reason_short_llm."
 )
 
+DAILY_TABLE_JSON_INSTRUCTION = (
+    "Верни только валидный JSON-объект без markdown/комментариев/пояснений. "
+    "Строго ключи: key_takeaway, strong_sides, growth_zones, why_important, reinforce, fix_action, "
+    "coaching_list, expected_quantity, expected_quality."
+)
+
+DAILY_RERANK_JSON_INSTRUCTION = (
+    "Верни только валидный JSON-объект без markdown/комментариев/пояснений. "
+    "Строго формат: {\"ranked\":[{\"deal_id\":\"...\",\"rank\":1,\"reason\":\"...\",\"skip\":false,\"skip_reason\":\"...\","
+    "\"call_analysis_viability\":\"high|medium|low\",\"call_analysis_viability_reason\":\"...\"}]}"
+)
+
 
 def build_manager_message_draft(analysis: DealAnalysis) -> str:
     deal_label = analysis.deal_name or f"Сделка {analysis.deal_id}"
@@ -69,6 +81,18 @@ def append_hybrid_json_repair_instruction(messages: list[dict[str, str]]) -> lis
     return out
 
 
+def append_daily_table_json_repair_instruction(messages: list[dict[str, str]]) -> list[dict[str, str]]:
+    out = list(messages)
+    out.append({"role": "user", "content": DAILY_TABLE_JSON_INSTRUCTION})
+    return out
+
+
+def append_daily_rerank_json_repair_instruction(messages: list[dict[str, str]]) -> list[dict[str, str]]:
+    out = list(messages)
+    out.append({"role": "user", "content": DAILY_RERANK_JSON_INSTRUCTION})
+    return out
+
+
 def build_hybrid_short_messages(*, normalized_deal: dict[str, Any], config: DealAnalyzerConfig) -> list[dict[str, str]]:
     system_prompt = (
         "Ты помогаешь с коротким уточнением анализа сделки. "
@@ -85,6 +109,89 @@ def build_hybrid_short_messages(*, normalized_deal: dict[str, Any], config: Deal
         "Сделка (compact payload):\n"
         f"{json.dumps(compact, ensure_ascii=False, indent=2)}\n\n"
         "Верни короткое уточнение по трем полям JSON."
+    )
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+
+def build_daily_table_messages(
+    *,
+    factual_payload: dict[str, Any],
+    config: DealAnalyzerConfig,
+    style_source_excerpt: str,
+) -> list[dict[str, str]]:
+    system_prompt = (
+        "Ты формируешь текст ячеек для таблицы ежедневного управленческого контроля продаж. "
+        "Пиши живым рабочим русским языком руководителя: коротко, по делу, без бюрократии. "
+        "Используй только факты из входных данных, ничего не выдумывай. "
+        "Можно выбирать подходящие инструменты продаж (вопросы, модуль следующего шага, квалификация), "
+        "если это подтверждается фактурой звонков/CRM. "
+        "Если переговорного материала мало, честно пиши про дисциплину набора->дозвона без выдумки. "
+        "Верни только JSON-объект без markdown."
+    )
+    style_hint = style_source_excerpt.strip()
+    user_prompt = (
+        "Factual payload:\n"
+        f"{json.dumps(factual_payload, ensure_ascii=False, indent=2)}\n\n"
+        "Сгенерируй поля таблицы строго в JSON-ключах:\n"
+        "- key_takeaway\n"
+        "- strong_sides\n"
+        "- growth_zones\n"
+        "- why_important\n"
+        "- reinforce\n"
+        "- fix_action\n"
+        "- coaching_list\n"
+        "- expected_quantity\n"
+        "- expected_quality\n\n"
+        "Контракт формата:\n"
+        "1) key_takeaway: 1 короткий абзац.\n"
+        "2) strong_sides: только подтверждаемые сильные стороны; если нечего хвалить, пустая строка.\n"
+        "3) growth_zones: максимум 2 пункта через '; '.\n"
+        "4) why_important: сначала польза сотруднику, потом польза отделу.\n"
+        "5) reinforce: конкретный прием/инструмент.\n"
+        "6) fix_action: конкретный шаг без фразы 'на ближайший цикл'.\n"
+        "7) coaching_list: только нумерованный формат '1) ...\\n2) ...\\n3) ...', без слова 'донес'.\n"
+        "8) expected_quantity: только абсолютные значения, без процентов и без обещаний конверсии.\n"
+        "9) expected_quality: можно аккуратно описывать влияние на этапы/конверсию как гипотезу.\n\n"
+        "Важно: не скатывайся в техно-термины и канцелярит. Не повторяй одинаковые шаблоны между строками.\n\n"
+        "Style source excerpt:\n"
+        f"{style_hint or '(style source unavailable)'}"
+    )
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+
+def build_daily_rerank_messages(
+    *,
+    rerank_payload: dict[str, Any],
+    config: DealAnalyzerConfig,
+    style_source_excerpt: str,
+) -> list[dict[str, str]]:
+    system_prompt = (
+        "Ты помогаешь ранжировать сделки для ежедневного управленческого разбора. "
+        "Выбирай те сделки, где больше пользы для управления: живые сигналы разговора, "
+        "достаточный контекст, понятный участок воронки, практическая ценность для разборов. "
+        "Слабые/шумные кейсы можно помечать skip=true. "
+        "Используй только входные данные, ничего не выдумывай. Верни только JSON."
+    )
+    user_prompt = (
+        "Payload:\n"
+        f"{json.dumps(rerank_payload, ensure_ascii=False, indent=2)}\n\n"
+        "Верни JSON:\n"
+        "{\n"
+        '  "ranked": [\n'
+        '    {"deal_id":"321", "rank":1, "reason":"коротко", "skip":false, "skip_reason":"", "call_analysis_viability":"high", "call_analysis_viability_reason":"коротко"}\n'
+        "  ]\n"
+        "}\n\n"
+        "Правила:\n"
+        "1) Сначала самые информативные и полезные для daily-control.\n"
+        "2) Если transcript weak/noisy и CRM тонкий, можно ставить skip=true.\n"
+        "3) reason и skip_reason короткие, по делу.\n"
+        f"Style source excerpt:\n{style_source_excerpt or '(style source unavailable)'}"
     )
     return [
         {"role": "system", "content": system_prompt},

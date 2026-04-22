@@ -31,6 +31,10 @@ class DealAnalyzerConfig:
     ollama_model: str
     ollama_timeout_seconds: int
     style_profile_name: str
+    ollama_fallback_enabled: bool = False
+    ollama_fallback_base_url: str = ""
+    ollama_fallback_model: str = ""
+    ollama_fallback_timeout_seconds: int = 60
     period_mode: str = "smart_manager_default"
     custom_date_from: str | None = None
     custom_date_to: str | None = None
@@ -59,6 +63,10 @@ class DealAnalyzerConfig:
     whisper_compute_type: str = "auto"
     transcription_language: str = ""
     transcription_timeout_seconds: int = 60
+    whisper_quality_retry_enabled: bool = False
+    whisper_quality_retry_model_name: str = "large-v3"
+    whisper_quality_retry_only_for_daily_candidates: bool = True
+    whisper_quality_retry_timeout_seconds: int = 120
     transcription_cache_dir: str = "workspace/deal_analyzer/transcripts_cache"
     call_collection_mode: str = "api_first"
     call_backend: str = "amocrm_api"
@@ -76,6 +84,8 @@ class DealAnalyzerConfig:
     deal_analyzer_weekly_start_cell: str = "A2"
     deal_analyzer_overwrite_mode: bool = False
     daily_manager_allowlist: tuple[str, ...] = ("Илья", "Рустам")
+    product_reference_urls: dict[str, str] | None = None
+    sales_module_references: tuple[str, ...] = ()
     janitor_enabled: bool = False
     janitor_dry_run_default: bool = True
     retention_days_exports: int = 30
@@ -158,6 +168,13 @@ def load_deal_analyzer_config(config_path: str | None = None) -> DealAnalyzerCon
         ollama_timeout_seconds = max(1, int(timeout_raw))
     except (TypeError, ValueError):
         ollama_timeout_seconds = 60
+    ollama_fallback_enabled = bool(raw.get("ollama_fallback_enabled", False))
+    ollama_fallback_base_url = str(raw.get("ollama_fallback_base_url", "")).strip() or ollama_base_url
+    ollama_fallback_model = str(raw.get("ollama_fallback_model", "")).strip() or ollama_model
+    try:
+        ollama_fallback_timeout_seconds = max(1, int(raw.get("ollama_fallback_timeout_seconds", 60)))
+    except (TypeError, ValueError):
+        ollama_fallback_timeout_seconds = 60
 
     style_profile_name = str(raw.get("style_profile_name", "manager_ru_v1")).strip() or "manager_ru_v1"
 
@@ -220,6 +237,15 @@ def load_deal_analyzer_config(config_path: str | None = None) -> DealAnalyzerCon
         transcription_timeout_seconds = max(1, int(raw.get("transcription_timeout_seconds", 60)))
     except (TypeError, ValueError):
         transcription_timeout_seconds = 60
+    whisper_quality_retry_enabled = bool(raw.get("whisper_quality_retry_enabled", False))
+    whisper_quality_retry_model_name = _normalize_whisper_model_name(
+        str(raw.get("whisper_quality_retry_model_name", "large-v3")).strip() or "large-v3"
+    )
+    whisper_quality_retry_only_for_daily_candidates = bool(raw.get("whisper_quality_retry_only_for_daily_candidates", True))
+    try:
+        whisper_quality_retry_timeout_seconds = max(1, int(raw.get("whisper_quality_retry_timeout_seconds", 120)))
+    except (TypeError, ValueError):
+        whisper_quality_retry_timeout_seconds = 120
     transcription_cache_dir = str(
         raw.get("transcription_cache_dir", "workspace/deal_analyzer/transcripts_cache")
     ).strip() or "workspace/deal_analyzer/transcripts_cache"
@@ -248,6 +274,15 @@ def load_deal_analyzer_config(config_path: str | None = None) -> DealAnalyzerCon
     daily_manager_allowlist = tuple(
         _parse_str_list(raw.get("daily_manager_allowlist", ["Илья", "Рустам"]))
     ) or ("Илья", "Рустам")
+    product_reference_urls_raw = raw.get("product_reference_urls")
+    product_reference_urls: dict[str, str] = {}
+    if isinstance(product_reference_urls_raw, dict):
+        for key, value in product_reference_urls_raw.items():
+            key_norm = str(key or "").strip().lower()
+            val_norm = str(value or "").strip()
+            if key_norm and val_norm:
+                product_reference_urls[key_norm] = val_norm
+    sales_module_references = tuple(_parse_str_list(raw.get("sales_module_references", [])))
 
     janitor_enabled = bool(raw.get("janitor_enabled", False))
     janitor_dry_run_default = bool(raw.get("janitor_dry_run_default", True))
@@ -280,6 +315,10 @@ def load_deal_analyzer_config(config_path: str | None = None) -> DealAnalyzerCon
         ollama_base_url=ollama_base_url,
         ollama_model=ollama_model,
         ollama_timeout_seconds=ollama_timeout_seconds,
+        ollama_fallback_enabled=ollama_fallback_enabled,
+        ollama_fallback_base_url=ollama_fallback_base_url,
+        ollama_fallback_model=ollama_fallback_model,
+        ollama_fallback_timeout_seconds=ollama_fallback_timeout_seconds,
         style_profile_name=style_profile_name,
         period_mode=period_mode,
         custom_date_from=custom_date_from,
@@ -309,6 +348,10 @@ def load_deal_analyzer_config(config_path: str | None = None) -> DealAnalyzerCon
         whisper_compute_type=whisper_compute_type,
         transcription_language=transcription_language,
         transcription_timeout_seconds=transcription_timeout_seconds,
+        whisper_quality_retry_enabled=whisper_quality_retry_enabled,
+        whisper_quality_retry_model_name=whisper_quality_retry_model_name,
+        whisper_quality_retry_only_for_daily_candidates=whisper_quality_retry_only_for_daily_candidates,
+        whisper_quality_retry_timeout_seconds=whisper_quality_retry_timeout_seconds,
         transcription_cache_dir=transcription_cache_dir,
         call_collection_mode=call_collection_mode,
         call_backend=call_backend,
@@ -326,6 +369,8 @@ def load_deal_analyzer_config(config_path: str | None = None) -> DealAnalyzerCon
         deal_analyzer_weekly_start_cell=deal_analyzer_weekly_start_cell,
         deal_analyzer_overwrite_mode=deal_analyzer_overwrite_mode,
         daily_manager_allowlist=daily_manager_allowlist,
+        product_reference_urls=product_reference_urls or None,
+        sales_module_references=sales_module_references,
         janitor_enabled=janitor_enabled,
         janitor_dry_run_default=janitor_dry_run_default,
         retention_days_exports=retention_days_exports,

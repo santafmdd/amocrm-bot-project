@@ -23,6 +23,9 @@ def test_derive_transcript_signals_detects_basic_keywords():
     assert signals["call_signal_objection_price"] is True
     assert signals["call_signal_next_step_present"] is True
     assert signals["call_signal_summary_short"]
+    assert signals["transcript_text_len"] > 0
+    assert signals["transcript_signal_score"] >= 2
+    assert signals["transcript_usability_label"] in {"usable", "weak", "noisy"}
 
 
 def test_derive_transcript_signals_returns_safe_empty_when_no_text():
@@ -31,6 +34,23 @@ def test_derive_transcript_signals_returns_safe_empty_when_no_text():
     assert signals["transcript_text_excerpt"] == ""
     assert signals["call_signal_summary_short"] == ""
     assert signals["call_signal_objection_not_target"] is False
+    assert signals["transcript_usability_label"] == "empty"
+    assert signals["transcript_usability_score_final"] == 0
+
+
+def test_transcription_success_does_not_imply_transcript_usable():
+    deal = {"deal_id": 77}
+    snapshot = {
+        "transcripts": [
+            {
+                "transcript_status": "ok",
+                "transcript_text": "шум шум шум тишина шум неразборчиво шум",
+            }
+        ]
+    }
+    signals = derive_transcript_signals(deal=deal, snapshot=snapshot)
+    assert signals["transcript_available"] is True
+    assert signals["transcript_usability_label"] in {"weak", "noisy"}
 
 
 def test_call_signal_aggregates_count_expected_patterns():
@@ -64,4 +84,3 @@ def test_call_signal_aggregates_count_expected_patterns():
     assert agg["deals_next_step_in_call_but_missing_followup_in_crm"] == 1
     assert agg["deals_with_probable_wrong_or_mixed_product_by_call"] == 1
     assert agg["deals_with_early_objection_pattern"] == 2
-

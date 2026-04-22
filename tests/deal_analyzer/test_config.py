@@ -15,6 +15,10 @@ def _cfg_payload(extra: str = "") -> str:
   "ollama_base_url": "http://127.0.0.1:11434",
   "ollama_model": "gemma4:e4b",
   "ollama_timeout_seconds": 45,
+  "ollama_fallback_enabled": true,
+  "ollama_fallback_base_url": "http://127.0.0.1:11434",
+  "ollama_fallback_model": "gemma4:latest",
+  "ollama_fallback_timeout_seconds": 90,
   "style_profile_name": "manager_ru_v2",
   "period_mode": "smart_manager_default",
   "period_label_mode": "period_only",
@@ -35,6 +39,10 @@ def _cfg_payload(extra: str = "") -> str:
   "whisper_device": "auto",
   "whisper_compute_type": "auto",
   "transcription_language": "ru",
+  "whisper_quality_retry_enabled": true,
+  "whisper_quality_retry_model_name": "large-v3",
+  "whisper_quality_retry_only_for_daily_candidates": true,
+  "whisper_quality_retry_timeout_seconds": 180,
   "deal_analyzer_sheet_url": "https://docs.google.com/spreadsheets/d/test123/edit#gid=0",
   "deal_analyzer_sheet_name": "analytics_writer_test",
   "deal_analyzer_start_cell": "A1",
@@ -43,6 +51,12 @@ def _cfg_payload(extra: str = "") -> str:
   "deal_analyzer_daily_start_cell": "A2",
   "deal_analyzer_weekly_sheet_name": "Недельный свод менеджеров",
   "deal_analyzer_weekly_start_cell": "A2",
+  "product_reference_urls": {
+    "info": "https://info.example.local",
+    "link": "https://link.example.local",
+    "both": "https://both.example.local"
+  },
+  "sales_module_references": ["Модуль выхода на ЛПР", "Модуль следующего шага"],
   "janitor_enabled": true,
   "janitor_dry_run_default": true,
   "retention_days_exports": 21,
@@ -85,6 +99,9 @@ def test_load_deal_analyzer_config_with_ollama_backend_and_period_fields():
     assert cfg.analyzer_backend == "ollama"
     assert cfg.ollama_model == "gemma4:e4b"
     assert cfg.ollama_timeout_seconds == 45
+    assert cfg.ollama_fallback_enabled is True
+    assert cfg.ollama_fallback_model == "gemma4:latest"
+    assert cfg.ollama_fallback_timeout_seconds == 90
     assert cfg.style_profile_name == "manager_ru_v2"
     assert cfg.period_mode == "smart_manager_default"
     assert cfg.hide_executed_at_from_public_exports is True
@@ -99,6 +116,9 @@ def test_load_deal_analyzer_config_with_ollama_backend_and_period_fields():
     assert cfg.whisper_device == "auto"
     assert cfg.whisper_compute_type == "auto"
     assert cfg.transcription_language == "ru"
+    assert cfg.whisper_quality_retry_enabled is True
+    assert cfg.whisper_quality_retry_model_name == "large-v3"
+    assert cfg.whisper_quality_retry_timeout_seconds == 180
     assert cfg.deal_analyzer_sheet_url.startswith("https://docs.google.com/spreadsheets/d/")
     assert cfg.deal_analyzer_sheet_name == "analytics_writer_test"
     assert cfg.deal_analyzer_start_cell == "A1"
@@ -107,6 +127,9 @@ def test_load_deal_analyzer_config_with_ollama_backend_and_period_fields():
     assert cfg.deal_analyzer_daily_start_cell == "A2"
     assert cfg.deal_analyzer_weekly_sheet_name == "Недельный свод менеджеров"
     assert cfg.deal_analyzer_weekly_start_cell == "A2"
+    assert cfg.product_reference_urls["info"] == "https://info.example.local"
+    assert cfg.product_reference_urls["link"] == "https://link.example.local"
+    assert "Модуль выхода на ЛПР" in cfg.sales_module_references
 
 
 def test_load_deal_analyzer_config_rejects_unknown_backend():

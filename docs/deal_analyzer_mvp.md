@@ -255,11 +255,39 @@ LLM генерирует поля:
 - `Ожидаемый эффект - количество`
 - `Ожидаемый эффект - качество`
 
+Жесткое правило записи:
+- если main LLM недоступна и fallback LLM тоже недоступна, real write в Google Sheet запрещен;
+- run продолжает работать в `dry_run`, а причина фиксируется в `summary.json` (`daily_control_writer.error=write_forced_dry_run_no_live_llm`);
+- в боевой лист пишутся только строки с `llm_text_ready=true` (без rules-only J-Q текста).
+
 Политика эффектов:
 - `Ожидаемый эффект - количество` — только абсолютные результаты (без процентов);
 - `Ожидаемый эффект - качество` — аккуратная гипотеза про качество этапов/конверсии, без завышенных обещаний.
 
 Style source: `docs/мой паттерн общения.txt` (используется как ориентир тона; если недоступен — включается безопасный fallback).
+
+### Daily candidate pool and ranking
+Daily row собирается не из первых сделок периода, а через `candidate-pool -> ranking -> top selection`:
+- приоритет 1: call-rich и информативные сделки (usable transcript / сигнал из звонка);
+- приоритет 2: rich CRM-context сделки (notes/tasks/comments/tags);
+- приоритет 3: thin fallback только если иначе пакет дня не собрать честно.
+
+Debug-only поля в `daily_control_sheet_payload.json`:
+- `transcript_usability_score`
+- `evidence_richness_score`
+- `funnel_relevance_score`
+- `daily_selection_rank`
+- `daily_selection_reason`
+
+### ROKS hook for ranking/effect forecast
+Добавлен подготовительный hook под stage-priority weighting из ROKS:
+- если `roks_stage_priority_weights` доступны, ranking учитывает их;
+- если нет — используется нейтральный fallback (`stage_priority_weight_source=neutral_fallback`).
+
+Для `Ожидаемый эффект`:
+- количество считается через абсолютный каскад по этапам (без процентов в колонке количества);
+- качество описывает влияние на смежные этапы как аккуратную гипотезу;
+- если ROKS-метрики недоступны, используется консервативный fallback и это явно логируется.
 
 `summary.json` включает:
 - `run_timestamp`
@@ -507,3 +535,87 @@ python -m src.deal_analyzer.cli --config config/deal_analyzer.local.json analyze
   - Формулировка для руководителя, Сообщение сотруднику, Средняя оценка 0-100.
 - Технические поля в боевой лист не выводятся.
 
+
+## Transcript Usability Layer (Daily Control Input)
+
+Daily-control теперь разделяет:
+- `transcription technically succeeded`
+- `transcript is usable for analysis`
+
+Для каждой сделки в debug-поле фиксируются:
+- `transcript_text_len`
+- `transcript_nonempty_ratio`
+- `transcript_noise_score`
+- `transcript_repeat_score`
+- `transcript_signal_score`
+- `transcript_usability_score_final`
+- `transcript_usability_label` (`usable|weak|noisy|empty`)
+
+В `summary.json -> transcript_runtime_diagnostics` добавлены:
+- `transcriptions_usable`
+- `transcriptions_weak`
+- `transcriptions_noisy`
+- `transcriptions_empty`
+- `deals_with_usable_transcript`
+
+## Daily Candidate Pool -> Ranking -> Top Selection
+
+Daily-пакет формируется через:
+1) candidate-pool по дню и менеджеру
+2) rules prefilter (`transcript_usability_score`, `evidence_richness_score`, `funnel_relevance_score`, `management_value_score`)
+3) optional LLM rerank только для ограниченного shortlist (обычно 8-12 кандидатов)
+4) top selection без честного заполнения мусором
+
+Если transcript слабый/шумный и CRM-контекст тонкий, сделка может быть помечена `skip_for_daily_reason` и не попадать в daily-строку.
+
+Дополнительные debug-поля daily-строки:
+- `daily_package_quality_label` (`strong|acceptable|thin|weak`)
+- `daily_package_has_forced_fallback`
+- `negotiation_signal_presence_score`
+- `crm_only_bias_flag`
+- `text_generation_source_per_column`
+- `style_layer_applied`
+- `transcript_quality_retry_used`
+- `transcript_quality_retry_improved`
+
+Для shortlist кандидатов фиксируются:
+- `llm_daily_rank`
+- `llm_daily_rank_reason`
+- `llm_call_analysis_viability`
+- `llm_call_analysis_viability_reason`
+
+## Effect Forecast (Units + Cascade)
+
+`Ожидаемый эффект - количество` строится каскадом в штуках:
+- фиксируем проблемный этап,
+- считаем абсолютный эффект на нем,
+- протягиваем вниз по воронке.
+
+Debug-поля в daily payload:
+- `effect_forecast_source` (`roks|fallback`)
+- `effect_problem_stage`
+- `effect_downstream_stages`
+- `stage_priority_weight_source`
+- `stage_priority_weight_value`
+
+Если метрики РОКС недоступны, включается консервативный fallback и это явно логируется.
+
+## Optional Context Boost (not scoring truth)
+
+В config доступны:
+- `product_reference_urls` (`info|link|both`)
+- `sales_module_references`
+
+Эти поля передаются в LLM prompt как контекст/библиотека модулей, но не используются как жесткая scoring-истина.
+
+## Style/Reference Sources (Daily Text)
+
+При генерации daily-текста runtime пытается подхватить:
+- `docs/мой паттерн общения.txt`
+- `docs/style_sources/telegram_ilya/**/*.{txt,md,html}`
+- `docs/sales_context/scripts/link_base.md`
+- `docs/sales_context/scripts/info_plm_base.md`
+- `docs/sales_context/scripts/info_plm_light_industry.md`
+- все файлы из `sales_module_references`, если указан путь к папке (рекурсивно).
+
+В лог пишется, какие style/reference sources реально загрузились.

@@ -1,16 +1,22 @@
 ﻿import json
 import shutil
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from src.config import load_config
 from src.deal_analyzer.cli import (
+    _build_dial_discipline_signals,
     _build_daily_control_sheet_payload,
+    _merge_deal_company_tags,
+    _normalize_phone_last7,
     _build_transcription_impact_row,
     _derive_product_hypothesis,
     _expected_quality_text,
     _expected_quantity_text,
+    _llm_chat_json_with_runtime,
+    _select_daily_package_records,
     _run_analyze_period,
 )
 from src.deal_analyzer.config import DealAnalyzerConfig
@@ -52,7 +58,7 @@ def _cfg() -> DealAnalyzerConfig:
     )
 
 
-def _snapshot_for_deal(deal_id: int, *, warnings=None, status_name: str = "Р’ СЂР°Р±РѕС‚Рµ"):
+def _snapshot_for_deal(deal_id: int, *, warnings=None, status_name: str = "В работе"):
     return {
         "snapshot_generated_at": "2026-04-18T12:00:00+00:00",
         "crm": {
@@ -63,8 +69,35 @@ def _snapshot_for_deal(deal_id: int, *, warnings=None, status_name: str = "Р’
             "responsible_user_name": "Илья",
         },
         "warnings": list(warnings or []),
-        "call_evidence": {"items": [], "summary": {"calls_total": 0}},
-        "transcripts": [],
+        "call_evidence": {
+            "items": [
+                {
+                    "call_id": f"c-{deal_id}",
+                    "deal_id": str(deal_id),
+                    "direction": "outbound",
+                    "status": "secretary",
+                    "phone": "+7 (999) 100-20-30",
+                    "timestamp": "2026-04-16T10:15:00+00:00",
+                    "duration_seconds": 55,
+                    "recording_url": f"https://example.test/{deal_id}.mp3",
+                    "audio_path": "",
+                    "quality_flags": [],
+                }
+            ],
+            "summary": {"calls_total": 1},
+        },
+        "transcripts": [
+            {
+                "call_id": f"c-{deal_id}",
+                "transcript_status": "ok",
+                "transcript_text": (
+                    "Обсудили текущий процесс клиента, узкие места и что мешает сейчас. "
+                    "Менеджер задал уточняющие вопросы, согласовали следующий шаг и время повторного контакта. "
+                    "Отдельно зафиксировали, кто принимает решение и какие данные нужны до следующего звонка."
+                ),
+                "transcript_error": "",
+            }
+        ],
         "roks_context": {"ok": True},
     }
 
@@ -205,6 +238,11 @@ def test_analyze_period_creates_run_dir_and_summary_json():
     assert "deals_with_nonempty_call_signal_summary" in tx_diag
     assert "deals_with_transcription_error" in tx_diag
     assert "transcript_layer_effective" in tx_diag
+    assert "transcriptions_usable" in tx_diag
+    assert "transcriptions_weak" in tx_diag
+    assert "transcriptions_noisy" in tx_diag
+    assert "transcriptions_empty" in tx_diag
+    assert "deals_with_usable_transcript" in tx_diag
     assert len(summary["artifact_paths"]) == 2
     md = summary_md_path.read_text(encoding="utf-8")
     assert "## Run Info" in md
@@ -1188,12 +1226,13 @@ def test_meeting_queue_writer_real_write_path_via_mock():
     cfg = base_cfg.__class__(
         **{
             **base_cfg.__dict__,
-            "deal_analyzer_write_enabled": True,
-            "deal_analyzer_spreadsheet_id": "sheet123",
-            "deal_analyzer_sheet_name": "analytics_writer_test",
-            "deal_analyzer_start_cell": "A1",
-        }
-    )
+                "deal_analyzer_write_enabled": True,
+                "deal_analyzer_spreadsheet_id": "sheet123",
+                "deal_analyzer_sheet_name": "analytics_writer_test",
+                "deal_analyzer_start_cell": "A1",
+                "daily_manager_allowlist": ("Илья", "Рустам"),
+            }
+        )
 
     class _FakeSheetsClient:
         def __init__(self, project_root, logger):
@@ -1210,10 +1249,28 @@ def test_meeting_queue_writer_real_write_path_via_mock():
             return {"ok": True}
 
     fake_client = _FakeSheetsClient(None, None)
+    llm_columns = {
+        "Ключевой вывод": "Живой вывод по дню.",
+        "Сильные стороны": "Есть рабочий контакт.",
+        "Зоны роста": "Дожать следующий шаг",
+        "Почему это важно": "Сотруднику проще дожимать; отделу видно реальное движение.",
+        "Что закрепить": "Закрепить модуль фиксации шага.",
+        "Что исправить": "Сразу фиксировать дату следующего касания.",
+        "Что донес сотруднику": "1) Разобрали звонок.\n2) Дали модуль шага.\n3) Применяет в следующих касаниях.",
+        "Ожидаемый эффект - количество": "+1 рабочий контакт за неделю",
+        "Ожидаемый эффект - качество": "Этап станет управляемее.",
+        "_llm_text_ready": True,
+    }
 
     with patch("src.deal_analyzer.cli.GoogleSheetsApiClient", return_value=fake_client), patch(
         "src.deal_analyzer.cli.load_config",
         return_value=SimpleNamespace(project_root=Path("D:/AI_Automation/amocrm_bot/project")),
+    ), patch(
+        "src.deal_analyzer.cli._resolve_daily_llm_runtime",
+        return_value={"enabled": True, "selected": "main", "reason": "main_ok", "main_ok": True, "fallback_ok": False, "main": {"base_url": "http://m", "model": "m", "timeout_seconds": 10}},
+    ), patch(
+        "src.deal_analyzer.cli._generate_daily_table_text_columns",
+        return_value=llm_columns,
     ), patch(
         "src.deal_analyzer.cli.build_deal_snapshot",
         side_effect=lambda **kw: _snapshot_for_deal(int(kw["normalized_deal"]["deal_id"])),
@@ -1253,14 +1310,34 @@ def test_meeting_queue_writer_safe_skip_when_target_missing():
     cfg = base_cfg.__class__(
         **{
             **base_cfg.__dict__,
-            "deal_analyzer_write_enabled": True,
-            "deal_analyzer_spreadsheet_id": "",
-            "deal_analyzer_sheet_name": "",
-            "deal_analyzer_start_cell": "",
-        }
-    )
+                "deal_analyzer_write_enabled": True,
+                "deal_analyzer_spreadsheet_id": "",
+                "deal_analyzer_sheet_name": "",
+                "deal_analyzer_start_cell": "",
+                "daily_manager_allowlist": ("Илья", "Рустам"),
+            }
+        )
+
+    llm_columns = {
+        "Ключевой вывод": "Живой вывод по дню.",
+        "Сильные стороны": "Есть рабочий контакт.",
+        "Зоны роста": "Дожать следующий шаг",
+        "Почему это важно": "Сотруднику проще дожимать; отделу видно реальное движение.",
+        "Что закрепить": "Закрепить модуль фиксации шага.",
+        "Что исправить": "Сразу фиксировать дату следующего касания.",
+        "Что донес сотруднику": "1) Разобрали звонок.\n2) Дали модуль шага.\n3) Применяет в следующих касаниях.",
+        "Ожидаемый эффект - количество": "+1 рабочий контакт за неделю",
+        "Ожидаемый эффект - качество": "Этап станет управляемее.",
+        "_llm_text_ready": True,
+    }
 
     with patch(
+        "src.deal_analyzer.cli._resolve_daily_llm_runtime",
+        return_value={"enabled": True, "selected": "main", "reason": "main_ok", "main_ok": True, "fallback_ok": False, "main": {"base_url": "http://m", "model": "m", "timeout_seconds": 10}},
+    ), patch(
+        "src.deal_analyzer.cli._generate_daily_table_text_columns",
+        return_value=llm_columns,
+    ), patch(
         "src.deal_analyzer.cli.build_deal_snapshot",
         side_effect=lambda **kw: _snapshot_for_deal(int(kw["normalized_deal"]["deal_id"])),
     ), patch(
@@ -1321,10 +1398,28 @@ def test_meeting_queue_writer_appends_below_existing_rows():
             return {"ok": True}
 
     fake_client = _FakeSheetsClient(None, None)
+    llm_columns = {
+        "Ключевой вывод": "Живой вывод по дню.",
+        "Сильные стороны": "Есть рабочий контакт.",
+        "Зоны роста": "Дожать следующий шаг",
+        "Почему это важно": "Сотруднику проще дожимать; отделу видно реальное движение.",
+        "Что закрепить": "Закрепить модуль фиксации шага.",
+        "Что исправить": "Сразу фиксировать дату следующего касания.",
+        "Что донес сотруднику": "1) Разобрали звонок.\n2) Дали модуль шага.\n3) Применяет в следующих касаниях.",
+        "Ожидаемый эффект - количество": "+1 рабочий контакт за неделю",
+        "Ожидаемый эффект - качество": "Этап станет управляемее.",
+        "_llm_text_ready": True,
+    }
 
     with patch("src.deal_analyzer.cli.GoogleSheetsApiClient", return_value=fake_client), patch(
         "src.deal_analyzer.cli.load_config",
         return_value=SimpleNamespace(project_root=Path("D:/AI_Automation/amocrm_bot/project")),
+    ), patch(
+        "src.deal_analyzer.cli._resolve_daily_llm_runtime",
+        return_value={"enabled": True, "selected": "main", "reason": "main_ok", "main_ok": True, "fallback_ok": False, "main": {"base_url": "http://m", "model": "m", "timeout_seconds": 10}},
+    ), patch(
+        "src.deal_analyzer.cli._generate_daily_table_text_columns",
+        return_value=llm_columns,
     ), patch(
         "src.deal_analyzer.cli.build_deal_snapshot",
         side_effect=lambda **kw: _snapshot_for_deal(int(kw["normalized_deal"]["deal_id"])),
@@ -1401,12 +1496,13 @@ def test_daily_control_writer_starts_from_a2_and_does_not_write_header_row():
     cfg = base_cfg.__class__(
         **{
             **base_cfg.__dict__,
-            "deal_analyzer_write_enabled": True,
-            "deal_analyzer_spreadsheet_id": "sheet123",
-            "deal_analyzer_daily_sheet_name": "Дневной контроль",
-            "deal_analyzer_daily_start_cell": "A2",
-        }
-    )
+                "deal_analyzer_write_enabled": True,
+                "deal_analyzer_spreadsheet_id": "sheet123",
+                "deal_analyzer_daily_sheet_name": "Дневной контроль",
+                "deal_analyzer_daily_start_cell": "A2",
+                "daily_manager_allowlist": ("Илья", "Рустам"),
+            }
+        )
 
     class _FakeSheetsClient:
         def __init__(self, project_root, logger):
@@ -1423,9 +1519,27 @@ def test_daily_control_writer_starts_from_a2_and_does_not_write_header_row():
             return {"ok": True}
 
     fake_client = _FakeSheetsClient(None, None)
+    llm_columns = {
+        "Ключевой вывод": "Живой вывод по дню.",
+        "Сильные стороны": "Есть рабочий контакт.",
+        "Зоны роста": "Дожать следующий шаг",
+        "Почему это важно": "Сотруднику проще дожимать; отделу видно реальное движение.",
+        "Что закрепить": "Закрепить модуль фиксации шага.",
+        "Что исправить": "Сразу фиксировать дату следующего касания.",
+        "Что донес сотруднику": "1) Разобрали звонок.\n2) Дали модуль шага.\n3) Применяет в следующих касаниях.",
+        "Ожидаемый эффект - количество": "+1 рабочий контакт за неделю",
+        "Ожидаемый эффект - качество": "Этап станет управляемее.",
+        "_llm_text_ready": True,
+    }
     with patch("src.deal_analyzer.cli.GoogleSheetsApiClient", return_value=fake_client), patch(
         "src.deal_analyzer.cli.load_config",
         return_value=SimpleNamespace(project_root=Path("D:/AI_Automation/amocrm_bot/project")),
+    ), patch(
+        "src.deal_analyzer.cli._resolve_daily_llm_runtime",
+        return_value={"enabled": True, "selected": "main", "reason": "main_ok", "main_ok": True, "fallback_ok": False, "main": {"base_url": "http://m", "model": "m", "timeout_seconds": 10}},
+    ), patch(
+        "src.deal_analyzer.cli._generate_daily_table_text_columns",
+        return_value=llm_columns,
     ), patch(
         "src.deal_analyzer.cli.build_deal_snapshot",
         side_effect=lambda **kw: _snapshot_for_deal(int(kw["normalized_deal"]["deal_id"])),
@@ -1461,12 +1575,13 @@ def test_daily_control_writer_uses_append_mode_by_default():
     cfg = base_cfg.__class__(
         **{
             **base_cfg.__dict__,
-            "deal_analyzer_write_enabled": True,
-            "deal_analyzer_spreadsheet_id": "sheet123",
-            "deal_analyzer_daily_sheet_name": "Дневной контроль",
-            "deal_analyzer_daily_start_cell": "A2",
-        }
-    )
+                "deal_analyzer_write_enabled": True,
+                "deal_analyzer_spreadsheet_id": "sheet123",
+                "deal_analyzer_daily_sheet_name": "Дневной контроль",
+                "deal_analyzer_daily_start_cell": "A2",
+                "daily_manager_allowlist": ("Илья", "Рустам"),
+            }
+        )
 
     class _FakeSheetsClient:
         def __init__(self, project_root, logger):
@@ -1483,9 +1598,27 @@ def test_daily_control_writer_uses_append_mode_by_default():
             return {"ok": True}
 
     fake_client = _FakeSheetsClient(None, None)
+    llm_columns = {
+        "Ключевой вывод": "Живой вывод по дню.",
+        "Сильные стороны": "Есть рабочий контакт.",
+        "Зоны роста": "Дожать следующий шаг",
+        "Почему это важно": "Сотруднику проще дожимать; отделу видно реальное движение.",
+        "Что закрепить": "Закрепить модуль фиксации шага.",
+        "Что исправить": "Сразу фиксировать дату следующего касания.",
+        "Что донес сотруднику": "1) Разобрали звонок.\n2) Дали модуль шага.\n3) Применяет в следующих касаниях.",
+        "Ожидаемый эффект - количество": "+1 рабочий контакт за неделю",
+        "Ожидаемый эффект - качество": "Этап станет управляемее.",
+        "_llm_text_ready": True,
+    }
     with patch("src.deal_analyzer.cli.GoogleSheetsApiClient", return_value=fake_client), patch(
         "src.deal_analyzer.cli.load_config",
         return_value=SimpleNamespace(project_root=Path("D:/AI_Automation/amocrm_bot/project")),
+    ), patch(
+        "src.deal_analyzer.cli._resolve_daily_llm_runtime",
+        return_value={"enabled": True, "selected": "main", "reason": "main_ok", "main_ok": True, "fallback_ok": False, "main": {"base_url": "http://m", "model": "m", "timeout_seconds": 10}},
+    ), patch(
+        "src.deal_analyzer.cli._generate_daily_table_text_columns",
+        return_value=llm_columns,
     ), patch(
         "src.deal_analyzer.cli.build_deal_snapshot",
         side_effect=lambda **kw: _snapshot_for_deal(int(kw["normalized_deal"]["deal_id"])),
@@ -1736,6 +1869,7 @@ def test_daily_control_text_columns_can_be_llm_authored_not_template():
         "Что донес сотруднику": "1) Сверить шаг в двух свежих звонках.\n2) Проговорить формулировку следующего шага.\n3) Закрепить шаблон фиксации в CRM.",
         "Ожидаемый эффект - количество": "+1 подтвержденная встреча в неделю.",
         "Ожидаемый эффект - качество": "Шаги будут фиксироваться чище; переход между этапами станет стабильнее.",
+        "_llm_text_ready": True,
     }
 
     with patch("src.deal_analyzer.cli._generate_daily_table_text_columns", return_value=llm_columns):
@@ -1807,6 +1941,70 @@ def test_daily_control_rows_are_sorted_by_day_then_manager():
     assert order == sorted(order, key=lambda x: (x[0], x[1]))
 
 
+def test_daily_selection_prefers_call_rich_and_can_stay_thin():
+    records = [
+        {
+            "deal_id": 1001,
+            "updated_at": "2026-04-14T10:00:00+00:00",
+            "transcript_available": True,
+            "transcript_text_excerpt": "Обсудили боль, задачу, ЛПР и следующий шаг с датой",
+            "call_signal_summary_short": "разговор предметный, следующий шаг подтвержден",
+            "notes_summary_raw": [{"text": "фиксировали задачу"}],
+            "tasks_summary_raw": [{"text": "контроль даты"}],
+            "risk_flags": [],
+        },
+        {
+            "deal_id": 1002,
+            "updated_at": "2026-04-14T10:05:00+00:00",
+            "transcript_available": False,
+            "transcript_text_excerpt": "",
+            "call_signal_summary_short": "",
+            "notes_summary_raw": [],
+            "tasks_summary_raw": [],
+            "risk_flags": [],
+        },
+        {
+            "deal_id": 1003,
+            "updated_at": "2026-04-14T10:10:00+00:00",
+            "transcript_available": False,
+            "transcript_text_excerpt": "",
+            "call_signal_summary_short": "",
+            "notes_summary_raw": [],
+            "tasks_summary_raw": [],
+            "risk_flags": [],
+        },
+    ]
+    selected = _select_daily_package_records(
+        manager_records=records,
+        control_day="2026-04-14",
+        package_target=6,
+        carryover_days=7,
+    )
+    selected_ids = [int(x.get("deal_id")) for x in selected]
+    assert 1001 in selected_ids
+    assert len(selected_ids) == 1
+
+
+def test_daily_payload_has_ranking_debug_fields():
+    summary = {
+        "period_start": "2026-04-13",
+        "period_end": "2026-04-19",
+        "run_timestamp": "2026-04-19T10:10:00+00:00",
+    }
+    records = [{"deal_id": 940, "owner_name": "Илья", "score": 55, "status_name": "В работе"}]
+    payload = _build_daily_control_sheet_payload(summary=summary, period_deal_records=records)
+    row = payload["rows"][0]
+    for key in (
+        "transcript_usability_score",
+        "evidence_richness_score",
+        "funnel_relevance_score",
+        "daily_selection_rank",
+        "daily_selection_reason",
+    ):
+        assert key in row
+    assert row["daily_selection_reason"] in {"has_call_priority", "rich_context_priority", "fallback_fill"}
+
+
 def test_daily_expected_quantity_has_no_percent_and_no_conversion_wording():
     qty_rustam = _expected_quantity_text(avg_score=35, deals=4, role="телемаркетолог")
     qty_ilya = _expected_quantity_text(avg_score=55, deals=4, role="менеджер по продажам")
@@ -1850,4 +2048,462 @@ def test_daily_payload_expected_quantity_is_absolute_and_no_percent():
         low = qty.lower()
         assert "%" not in qty
         assert "конверси" not in low
+
+
+
+
+def test_daily_selection_skips_weak_transcript_when_stronger_candidate_exists():
+    records = [
+        {
+            "deal_id": 1,
+            "updated_at": 1713132000,
+            "status_name": "В работе",
+            "pipeline_name": "Привлечение",
+            "transcript_usability_label": "usable",
+            "transcript_usability_score_final": 80,
+            "transcript_available": True,
+            "call_signal_summary_short": "есть следующий шаг",
+            "notes_summary_raw": [{"text": "контекст"}],
+            "tasks_summary_raw": [{"text": "задача"}],
+            "risk_flags": [],
+            "score": 60,
+        },
+        {
+            "deal_id": 2,
+            "updated_at": 1713132000,
+            "status_name": "В работе",
+            "pipeline_name": "Привлечение",
+            "transcript_usability_label": "noisy",
+            "transcript_usability_score_final": 10,
+            "transcript_available": True,
+            "call_signal_summary_short": "",
+            "notes_summary_raw": [],
+            "tasks_summary_raw": [],
+            "risk_flags": [],
+            "score": 60,
+        },
+    ]
+    selected = _select_daily_package_records(
+        manager_records=records,
+        control_day="2024-04-15",
+        package_target=6,
+        carryover_days=7,
+        exclude_deal_ids=set(),
+    )
+    ids = {int(x.get("deal_id")) for x in selected if str(x.get("deal_id") or "").isdigit()}
+    assert 1 in ids
+    assert 2 not in ids
+
+
+def test_daily_selection_keeps_secretary_fallback_when_lpr_missing():
+    records = [
+        {
+            "deal_id": 11,
+            "updated_at": 1713132000,
+            "status_name": "В работе",
+            "pipeline_name": "Привлечение",
+            "transcript_usability_label": "weak",
+            "transcript_usability_score_final": 20,
+            "transcript_available": True,
+            "call_signal_summary_short": "Секретарь: перезвонить после обеда",
+            "notes_summary_raw": [{"text": "секретарь попросил перенабрать"}],
+            "tasks_summary_raw": [],
+            "risk_flags": [],
+            "score": 50,
+        },
+        {
+            "deal_id": 12,
+            "updated_at": 1713132000,
+            "status_name": "В работе",
+            "pipeline_name": "Привлечение",
+            "transcript_usability_label": "empty",
+            "transcript_usability_score_final": 0,
+            "transcript_available": False,
+            "call_signal_summary_short": "",
+            "notes_summary_raw": [],
+            "tasks_summary_raw": [],
+            "risk_flags": [],
+            "score": 50,
+        },
+    ]
+    selected = _select_daily_package_records(
+        manager_records=records,
+        control_day="2024-04-15",
+        package_target=2,
+        carryover_days=7,
+        exclude_deal_ids=set(),
+    )
+    assert selected
+    assert int(selected[0].get("deal_id")) == 11
+    assert str(selected[0].get("skip_for_daily_reason") or "") == ""
+
+
+def test_llm_rerank_receives_limited_shortlist_only():
+    records = []
+    for i in range(1, 25):
+        records.append(
+            {
+                "deal_id": i,
+                "updated_at": 1713132000,
+                "status_name": "В работе",
+                "pipeline_name": "Привлечение",
+                "transcript_usability_label": "usable",
+                "transcript_usability_score_final": 75,
+                "transcript_available": True,
+                "call_signal_summary_short": "есть контекст",
+                "notes_summary_raw": [{"text": "note"}],
+                "tasks_summary_raw": [{"text": "task"}],
+                "risk_flags": [],
+                "score": 60,
+            }
+        )
+    cfg = replace(_cfg(), analyzer_backend="hybrid")
+    seen_sizes = []
+
+    def _fake_rerank(**kwargs):
+        seen_sizes.append(len(kwargs.get("candidates", [])))
+        return {}
+
+    with patch("src.deal_analyzer.cli._llm_daily_rerank_candidates", side_effect=_fake_rerank):
+        _select_daily_package_records(
+            manager_records=records,
+            control_day="2024-04-15",
+            package_target=6,
+            carryover_days=7,
+            exclude_deal_ids=set(),
+            cfg=cfg,
+            logger=_Logger(),
+            backend_effective="hybrid",
+            manager="Илья",
+            role="менеджер по продажам",
+            style_source_excerpt="style",
+        )
+
+    assert seen_sizes
+    assert max(seen_sizes) <= 12
+
+
+def test_daily_payload_contains_effect_forecast_debug_and_quantity_in_units():
+    summary = {
+        "period_start": "2026-04-14",
+        "period_end": "2026-04-18",
+        "run_timestamp": "2026-04-18T12:00:00+00:00",
+    }
+    records = [
+        {
+            "deal_id": 100,
+            "owner_name": "Илья",
+            "updated_at": 1713132000,
+            "status_name": "В работе",
+            "pipeline_name": "Привлечение",
+            "score": 55,
+            "risk_flags": [],
+            "notes_summary_raw": [{"text": "Есть контекст"}],
+            "tasks_summary_raw": [{"text": "Есть задача"}],
+            "transcript_available": True,
+            "transcript_text_excerpt": "Обсудили следующий шаг и бюджет",
+            "transcript_usability_label": "usable",
+            "transcript_usability_score_final": 78,
+            "call_signal_summary_short": "В разговоре есть следующий шаг",
+            "product_hypothesis": "info",
+        }
+    ]
+    payload = _build_daily_control_sheet_payload(
+        summary=summary,
+        period_deal_records=records,
+        manager_allowlist=["Илья", "Рустам"],
+        cfg=_cfg(),
+        logger=_Logger(),
+        backend_effective="rules",
+        style_source_excerpt="",
+    )
+    assert payload["rows"]
+    row = payload["rows"][0]
+    assert row.get("effect_forecast_source") in {"fallback", "roks"}
+    assert row.get("effect_problem_stage")
+    assert row.get("effect_downstream_stages")
+    assert "%" not in str(row.get("Ожидаемый эффект - количество", ""))
+
+
+def test_daily_payload_contains_package_quality_and_generation_diagnostics():
+    summary = {
+        "period_start": "2026-04-14",
+        "period_end": "2026-04-18",
+        "run_timestamp": "2026-04-18T12:00:00+00:00",
+    }
+    records = [
+        {
+            "deal_id": 201,
+            "owner_name": "Илья",
+            "updated_at": 1713132000,
+            "status_name": "В работе",
+            "pipeline_name": "Привлечение",
+            "score": 58,
+            "risk_flags": [],
+            "notes_summary_raw": [{"text": "контекст"}],
+            "tasks_summary_raw": [{"text": "задача"}],
+            "transcript_available": True,
+            "transcript_text_excerpt": "Обсудили шаг и сроки",
+            "transcript_usability_label": "usable",
+            "transcript_usability_score_final": 80,
+            "call_signal_summary_short": "Есть следующий шаг",
+            "product_hypothesis": "info",
+            "transcript_quality_retry_used": True,
+            "transcript_quality_retry_improved": True,
+        }
+    ]
+    payload = _build_daily_control_sheet_payload(summary=summary, period_deal_records=records, cfg=_cfg(), logger=_Logger())
+    row = payload["rows"][0]
+    assert row.get("daily_package_quality_label") in {"strong", "acceptable", "thin", "weak"}
+    assert "daily_package_has_forced_fallback" in row
+    assert "negotiation_signal_presence_score" in row
+    assert "crm_only_bias_flag" in row
+    assert "style_layer_applied" in row
+    assert isinstance(row.get("text_generation_source_per_column"), dict)
+    assert row.get("transcript_quality_retry_used") is True
+    assert row.get("transcript_quality_retry_improved") is True
+
+
+def test_daily_payload_antirepeat_rewrites_duplicate_key_takeaway_for_same_manager():
+    summary = {
+        "period_start": "2026-04-14",
+        "period_end": "2026-04-15",
+        "run_timestamp": "2026-04-15T12:00:00+00:00",
+    }
+    base = {
+        "owner_name": "Илья",
+        "status_name": "В работе",
+        "pipeline_name": "Привлечение",
+        "score": 55,
+        "risk_flags": [],
+        "notes_summary_raw": [{"text": "контекст"}],
+        "tasks_summary_raw": [{"text": "задача"}],
+        "transcript_available": True,
+        "transcript_text_excerpt": "Обсудили шаг",
+        "transcript_usability_label": "usable",
+        "transcript_usability_score_final": 76,
+        "call_signal_summary_short": "Есть шаг",
+        "product_hypothesis": "info",
+    }
+    records = [
+        {**base, "deal_id": 3101, "updated_at": "2026-04-14T10:00:00+00:00"},
+        {**base, "deal_id": 3102, "updated_at": "2026-04-15T10:00:00+00:00"},
+    ]
+    payload = _build_daily_control_sheet_payload(summary=summary, period_deal_records=records, cfg=_cfg(), logger=_Logger())
+    rows = [r for r in payload["rows"] if str(r.get("Менеджер") or "") == "Илья"]
+    assert len(rows) >= 2
+    assert str(rows[0].get("Ключевой вывод") or "").strip()
+    assert str(rows[1].get("Ключевой вывод") or "").strip()
+    assert str(rows[0].get("Ключевой вывод") or "").strip() != str(rows[1].get("Ключевой вывод") or "").strip()
+
+
+def test_phone_normalization_uses_last_7_digits():
+    assert _normalize_phone_last7("+7 (999) 123-45-67") == "1234567"
+    assert _normalize_phone_last7("8-999-123-45-67") == "1234567"
+    assert _normalize_phone_last7("12345") == ""
+
+
+def test_dial_discipline_detects_dead_redials_and_same_time_pattern():
+    snapshot = {
+        "call_evidence": {
+            "items": [
+                {"phone": "+7 900 111 22 33", "status": "no_answer", "timestamp": "2026-04-21T10:00:00+00:00"},
+                {"phone": "8(900)1112233", "status": "busy", "timestamp": "2026-04-21T10:00:30+00:00"},
+                {"phone": "9001112233", "status": "voicemail", "timestamp": "2026-04-21T10:00:50+00:00"},
+            ]
+        }
+    }
+    sig = _build_dial_discipline_signals(snapshot, status_name="В работе")
+    assert sig["dial_unique_phones_count"] == 1
+    assert sig["dial_attempts_total"] == 3
+    assert sig["repeated_dead_redial_day_flag"] is True
+    assert sig["same_time_redial_pattern_flag"] is True
+    assert sig["dial_discipline_pattern_label"] == "red_flag"
+
+
+def test_secretary_touch_counts_as_attempt():
+    snapshot = {
+        "call_evidence": {
+            "items": [
+                {"phone": "+7 900 222 33 44", "status": "secretary", "timestamp": "2026-04-21T11:20:00+00:00"}
+            ]
+        }
+    }
+    sig = _build_dial_discipline_signals(snapshot, status_name="В работе")
+    assert sig["dial_attempts_total"] == 1
+    assert sig["dial_unique_phones_count"] == 1
+
+
+def test_daily_payload_can_use_dial_discipline_mode_without_negotiation():
+    summary = {
+        "period_start": "2026-04-20",
+        "period_end": "2026-04-22",
+        "run_timestamp": "2026-04-22T10:00:00+00:00",
+    }
+    records = [
+        {
+            "deal_id": 401,
+            "owner_name": "Рустам",
+            "updated_at": "2026-04-21T12:00:00+00:00",
+            "status_name": "В работе",
+            "pipeline_name": "Привлечение",
+            "score": 42,
+            "risk_flags": [],
+            "notes_summary_raw": [{"text": "недозвоны"}],
+            "tasks_summary_raw": [],
+            "transcript_available": False,
+            "transcript_text_excerpt": "",
+            "transcript_usability_label": "empty",
+            "transcript_usability_score_final": 0,
+            "call_signal_summary_short": "",
+            "repeated_dead_redial_day_flag": True,
+            "repeated_dead_redial_count": 3,
+            "same_time_redial_pattern_flag": True,
+            "numbers_not_fully_covered_flag": True,
+        }
+    ]
+    llm_cols = {
+        "Ключевой вывод": "День ушел в повторные недозвоны по одним и тем же номерам.",
+        "Сильные стороны": "",
+        "Зоны роста": "Дисциплина набора и смена времени дозвона",
+        "Почему это важно": "Сотруднику быстрее даст рабочие контакты, отделу снимет верхний шум.",
+        "Что закрепить": "Модуль жесткой фиксации окна перезвона.",
+        "Что исправить": "Остановить подрядные перезвоны в одно и то же время.",
+        "Что донес сотруднику": "1) Разобрали паттерн недозвонов.\n2) Дали модуль смены окна дозвона.\n3) В следующих касаниях тестирует новый слот.",
+        "Ожидаемый эффект - количество": "+1-2 живых контакта за неделю",
+        "Ожидаемый эффект - качество": "Станет чище верхний этап и меньше пустых касаний.",
+        "_llm_text_ready": True,
+    }
+    with patch("src.deal_analyzer.cli._generate_daily_table_text_columns", return_value=llm_cols):
+        payload = _build_daily_control_sheet_payload(
+            summary=summary,
+            period_deal_records=records,
+            cfg=replace(_cfg(), analyzer_backend="hybrid"),
+            backend_effective="hybrid",
+            llm_runtime={"selected": "main", "main_ok": True, "main": {"base_url": "http://x", "model": "m", "timeout_seconds": 10}},
+        )
+    assert payload["rows"]
+    assert payload["rows"][0].get("daily_analysis_mode") == "dial_discipline_analysis"
+
+
+def test_no_real_write_when_daily_llm_unavailable():
+    output_dir = _fresh_output_dir("period_batch_no_llm_write")
+    payload = {"normalized_deals": [{"deal_id": 1}]}
+    logger = _Logger()
+    cfg = replace(_cfg(), analyzer_backend="hybrid", deal_analyzer_write_enabled=True)
+
+    with patch("src.deal_analyzer.cli.build_deal_snapshot", side_effect=lambda **kw: _snapshot_for_deal(int(kw["normalized_deal"]["deal_id"]))), patch(
+        "src.deal_analyzer.cli._analyze_one_with_isolation",
+        side_effect=lambda normalized, cfg, logger, *, deal_hint, backend_override: _analysis_for_deal(int(normalized["deal_id"])),
+    ), patch(
+        "src.deal_analyzer.cli._resolve_daily_llm_runtime",
+        return_value={"enabled": True, "selected": "none", "reason": "main_and_fallback_failed", "main_ok": False, "fallback_ok": False},
+    ):
+        _run_analyze_period(
+            cfg,
+            output_dir,
+            payload,
+            "period.json",
+            True,
+            logger,
+            period_mode=None,
+            date_from=None,
+            date_to=None,
+            limit=None,
+        )
+
+    run_dir = next((output_dir / "period_runs").iterdir())
+    summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    writer = summary.get("daily_control_writer", {})
+    assert writer.get("mode") == "dry_run"
+    assert writer.get("enabled") is False
+    assert writer.get("error") == "write_forced_dry_run_no_live_llm"
+    llm_runtime = summary.get("daily_llm_runtime", {})
+    assert llm_runtime.get("selected") == "none"
+
+
+def test_llm_runtime_generation_uses_fallback_when_main_call_fails():
+    runtime = {
+        "selected": "main",
+        "main_ok": True,
+        "fallback_ok": True,
+        "main": {"base_url": "http://main", "model": "m1", "timeout_seconds": 5},
+        "fallback": {"base_url": "http://fb", "model": "m2", "timeout_seconds": 5},
+    }
+
+    class _MainClient:
+        def chat_json(self, *, messages):
+            raise RuntimeError("main_generation_failed")
+
+    class _FallbackClient:
+        def chat_json(self, *, messages):
+            return SimpleNamespace(payload={"key_takeaway": "ok"})
+
+    def _fake_make(runtime_payload):
+        selected = str(runtime_payload.get("selected") or "")
+        if selected == "main":
+            return _MainClient()
+        if selected == "fallback":
+            return _FallbackClient()
+        return None
+
+    with patch("src.deal_analyzer.cli._make_llm_client_from_runtime", side_effect=_fake_make):
+        payload, source = _llm_chat_json_with_runtime(
+            runtime=runtime,
+            messages=[{"role": "user", "content": "{}"}],
+            repair_messages=None,
+            logger=_Logger(),
+            log_prefix="test",
+        )
+
+    assert isinstance(payload, dict)
+    assert source == "fallback"
+
+
+def test_company_tags_are_propagated_to_deal_tags():
+    merged, company, propagated = _merge_deal_company_tags(
+        deal_tags=["expo", "priority"],
+        company_tags=["priority", "roks", "expo-2026"],
+    )
+    assert "roks" in merged
+    assert "expo-2026" in merged
+    assert "roks" in propagated
+    assert "priority" not in propagated
+    assert company == ["expo-2026", "priority", "roks"]
+
+
+def test_daily_payload_drops_rows_when_llm_text_not_ready():
+    summary = {
+        "period_start": "2026-04-20",
+        "period_end": "2026-04-22",
+        "run_timestamp": "2026-04-22T10:00:00+00:00",
+    }
+    records = [
+        {
+            "deal_id": 501,
+            "owner_name": "Илья",
+            "updated_at": "2026-04-21T12:00:00+00:00",
+            "status_name": "В работе",
+            "pipeline_name": "Привлечение",
+            "score": 55,
+            "risk_flags": [],
+            "notes_summary_raw": [{"text": "контекст"}],
+            "tasks_summary_raw": [{"text": "задача"}],
+            "transcript_available": True,
+            "transcript_text_excerpt": "разговор",
+            "transcript_usability_label": "usable",
+            "transcript_usability_score_final": 80,
+            "call_signal_summary_short": "есть следующий шаг",
+        }
+    ]
+    with patch("src.deal_analyzer.cli._generate_daily_table_text_columns", return_value={"_llm_text_ready": False}):
+        payload = _build_daily_control_sheet_payload(
+            summary=summary,
+            period_deal_records=records,
+            cfg=replace(_cfg(), analyzer_backend="hybrid"),
+            backend_effective="hybrid",
+            llm_runtime={"selected": "none"},
+        )
+    assert payload["rows_count"] == 0
+
 
