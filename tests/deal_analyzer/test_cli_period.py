@@ -111,7 +111,7 @@ def test_preflight_success_path():
         def preflight(self, *, probe_timeout_seconds):
             return OllamaPreflightResult(ok=True, error=None)
 
-    with patch("src.deal_analyzer.cli.OllamaClient", _Client):
+    with patch("src.deal_analyzer.llm_runtime.OllamaClient", _Client):
         forced_rules = _run_ollama_preflight(_cfg(), logger)
 
     assert forced_rules is False
@@ -128,11 +128,46 @@ def test_preflight_fail_path_switches_to_rules():
         def preflight(self, *, probe_timeout_seconds):
             return OllamaPreflightResult(ok=False, error="connect failed")
 
-    with patch("src.deal_analyzer.cli.OllamaClient", _Client):
+    with patch("src.deal_analyzer.llm_runtime.OllamaClient", _Client):
         forced_rules = _run_ollama_preflight(_cfg(), logger)
 
     assert forced_rules is True
     assert any("preflight failed" in msg for msg in logger.warnings)
+
+
+def test_preflight_failover_to_fallback_does_not_force_rules():
+    logger = _Logger()
+    cfg = DealAnalyzerConfig(**{**_cfg().__dict__, "ollama_fallback_enabled": True, "ollama_fallback_model": "deepseek-v3.1:671b-cloud"})
+
+    class _Client:
+        def __init__(self, *, base_url, model, timeout_seconds):
+            self.model = model
+
+        def preflight(self, *, probe_timeout_seconds):
+            if self.model == "gemma4:e4b":
+                return OllamaPreflightResult(ok=False, error="main_down")
+            return OllamaPreflightResult(ok=True, error=None)
+
+    with patch("src.deal_analyzer.llm_runtime.OllamaClient", _Client):
+        forced_rules = _run_ollama_preflight(cfg, logger)
+
+    assert forced_rules is False
+
+
+def test_preflight_soft_nonjson_is_treated_as_live_runtime():
+    logger = _Logger()
+
+    class _Client:
+        def __init__(self, *, base_url, model, timeout_seconds):
+            pass
+
+        def preflight(self, *, probe_timeout_seconds):
+            return OllamaPreflightResult(ok=False, error="Ollama content is not valid JSON object: hello")
+
+    with patch("src.deal_analyzer.llm_runtime.OllamaClient", _Client):
+        forced_rules = _run_ollama_preflight(_cfg(), logger)
+
+    assert forced_rules is False
 
 
 def test_cli_analyze_period_parses_limit():

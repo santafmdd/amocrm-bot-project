@@ -619,3 +619,85 @@ Debug-поля в daily payload:
 - все файлы из `sales_module_references`, если указан путь к папке (рекурсивно).
 
 В лог пишется, какие style/reference sources реально загрузились.
+
+## Daily LLM Failover + Write Guard
+
+- Для `analyze-period` и daily-текста используется единый runtime-resolver:
+  - main: `ollama_base_url` + `ollama_model`
+  - fallback: `ollama_fallback_*`
+- Выбор runtime фиксируется в `summary.json`:
+  - `analysis_llm_runtime`
+  - `daily_llm_runtime`
+- Если main недоступна, но fallback жива: daily-генерация идет через fallback.
+- Если обе недоступны:
+  - daily J-Q не считаются готовыми,
+  - запись в боевой лист принудительно уходит в dry-run,
+  - статус writer: `write_forced_dry_run_no_live_llm`.
+
+## Daily Multi-Step Pipeline (Debuggable)
+
+Для daily generation включен последовательный конвейер:
+1) candidate selection  
+2) primary free-form analysis  
+3) effect/motivation layer  
+4) block split  
+5) style rewrite  
+6) final assembler (`source_of_truth=styled_blocks`, `assembler_only=true`)  
+7) writer-ready handoff
+
+Принцип:
+- каждый шаг пишет отдельный debug artifact;
+- если ломается любой шаг, строка не попадает в боевой payload;
+- run продолжает работу в безопасном режиме (dry-run), с явным `failed_step` и `error`.
+
+Где смотреть:
+- `period_runs/<timestamp>/daily_step_artifacts/...` — артефакты по шагам;
+- `daily_control_sheet_payload.json -> daily_multistep_pipeline`;
+- `summary.json -> daily_multistep_pipeline`.
+
+Этот слой не использует rules-текст как содержательный fallback для J-Q в LLM-ветке.  
+Rules остаются только factual/debug основой (отбор/сигналы/guardrails).
+
+## CRM Consistency Layer (Parallel, not dominant)
+
+CRM-анализ вынесен в отдельный параллельный слой и не должен доминировать над разбором переговоров при наличии живого звонка.
+
+Новые поля:
+- `crm_consistency_summary`
+- `crm_hygiene_flags`
+- `crm_vs_call_mismatch`
+- `crm_consistency_debug`
+
+Логика:
+- если есть живой разговор, mismatch CRM vs call фиксируется отдельным блоком;
+- если живого разговора нет, CRM/discpline слой может становиться основным источником сигнала.
+
+## Deterministic Base Mix (Code-first)
+
+`База микс` собирается детерминированно и без LLM:
+1) `deal tags`
+2) `company tags` (с безопасным auto-propagation в merged deal view)
+3) source/form/url/title hints
+4) company meaning / OKVED / comments hints
+5) fallback `солянка`
+
+Запрещено использовать status/stage как источник `База микс`.
+
+## Daily Case Modes (Type-Specific Contract)
+
+Daily-кейс перед генерацией типизируется:
+- `negotiation_lpr_analysis`
+- `secretary_analysis`
+- `redial_discipline_analysis`
+- `supplier_inbound_analysis`
+- `warm_inbound_analysis`
+- `skip_no_meaningful_case`
+
+Для каждого режима в prompt передаются:
+- `allowed_axes`
+- `banned_topics`
+- mode reason/confidence
+
+Это убирает CRM-first спам и блокирует нерелевантные темы:
+- secretary/redial кейсы не тянут demo/brief/боль как основной разбор;
+- LPR-кейсы приоритетно разбираются по этапам разговора.

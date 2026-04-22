@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from src.config import load_config
 from src.deal_analyzer.cli import (
+    _call_role_signal,
     _build_dial_discipline_signals,
     _build_daily_control_sheet_payload,
     _merge_deal_company_tags,
@@ -16,9 +17,13 @@ from src.deal_analyzer.cli import (
     _expected_quality_text,
     _expected_quantity_text,
     _llm_chat_json_with_runtime,
+    _sanitize_daily_llm_columns,
+    _daily_candidate_tier,
+    _transcript_usability_score,
     _select_daily_package_records,
     _run_analyze_period,
 )
+from src.deal_analyzer.daily_case_modes import classify_daily_case
 from src.deal_analyzer.config import DealAnalyzerConfig
 
 
@@ -56,6 +61,11 @@ def _cfg() -> DealAnalyzerConfig:
         style_profile_name="manager_ru_v1",
         period_live_refresh_enabled=False,
     )
+
+
+def _cfg_hybrid() -> DealAnalyzerConfig:
+    cfg = _cfg()
+    return replace(cfg, analyzer_backend="hybrid")
 
 
 def _snapshot_for_deal(deal_id: int, *, warnings=None, status_name: str = "В работе"):
@@ -2138,6 +2148,165 @@ def test_daily_selection_keeps_secretary_fallback_when_lpr_missing():
     assert str(selected[0].get("skip_for_daily_reason") or "") == ""
 
 
+def test_daily_ranking_prioritizes_lpr_and_secretary_over_autoanswer_control_cases():
+    records = [
+        {
+            "deal_id": 32162059,
+            "updated_at": "2026-04-22T12:26:24+00:00",
+            "status_name": "Первый контакт. Квалификация",
+            "pipeline_name": "Привлечение",
+            "transcript_available": True,
+            "transcript_usability_label": "usable",
+            "transcript_usability_score_final": 78,
+            "transcript_text_excerpt": "Говорили с ЛПР, согласовали демонстрацию и следующий звонок.",
+            "call_signal_summary_short": "ЛПР на связи, есть договоренность о следующем шаге",
+            "notes_summary_raw": [{"text": "есть контекст"}],
+            "tasks_summary_raw": [{"text": "задача"}],
+        },
+        {
+            "deal_id": 32165731,
+            "updated_at": "2026-04-22T09:46:42+00:00",
+            "status_name": "Закрыто и не реализовано",
+            "pipeline_name": "Привлечение",
+            "transcript_available": True,
+            "transcript_usability_label": "usable",
+            "transcript_usability_score_final": 62,
+            "transcript_text_excerpt": "Секретарь объяснил маршрутизацию через почту и отдел продаж.",
+            "call_signal_summary_short": "Секретарь дал маршрут, нужно корректно дожать следующий шаг",
+            "notes_summary_raw": [{"text": "секретарь"}],
+            "tasks_summary_raw": [],
+        },
+        {
+            "deal_id": 32160389,
+            "updated_at": "2026-04-21T07:41:58+00:00",
+            "status_name": "Верификация",
+            "pipeline_name": "Привлечение",
+            "transcript_available": True,
+            "transcript_usability_label": "usable",
+            "transcript_usability_score_final": 57,
+            "transcript_text_excerpt": "К сожалению, абонент сейчас не может ответить. Оставьте сообщение после сигнала.",
+            "call_signal_summary_short": "",
+            "notes_summary_raw": [],
+            "tasks_summary_raw": [],
+        },
+    ]
+    selected = _select_daily_package_records(
+        manager_records=records,
+        control_day="2026-04-22",
+        package_target=6,
+        carryover_days=7,
+        exclude_deal_ids=set(),
+    )
+    selected_ids = [int(x.get("deal_id")) for x in selected if str(x.get("deal_id") or "").isdigit()]
+    assert 32162059 in selected_ids
+    assert 32165731 in selected_ids
+    assert 32160389 not in selected_ids
+    skipped = []
+    for row in selected:
+        skipped.extend(row.get("_daily_skipped_candidates", []) if isinstance(row, dict) else [])
+    skip_32160389 = next((x for x in skipped if str(x.get("deal_id") or "") == "32160389"), {})
+    assert str(skip_32160389.get("skip_for_daily_reason") or "") == "autoanswer_low_priority_when_real_conversation_exists"
+
+
+def test_control_cases_have_expected_daily_ranking_signals():
+    lpr_case = {
+        "deal_id": 32162059,
+        "transcript_available": True,
+        "transcript_usability_label": "usable",
+        "transcript_usability_score_final": 80,
+        "transcript_text_excerpt": "Говорили с ЛПР, согласовали следующий шаг.",
+        "call_signal_summary_short": "ЛПР",
+        "notes_summary_raw": [{"text": "контекст"}],
+        "tasks_summary_raw": [{"text": "задача"}],
+    }
+    secretary_case = {
+        "deal_id": 32165731,
+        "transcript_available": True,
+        "transcript_usability_label": "usable",
+        "transcript_usability_score_final": 60,
+        "transcript_text_excerpt": "Секретарь объяснил, куда отправить письмо для закупки.",
+        "call_signal_summary_short": "секретарь",
+        "notes_summary_raw": [{"text": "секретарь"}],
+        "tasks_summary_raw": [],
+    }
+    autoanswer_case = {
+        "deal_id": 32160389,
+        "transcript_available": True,
+        "transcript_usability_label": "usable",
+        "transcript_usability_score_final": 57,
+        "transcript_text_excerpt": "Абонент сейчас не может ответить, перезвоните позже.",
+        "call_signal_summary_short": "",
+        "notes_summary_raw": [],
+        "tasks_summary_raw": [],
+    }
+
+    assert _call_role_signal(lpr_case) == "lpr"
+    assert _call_role_signal(secretary_case) == "secretary"
+    assert _call_role_signal(autoanswer_case) == "autoanswer"
+    assert _transcript_usability_score(autoanswer_case) == 0
+
+    lpr_tier, _ = _daily_candidate_tier(
+        lpr_case,
+        transcript_score=_transcript_usability_score(lpr_case),
+        evidence_score=6,
+    )
+    sec_tier, _ = _daily_candidate_tier(
+        secretary_case,
+        transcript_score=_transcript_usability_score(secretary_case),
+        evidence_score=4,
+    )
+    auto_tier, _ = _daily_candidate_tier(
+        autoanswer_case,
+        transcript_score=_transcript_usability_score(autoanswer_case),
+        evidence_score=1,
+    )
+
+    assert lpr_tier < sec_tier
+    assert sec_tier < auto_tier
+
+
+def test_daily_selection_uses_redial_fallback_when_no_usable_conversations():
+    records = [
+        {
+            "deal_id": 9901,
+            "updated_at": "2026-04-22T10:00:00+00:00",
+            "status_name": "В работе",
+            "pipeline_name": "Привлечение",
+            "transcript_available": False,
+            "transcript_usability_label": "empty",
+            "transcript_usability_score_final": 0,
+            "transcript_text_excerpt": "",
+            "call_signal_summary_short": "",
+            "repeated_dead_redial_day_flag": True,
+            "repeated_dead_redial_count": 3,
+            "notes_summary_raw": [],
+            "tasks_summary_raw": [],
+        },
+        {
+            "deal_id": 9902,
+            "updated_at": "2026-04-22T10:05:00+00:00",
+            "status_name": "В работе",
+            "pipeline_name": "Привлечение",
+            "transcript_available": True,
+            "transcript_usability_label": "usable",
+            "transcript_usability_score_final": 56,
+            "transcript_text_excerpt": "Абонент сейчас не может ответить, оставьте сообщение.",
+            "call_signal_summary_short": "",
+            "notes_summary_raw": [],
+            "tasks_summary_raw": [],
+        },
+    ]
+    selected = _select_daily_package_records(
+        manager_records=records,
+        control_day="2026-04-22",
+        package_target=2,
+        carryover_days=7,
+        exclude_deal_ids=set(),
+    )
+    selected_ids = [int(x.get("deal_id")) for x in selected if str(x.get("deal_id") or "").isdigit()]
+    assert 9901 in selected_ids
+
+
 def test_llm_rerank_receives_limited_shortlist_only():
     records = []
     for i in range(1, 25):
@@ -2374,13 +2543,17 @@ def test_daily_payload_can_use_dial_discipline_mode_without_negotiation():
         "Ожидаемый эффект - качество": "Станет чище верхний этап и меньше пустых касаний.",
         "_llm_text_ready": True,
     }
-    with patch("src.deal_analyzer.cli._generate_daily_table_text_columns", return_value=llm_cols):
+    with patch(
+        "src.deal_analyzer.cli._run_daily_multistep_pipeline",
+        return_value={"ok": True, "columns": {k: v for k, v in llm_cols.items() if not k.startswith("_")}, "step_artifacts": {}, "source_of_truth": "styled_blocks", "assembler_only": True},
+    ):
         payload = _build_daily_control_sheet_payload(
             summary=summary,
             period_deal_records=records,
             cfg=replace(_cfg(), analyzer_backend="hybrid"),
             backend_effective="hybrid",
             llm_runtime={"selected": "main", "main_ok": True, "main": {"base_url": "http://x", "model": "m", "timeout_seconds": 10}},
+            daily_step_artifacts_dir=Path("workspace/tmp_tests/deal_analyzer/daily_steps_dial_discipline"),
         )
     assert payload["rows"]
     assert payload["rows"][0].get("daily_analysis_mode") == "dial_discipline_analysis"
@@ -2505,5 +2678,175 @@ def test_daily_payload_drops_rows_when_llm_text_not_ready():
             llm_runtime={"selected": "none"},
         )
     assert payload["rows_count"] == 0
+
+
+def test_daily_case_classifier_separates_secretary_and_lpr():
+    secretary_profile = classify_daily_case(
+        role="телемаркетолог",
+        items=[
+            {
+                "transcript_usability_label": "usable",
+                "transcript_text_excerpt": "Секретарь попросил отправить на почту и уточнить тему обращения.",
+                "call_signal_summary_short": "Маршрутизация через секретаря",
+            }
+        ],
+    )
+    lpr_profile = classify_daily_case(
+        role="телемаркетолог",
+        items=[
+            {
+                "transcript_usability_label": "usable",
+                "transcript_text_excerpt": "Говорили с ЛПР, согласовали встречу на четверг.",
+                "call_signal_summary_short": "Есть следующий шаг с ЛПР",
+            }
+        ],
+    )
+    assert secretary_profile.mode == "secretary_analysis"
+    assert lpr_profile.mode == "negotiation_lpr_analysis"
+
+
+def test_sanitize_daily_columns_applies_case_bans_for_secretary():
+    payload = {
+        "key_takeaway": "Не подтверждена презентация и нет результата демонстрации.",
+        "strong_sides": "Хорошо держал секретаря.",
+        "growth_zones": "Нужно заполнить бриф и подтвердить презентацию.",
+        "why_important": "Без этого будет срыв.",
+        "reinforce": "Модуль захода через инфоповод.",
+        "fix_action": "Уточнить маршрут и убрать пустые перезвоны.",
+        "coaching_list": "1) Разобрали модуль секретаря.\n2) Дали модуль маршрутизации.\n3) Тестирует новый заход.",
+        "expected_quantity": "+0 встреч в неделю",
+        "expected_quality": "Качество этапа вырастет.",
+    }
+    cols = _sanitize_daily_llm_columns(
+        payload=payload,
+        fallback={"Ожидаемый эффект - количество": "+0.3 встречи в неделю"},
+        role="телемаркетолог",
+        case_policy={"banned_topics": ["презентация", "демонстрация", "бриф"]},
+    )
+    assert "презентац" not in cols["Зоны роста"].lower()
+    assert "бриф" not in cols["Зоны роста"].lower()
+    assert cols["Ожидаемый эффект - количество"] == "+0.3 встречи в неделю"
+
+
+def test_quantity_effect_keeps_decimals_and_never_plus_zero():
+    payload = {
+        "key_takeaway": "test",
+        "strong_sides": "test",
+        "growth_zones": "test",
+        "why_important": "test",
+        "reinforce": "test",
+        "fix_action": "test",
+        "coaching_list": "1) a\n2) b\n3) c",
+        "expected_quantity": "+0.0 встреч в неделю",
+        "expected_quality": "ok",
+    }
+    cols = _sanitize_daily_llm_columns(
+        payload=payload,
+        fallback={"Ожидаемый эффект - количество": "+0.4 встречи в неделю"},
+        role="менеджер по продажам",
+        case_policy={},
+    )
+    assert "+0.0" not in cols["Ожидаемый эффект - количество"]
+    assert cols["Ожидаемый эффект - количество"] == "+0.4 встречи в неделю"
+
+
+def test_daily_multistep_pipeline_failure_skips_row_and_collects_failure() -> None:
+    summary = {
+        "period_start": "2026-04-20",
+        "period_end": "2026-04-22",
+        "run_timestamp": "2026-04-22T10:00:00+00:00",
+    }
+    records = [
+        {
+            "deal_id": 601,
+            "owner_name": "Илья",
+            "updated_at": "2026-04-21T12:00:00+00:00",
+            "status_name": "В работе",
+            "pipeline_name": "Привлечение",
+            "score": 58,
+            "risk_flags": [],
+            "notes_summary_raw": [{"text": "контекст"}],
+            "tasks_summary_raw": [{"text": "задача"}],
+            "transcript_available": True,
+            "transcript_text_excerpt": "разговор",
+            "transcript_usability_label": "usable",
+            "transcript_usability_score_final": 85,
+            "call_signal_summary_short": "Есть следующий шаг",
+        }
+    ]
+    with patch(
+        "src.deal_analyzer.cli._run_daily_multistep_pipeline",
+        return_value={"ok": False, "failed_step": "block_split", "error": "missing_blocks=growth_zones"},
+    ):
+        payload = _build_daily_control_sheet_payload(
+            summary=summary,
+            period_deal_records=records,
+            cfg=replace(_cfg(), analyzer_backend="hybrid"),
+            logger=_Logger(),
+            backend_effective="hybrid",
+            llm_runtime={"selected": "main", "main_ok": True},
+            daily_step_artifacts_dir=Path("workspace/tmp_tests/deal_analyzer/daily_steps_fail"),
+        )
+    assert payload["rows_count"] == 0
+    diag = payload.get("daily_multistep_pipeline", {})
+    assert diag.get("step_failures_count", 0) >= 1
+    assert diag.get("step_failures", [])[0].get("failed_step") == "block_split"
+
+
+def test_daily_multistep_pipeline_success_populates_llm_columns() -> None:
+    summary = {
+        "period_start": "2026-04-20",
+        "period_end": "2026-04-22",
+        "run_timestamp": "2026-04-22T10:00:00+00:00",
+    }
+    records = [
+        {
+            "deal_id": 602,
+            "owner_name": "Рустам",
+            "updated_at": "2026-04-21T12:00:00+00:00",
+            "status_name": "В работе",
+            "pipeline_name": "Привлечение",
+            "score": 62,
+            "risk_flags": [],
+            "notes_summary_raw": [{"text": "контекст"}],
+            "tasks_summary_raw": [{"text": "задача"}],
+            "transcript_available": True,
+            "transcript_text_excerpt": "разговор",
+            "transcript_usability_label": "usable",
+            "transcript_usability_score_final": 88,
+            "call_signal_summary_short": "Секретарь дал маршрут",
+        }
+    ]
+    cols = {
+        "Ключевой вывод": "Есть рабочий контакт, но шаг нужно фиксировать жестче.",
+        "Сильные стороны": "Уверенно прошел секретаря.",
+        "Зоны роста": "Уточнять шаг и окно контакта.",
+        "Почему это важно": "Так не теряем темп и быстрее доходим до решения.",
+        "Что закрепить": "Модуль захода через инфоповод.",
+        "Что исправить": "После маршрута сразу фиксировать конкретный слот.",
+        "Что донес сотруднику": "1) Разобрали заход.\n2) Дали модуль.\n3) Пробует в следующих касаниях.",
+        "Ожидаемый эффект - количество": "+0.3 ЛПР в неделю и +0.2 встречи.",
+        "Ожидаемый эффект - качество": "Станет меньше пустых перезвонов.",
+    }
+    with patch(
+        "src.deal_analyzer.cli._run_daily_multistep_pipeline",
+        return_value={"ok": True, "columns": cols, "step_artifacts": {"1_candidate_selection": "a.json"}, "source_of_truth": "styled_blocks", "assembler_only": True},
+    ):
+        payload = _build_daily_control_sheet_payload(
+            summary=summary,
+            period_deal_records=records,
+            cfg=replace(_cfg(), analyzer_backend="hybrid"),
+            logger=_Logger(),
+            backend_effective="hybrid",
+            llm_runtime={"selected": "main", "main_ok": True},
+            daily_step_artifacts_dir=Path("workspace/tmp_tests/deal_analyzer/daily_steps_ok"),
+        )
+    assert payload["rows_count"] == 1
+    row = payload["rows"][0]
+    assert row["Ключевой вывод"] == cols["Ключевой вывод"]
+    assert row["daily_multistep_source_of_truth"] == "styled_blocks"
+    assert row["daily_multistep_assembler_only"] is True
+    diag = payload.get("daily_multistep_pipeline", {})
+    assert diag.get("step_artifacts_count", 0) >= 1
 
 

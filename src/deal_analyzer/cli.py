@@ -8,6 +8,8 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from src.config import load_config
 from src.integrations.google_sheets_api_client import GoogleSheetsApiClient, extract_spreadsheet_id
@@ -21,7 +23,15 @@ from src.safety import ensure_inside_root
 
 from .call_downloader import CallDownloader
 from .call_evidence import build_call_summary, call_evidence_to_dicts
+from .base_mix import build_base_mix_text as build_base_mix_text_priority, normalize_tag_values
 from .config import DealAnalyzerConfig, load_deal_analyzer_config, resolve_period
+from .daily_case_modes import (
+    classify_daily_case,
+    mode_is_writable,
+    mode_prompt_policy,
+)
+from .daily_multistep import BLOCK_KEYS as DAILY_BLOCK_KEYS, assemble_writer_columns, parse_blocks_markdown, validate_blocks
+from .crm_consistency import build_crm_consistency_layer
 from .enrichment import build_operator_outputs, enrich_rows
 from .exporters import (
     analyzer_output_dir,
@@ -32,6 +42,7 @@ from .exporters import (
 )
 from .llm_backend import analyze_deal_with_hybrid_outcome, analyze_deal_with_ollama_outcome
 from .llm_client import OllamaClient
+from .llm_runtime import resolve_ollama_runtime
 from .models import AnalysisRunMetadata
 from .prompt_builder import (
     append_daily_rerank_json_repair_instruction,
@@ -787,9 +798,25 @@ def _run_analyze_period(
 
     preflight_forced_rules = False
     effective_backend = cfg.analyzer_backend
+    analysis_cfg = cfg
+    analysis_llm_runtime = resolve_ollama_runtime(
+        cfg=cfg,
+        enabled=cfg.analyzer_backend in {"ollama", "hybrid"},
+        logger=logger,
+        log_prefix="analysis llm",
+    )
     if cfg.analyzer_backend in {"ollama", "hybrid"}:
-        preflight_forced_rules = _run_ollama_preflight(cfg, logger)
-        if preflight_forced_rules:
+        selected = str(analysis_llm_runtime.get("selected") or "none")
+        if selected == "fallback":
+            fb = analysis_llm_runtime.get("fallback", {}) if isinstance(analysis_llm_runtime.get("fallback"), dict) else {}
+            analysis_cfg = replace(
+                cfg,
+                ollama_base_url=str(fb.get("base_url") or cfg.ollama_base_url),
+                ollama_model=str(fb.get("model") or cfg.ollama_model),
+                ollama_timeout_seconds=int(fb.get("timeout_seconds") or cfg.ollama_timeout_seconds),
+            )
+        if selected == "none":
+            preflight_forced_rules = True
             effective_backend = "rules"
 
     normalized_rows_input = _extract_period_normalized(payload)
@@ -838,16 +865,16 @@ def _run_analyze_period(
         try:
             snapshot = build_deal_snapshot(
                 normalized_deal=row,
-                config=cfg,
+                config=analysis_cfg,
                 logger=logger,
                 raw_bundle=raw_bundles_by_deal.get(deal_hint),
             )
             crm = snapshot.get("crm") if isinstance(snapshot.get("crm"), dict) else row
             call_retry_candidate_score = _daily_candidate_retry_score(snapshot if isinstance(snapshot, dict) else {})
             allow_quality_retry = bool(
-                getattr(cfg, "whisper_quality_retry_enabled", False)
+                getattr(analysis_cfg, "whisper_quality_retry_enabled", False)
                 and (
-                    not bool(getattr(cfg, "whisper_quality_retry_only_for_daily_candidates", True))
+                    not bool(getattr(analysis_cfg, "whisper_quality_retry_only_for_daily_candidates", True))
                     or call_retry_candidate_score >= 40
                     or idx < 3
                 )
@@ -855,13 +882,13 @@ def _run_analyze_period(
             retry_info = _maybe_retry_transcript_quality_for_deal(
                 snapshot=snapshot if isinstance(snapshot, dict) else {},
                 crm=crm,
-                cfg=cfg,
+                cfg=analysis_cfg,
                 logger=logger,
                 allow_retry_for_deal=allow_quality_retry,
             )
             analysis, row_counts = _analyze_one_with_isolation(
                 crm,
-                cfg,
+                analysis_cfg,
                 logger,
                 deal_hint=deal_hint,
                 backend_override=effective_backend,
@@ -870,7 +897,7 @@ def _run_analyze_period(
             analysis = _attach_enrichment_and_operator_outputs(
                 analysis,
                 crm,
-                cfg,
+                analysis_cfg,
                 snapshot=snapshot if isinstance(snapshot, dict) else None,
             )
             with_transcript_view = _extract_transcription_compare_view(analysis)
@@ -882,6 +909,8 @@ def _run_analyze_period(
                 )
             )
             with_transcript_view = _extract_transcription_compare_view(analysis)
+            crm_consistency = build_crm_consistency_layer(crm=crm, analysis=analysis)
+            analysis.update(crm_consistency)
             analyses.append(analysis)
             llm_counts["llm_success_count"] += row_counts["llm_success_count"]
             llm_counts["llm_success_repaired_count"] += row_counts["llm_success_repaired_count"]
@@ -928,6 +957,7 @@ def _run_analyze_period(
             call_history_pattern = _derive_call_history_pattern(snapshot if isinstance(snapshot, dict) else {})
             deal_tags = crm.get("tags") if isinstance(crm.get("tags"), list) else []
             company_tags = crm.get("company_tags") if isinstance(crm.get("company_tags"), list) else []
+            normalized_deal_tags = normalize_tag_values(deal_tags)
             merged_tags, normalized_company_tags, propagated_company_tags = _merge_deal_company_tags(
                 deal_tags=deal_tags,
                 company_tags=company_tags,
@@ -953,9 +983,13 @@ def _run_analyze_period(
                         or _to_product_name(crm.get("source_values"))
                     ),
                     "source_values": crm.get("source_values") if isinstance(crm.get("source_values"), list) else [],
+                    "deal_tags_raw": normalized_deal_tags,
                     "tags": merged_tags,
                     "company_tags": sorted(normalized_company_tags),
                     "propagated_company_tags": propagated_company_tags,
+                    "company_name": str(crm.get("company_name") or ""),
+                    "source_name": str(crm.get("source_name") or ""),
+                    "source_url": str(crm.get("source_url") or ""),
                     "status_name": crm.get("status_name") or "",
                     "pipeline_name": crm.get("pipeline_name") or "",
                     "created_at": crm.get("created_at") or "",
@@ -1026,6 +1060,16 @@ def _run_analyze_period(
                     "call_signal_objection_not_target": bool(analysis.get("call_signal_objection_not_target")),
                     "call_signal_next_step_present": bool(analysis.get("call_signal_next_step_present")),
                     "call_signal_decision_maker_reached": bool(analysis.get("call_signal_decision_maker_reached")),
+                    "crm_consistency_summary": str(analysis.get("crm_consistency_summary") or ""),
+                    "crm_hygiene_flags": analysis.get("crm_hygiene_flags")
+                    if isinstance(analysis.get("crm_hygiene_flags"), list)
+                    else [],
+                    "crm_vs_call_mismatch": analysis.get("crm_vs_call_mismatch")
+                    if isinstance(analysis.get("crm_vs_call_mismatch"), list)
+                    else [],
+                    "crm_consistency_debug": analysis.get("crm_consistency_debug")
+                    if isinstance(analysis.get("crm_consistency_debug"), dict)
+                    else {},
                     "notes_summary_raw": crm.get("notes_summary_raw") if isinstance(crm.get("notes_summary_raw"), list) else [],
                     "tasks_summary_raw": crm.get("tasks_summary_raw") if isinstance(crm.get("tasks_summary_raw"), list) else [],
                     "company_comment": str(crm.get("company_comment") or ""),
@@ -1217,6 +1261,10 @@ def _run_analyze_period(
                     "call_signal_objection_not_target": False,
                     "call_signal_next_step_present": False,
                     "call_signal_decision_maker_reached": False,
+                    "crm_consistency_summary": "",
+                    "crm_hygiene_flags": [],
+                    "crm_vs_call_mismatch": [],
+                    "crm_consistency_debug": {},
                     "call_source_used": "analysis_failed",
                     "call_candidates_count": 0,
                     "recording_url_count": 0,
@@ -1366,8 +1414,8 @@ def _run_analyze_period(
         sheets_dry_run_payload_path,
         sheets_dry_run_payload,
     )
-    style_source_excerpt = _load_daily_style_source_excerpt(logger=logger, cfg=cfg)
-    daily_llm_runtime = _resolve_daily_llm_runtime(cfg, logger)
+    style_source_excerpt = _load_daily_style_source_excerpt(logger=logger, cfg=analysis_cfg)
+    daily_llm_runtime = _resolve_daily_llm_runtime(analysis_cfg, logger)
     summary_payload["daily_llm_runtime"] = {
         "enabled": bool(daily_llm_runtime.get("enabled")),
         "selected": str(daily_llm_runtime.get("selected") or "none"),
@@ -1382,16 +1430,26 @@ def _run_analyze_period(
         "main_error": str(daily_llm_runtime.get("main_error") or ""),
         "fallback_error": str(daily_llm_runtime.get("fallback_error") or ""),
     }
+    summary_payload["analysis_llm_runtime"] = {
+        "selected": str(analysis_llm_runtime.get("selected") or "none"),
+        "reason": str(analysis_llm_runtime.get("reason") or ""),
+        "main_ok": bool(analysis_llm_runtime.get("main_ok")),
+        "fallback_ok": bool(analysis_llm_runtime.get("fallback_ok")),
+        "main_model": str((analysis_llm_runtime.get("main") or {}).get("model") or ""),
+        "fallback_model": str((analysis_llm_runtime.get("fallback") or {}).get("model") or ""),
+    }
+    daily_step_artifacts_dir = run_dir / "daily_step_artifacts"
     daily_control_payload = _build_daily_control_sheet_payload(
         summary=summary_payload,
         period_deal_records=period_deal_records,
         amo_base_domain=_resolve_amo_base_domain_for_links(cfg=cfg),
         manager_allowlist=list(getattr(cfg, "daily_manager_allowlist", ()) or ()),
-        cfg=cfg,
+        cfg=analysis_cfg,
         logger=logger,
         backend_effective=effective_backend,
         style_source_excerpt=style_source_excerpt,
         llm_runtime=daily_llm_runtime,
+        daily_step_artifacts_dir=daily_step_artifacts_dir,
     )
     daily_rows = daily_control_payload.get("rows", []) if isinstance(daily_control_payload.get("rows"), list) else []
     summary_payload["daily_rows_total"] = len(daily_rows)
@@ -1405,9 +1463,11 @@ def _run_analyze_period(
     )
     daily_control_payload_path = run_dir / "daily_control_sheet_payload.json"
     _write_json_path(daily_control_payload_path, daily_control_payload)
-    write_cfg = cfg
+    if isinstance(daily_control_payload.get("daily_multistep_pipeline"), dict):
+        summary_payload["daily_multistep_pipeline"] = daily_control_payload.get("daily_multistep_pipeline")
+    write_cfg = analysis_cfg
     if not bool(daily_llm_runtime.get("selected") in {"main", "fallback"}):
-        write_cfg = replace(cfg, deal_analyzer_write_enabled=False)
+        write_cfg = replace(analysis_cfg, deal_analyzer_write_enabled=False)
         logger.warning(
             "daily writer forced to dry_run: reason=no_live_llm_runtime selected=%s runtime_reason=%s",
             str(daily_llm_runtime.get("selected") or "none"),
@@ -1418,7 +1478,7 @@ def _run_analyze_period(
         logger=logger,
         daily_payload=daily_control_payload,
     )
-    if cfg.deal_analyzer_write_enabled and not write_cfg.deal_analyzer_write_enabled:
+    if analysis_cfg.deal_analyzer_write_enabled and not write_cfg.deal_analyzer_write_enabled:
         meeting_queue_writer_status["error"] = "write_forced_dry_run_no_live_llm"
     summary_payload["daily_control_writer"] = meeting_queue_writer_status
     summary_payload["meeting_queue_writer"] = meeting_queue_writer_status
@@ -1731,128 +1791,22 @@ def _run_analyze_weekly(
 
 
 def _run_ollama_preflight(cfg: DealAnalyzerConfig, logger) -> bool:
-    client = OllamaClient(
-        base_url=cfg.ollama_base_url,
-        model=cfg.ollama_model,
-        timeout_seconds=cfg.ollama_timeout_seconds,
+    runtime = resolve_ollama_runtime(
+        cfg=cfg,
+        enabled=cfg.analyzer_backend in {"hybrid", "ollama"},
+        logger=logger,
+        log_prefix="ollama",
     )
-    probe_timeout = min(max(3, cfg.ollama_timeout_seconds), 12)
-    result = client.preflight(probe_timeout_seconds=probe_timeout)
-    if result.ok:
-        logger.info(
-            "ollama preflight success: base_url=%s model=%s timeout_seconds=%s probe_timeout_seconds=%s",
-            cfg.ollama_base_url,
-            cfg.ollama_model,
-            cfg.ollama_timeout_seconds,
-            probe_timeout,
-        )
-        return False
-
-    logger.warning(
-        "ollama preflight failed: base_url=%s model=%s timeout_seconds=%s probe_timeout_seconds=%s reason=%s; switching LLM layer to rules fallback",
-        cfg.ollama_base_url,
-        cfg.ollama_model,
-        cfg.ollama_timeout_seconds,
-        probe_timeout,
-        result.error,
-    )
-    return True
+    return str(runtime.get("selected") or "none") == "none"
 
 
 def _resolve_daily_llm_runtime(cfg: DealAnalyzerConfig, logger) -> dict[str, Any]:
-    runtime = {
-        "enabled": cfg.analyzer_backend in {"hybrid", "ollama"},
-        "main_ok": False,
-        "fallback_ok": False,
-        "main_error": "",
-        "fallback_error": "",
-        "selected": "none",
-        "reason": "",
-        "main": {
-            "base_url": cfg.ollama_base_url,
-            "model": cfg.ollama_model,
-            "timeout_seconds": cfg.ollama_timeout_seconds,
-        },
-        "fallback": {
-            "base_url": cfg.ollama_fallback_base_url or cfg.ollama_base_url,
-            "model": cfg.ollama_fallback_model or cfg.ollama_model,
-            "timeout_seconds": cfg.ollama_fallback_timeout_seconds or cfg.ollama_timeout_seconds,
-            "enabled": bool(cfg.ollama_fallback_enabled),
-        },
-    }
-    if not runtime["enabled"]:
-        runtime["reason"] = "llm_backend_not_requested"
-        return runtime
-
-    main_client = OllamaClient(
-        base_url=cfg.ollama_base_url,
-        model=cfg.ollama_model,
-        timeout_seconds=cfg.ollama_timeout_seconds,
+    return resolve_ollama_runtime(
+        cfg=cfg,
+        enabled=cfg.analyzer_backend in {"hybrid", "ollama"},
+        logger=logger,
+        log_prefix="daily llm",
     )
-    main_probe_timeout = min(max(3, int(cfg.ollama_timeout_seconds)), 12)
-    main_probe = main_client.preflight(probe_timeout_seconds=main_probe_timeout)
-    runtime["main_ok"] = bool(main_probe.ok)
-    runtime["main_error"] = str(main_probe.error or "")
-    if runtime["main_ok"]:
-        runtime["selected"] = "main"
-        runtime["reason"] = "main_ok"
-        logger.info(
-            "daily llm preflight success: selected=main base_url=%s model=%s timeout_seconds=%s",
-            cfg.ollama_base_url,
-            cfg.ollama_model,
-            cfg.ollama_timeout_seconds,
-        )
-
-    logger.warning(
-        "daily llm preflight failed: candidate=main base_url=%s model=%s reason=%s",
-        cfg.ollama_base_url,
-        cfg.ollama_model,
-        runtime["main_error"],
-    )
-    if not bool(cfg.ollama_fallback_enabled):
-        if not runtime["main_ok"]:
-            runtime["reason"] = "fallback_disabled"
-        return runtime
-
-    fb_base = str(cfg.ollama_fallback_base_url or cfg.ollama_base_url)
-    fb_model = str(cfg.ollama_fallback_model or cfg.ollama_model)
-    fb_timeout = int(cfg.ollama_fallback_timeout_seconds or cfg.ollama_timeout_seconds)
-    fb_client = OllamaClient(
-        base_url=fb_base,
-        model=fb_model,
-        timeout_seconds=fb_timeout,
-    )
-    fb_probe_timeout = min(max(3, fb_timeout), 12)
-    fb_probe = fb_client.preflight(probe_timeout_seconds=fb_probe_timeout)
-    runtime["fallback_ok"] = bool(fb_probe.ok)
-    runtime["fallback_error"] = str(fb_probe.error or "")
-    if runtime["fallback_ok"]:
-        if not runtime["main_ok"]:
-            runtime["selected"] = "fallback"
-            runtime["reason"] = "fallback_ok"
-            logger.warning(
-                "daily llm failover activated: selected=fallback base_url=%s model=%s timeout_seconds=%s",
-                fb_base,
-                fb_model,
-                fb_timeout,
-            )
-        else:
-            logger.info(
-                "daily llm fallback preflight success: model=%s base_url=%s timeout_seconds=%s (standby failover ready)",
-                fb_model,
-                fb_base,
-                fb_timeout,
-            )
-    else:
-        if not runtime["main_ok"]:
-            runtime["reason"] = "main_and_fallback_failed"
-        logger.warning(
-            "daily llm fallback preflight failed: base_url=%s model=%s reason=%s",
-            fb_base,
-            fb_model,
-            runtime["fallback_error"],
-        )
-    return runtime
 
 
 def _make_llm_client_from_runtime(runtime: dict[str, Any]) -> OllamaClient | None:
@@ -1919,6 +1873,70 @@ def _llm_chat_json_with_runtime(
                     if logger is not None:
                         logger.warning("%s repair failed on source=%s error=%s", log_prefix, source, exc2)
                     continue
+    return None, last_error
+
+
+def _llm_chat_text_with_runtime(
+    *,
+    runtime: dict[str, Any],
+    messages: list[dict[str, str]],
+    logger: Any | None = None,
+    log_prefix: str = "daily llm text",
+) -> tuple[str | None, str]:
+    selected = str(runtime.get("selected") or "none")
+    order: list[str] = []
+    if selected in {"main", "fallback"}:
+        order.append(selected)
+    if selected != "main" and bool(runtime.get("main_ok")):
+        order.append("main")
+    if selected != "fallback" and bool(runtime.get("fallback_ok")):
+        order.append("fallback")
+    if not order:
+        return None, "no_runtime"
+
+    last_error = "unknown_error"
+    for idx, source in enumerate(order):
+        cfg = runtime.get(source, {}) if isinstance(runtime.get(source), dict) else {}
+        base_url = str(cfg.get("base_url") or "").strip()
+        model = str(cfg.get("model") or "").strip()
+        timeout_seconds = int(cfg.get("timeout_seconds") or 60)
+        if not base_url or not model:
+            continue
+        payload = {
+            "model": model,
+            "messages": messages,
+            "stream": False,
+        }
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        endpoint = f"{base_url.rstrip('/')}/api/chat"
+        req = Request(
+            endpoint,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urlopen(req, timeout=timeout_seconds) as response:
+                raw = response.read().decode("utf-8", errors="replace")
+            envelope = json.loads(raw)
+            content = envelope.get("message", {}).get("content") if isinstance(envelope, dict) else ""
+            text = str(content or "").strip()
+            if text:
+                return text, source
+            last_error = "empty_content"
+        except HTTPError as exc:
+            preview = ""
+            try:
+                preview = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                preview = ""
+            last_error = f"http_{exc.code}:{preview[:200]}"
+            if logger is not None:
+                logger.warning("%s failed on source=%s attempt=%s error=%s", log_prefix, source, idx + 1, last_error)
+        except (URLError, TimeoutError, json.JSONDecodeError, RuntimeError) as exc:
+            last_error = str(exc)
+            if logger is not None:
+                logger.warning("%s failed on source=%s attempt=%s error=%s", log_prefix, source, idx + 1, exc)
     return None, last_error
 
 
@@ -2764,8 +2782,8 @@ def _build_dial_discipline_signals(snapshot: dict[str, Any], *, status_name: str
 
 
 def _merge_deal_company_tags(*, deal_tags: list[Any], company_tags: list[Any]) -> tuple[list[str], list[str], list[str]]:
-    normalized_deal_tags = {str(x).strip() for x in deal_tags if str(x).strip()}
-    normalized_company_tags = {str(x).strip() for x in company_tags if str(x).strip()}
+    normalized_deal_tags = set(normalize_tag_values(deal_tags))
+    normalized_company_tags = set(normalize_tag_values(company_tags))
     propagated_company_tags = sorted(x for x in normalized_company_tags if x not in normalized_deal_tags)
     merged_tags = sorted(normalized_deal_tags.union(normalized_company_tags))
     return merged_tags, sorted(normalized_company_tags), propagated_company_tags
@@ -4505,6 +4523,7 @@ def _build_daily_control_sheet_payload(
     backend_effective: str | None = None,
     style_source_excerpt: str = "",
     llm_runtime: dict[str, Any] | None = None,
+    daily_step_artifacts_dir: Path | None = None,
 ) -> dict[str, Any]:
     records = [x for x in period_deal_records if isinstance(x, dict) and x.get("score") is not None]
     allowlist = _resolve_daily_manager_allowlist(manager_allowlist)
@@ -4536,6 +4555,8 @@ def _build_daily_control_sheet_payload(
         )
 
     rows: list[dict[str, Any]] = []
+    step_failures: list[dict[str, Any]] = []
+    step_artifact_paths: list[str] = []
     effect_forecast_fallback_logged = False
     used_deal_ids_by_manager: dict[str, set[str]] = {m: set() for m in grouped}
     for control_day in control_days:
@@ -4592,7 +4613,8 @@ def _build_daily_control_sheet_payload(
             focus = _top_product_focus(package_items)
             quality_mix = _build_base_mix_text(package_items)
             selection_reason = _daily_selection_reason(package_items)
-            analysis_mode = _daily_analysis_mode(package_items)
+            case_profile = classify_daily_case(role=role, items=package_items)
+            analysis_mode = case_profile.mode
             repeated_dead_redial_count = sum(int(x.get("repeated_dead_redial_count", 0) or 0) for x in package_items if isinstance(x, dict))
             repeated_dead_redial_day_flag = bool(any(bool(x.get("repeated_dead_redial_day_flag")) for x in package_items if isinstance(x, dict)))
             same_time_redial_pattern_flag = bool(any(bool(x.get("same_time_redial_pattern_flag")) for x in package_items if isinstance(x, dict)))
@@ -4601,6 +4623,8 @@ def _build_daily_control_sheet_payload(
             has_meaningful_dial_pattern = repeated_dead_redial_day_flag or same_time_redial_pattern_flag or numbers_not_fully_covered_flag
             allow_thin_for_local_debug = cfg is None and backend_effective is None
             if not has_usable_negotiation and not has_meaningful_dial_pattern and not allow_thin_for_local_debug:
+                continue
+            if not mode_is_writable(case_profile) and not allow_thin_for_local_debug:
                 continue
             transcript_usability_score = round(
                 sum(_transcript_usability_score(x) for x in package_items) / max(1, len(package_items))
@@ -4687,44 +4711,107 @@ def _build_daily_control_sheet_payload(
                 "Ожидаемый эффект - количество": fallback_expected_qty,
                 "Ожидаемый эффект - качество": fallback_expected_quality,
             }
-            llm_text_columns = _generate_daily_table_text_columns(
-                cfg=cfg,
-                logger=logger,
-                backend_effective=backend_effective,
-                manager=manager,
-                role=role,
-                control_day=control_day,
-                period_start=period_start,
-                period_end=period_end,
-                package_items=package_items,
-                links=links,
-                focus=focus,
-                base_mix=quality_mix,
-                avg_score=avg_score,
-                criticality=criticality,
-                selection_reason=selection_reason,
-                growth_candidates=growth_compact,
-                fallback_columns=fallback_columns,
-                effect_forecast=forecast,
-                style_source_excerpt=style_source_excerpt,
-                llm_runtime=llm_runtime,
-            )
+            llm_required = cfg is not None and cfg.analyzer_backend in {"hybrid", "ollama"}
+            llm_text_columns: dict[str, Any] = {}
+            multistep = None
+            if llm_required:
+                factual_payload = _build_daily_table_factual_payload(
+                    cfg=cfg,
+                    manager=manager,
+                    role=role,
+                    control_day=control_day,
+                    period_start=period_start,
+                    period_end=period_end,
+                    package_items=package_items,
+                    links=links,
+                    focus=focus,
+                    base_mix=quality_mix,
+                    avg_score=avg_score,
+                    criticality=criticality,
+                    selection_reason=selection_reason,
+                    growth_candidates=growth_compact,
+                    fallback_columns=fallback_columns,
+                    effect_forecast=forecast,
+                    case_policy=mode_prompt_policy(case_profile),
+                )
+                multistep = _run_daily_multistep_pipeline(
+                    cfg=cfg,
+                    logger=logger,
+                    llm_runtime=llm_runtime,
+                    manager=manager,
+                    control_day=control_day,
+                    package_items=package_items,
+                    factual_payload=factual_payload,
+                    effect_forecast=forecast,
+                    style_source_excerpt=style_source_excerpt,
+                    case_policy=mode_prompt_policy(case_profile),
+                    debug_root=daily_step_artifacts_dir,
+                )
+                if multistep.get("ok"):
+                    llm_text_columns = dict(multistep.get("columns") or {})
+                    llm_text_columns["_llm_text_ready"] = True
+                    llm_text_columns["_style_layer_applied"] = True
+                    llm_text_columns["_content_layer_applied"] = True
+                    llm_text_columns["_pipeline_source_of_truth"] = str(multistep.get("source_of_truth") or "styled_blocks")
+                    llm_text_columns["_pipeline_assembler_only"] = bool(multistep.get("assembler_only"))
+                    artifacts = multistep.get("step_artifacts") if isinstance(multistep.get("step_artifacts"), dict) else {}
+                    step_artifact_paths.extend(str(v) for v in artifacts.values() if str(v).strip())
+                else:
+                    fail = {
+                        "manager": manager,
+                        "control_day": control_day,
+                        "failed_step": str(multistep.get("failed_step") or "unknown"),
+                        "error": str(multistep.get("error") or ""),
+                        "deal_ids": [x.get("deal_id") for x in package_items if isinstance(x, dict)],
+                        "step_artifacts": multistep.get("step_artifacts") if isinstance(multistep.get("step_artifacts"), dict) else {},
+                    }
+                    step_failures.append(fail)
+                    if logger is not None:
+                        logger.warning(
+                            "daily multistep pipeline failed: manager=%s day=%s step=%s error=%s",
+                            manager,
+                            control_day,
+                            fail["failed_step"],
+                            fail["error"],
+                        )
+                    continue
+            else:
+                # Legacy rules mode for local/tests only.
+                llm_text_columns = _generate_daily_table_text_columns(
+                    cfg=cfg,
+                    logger=logger,
+                    backend_effective=backend_effective,
+                    manager=manager,
+                    role=role,
+                    control_day=control_day,
+                    period_start=period_start,
+                    period_end=period_end,
+                    package_items=package_items,
+                    links=links,
+                    focus=focus,
+                    base_mix=quality_mix,
+                    avg_score=avg_score,
+                    criticality=criticality,
+                    selection_reason=selection_reason,
+                    growth_candidates=growth_compact,
+                    fallback_columns=fallback_columns,
+                    effect_forecast=forecast,
+                    style_source_excerpt=style_source_excerpt,
+                    llm_runtime=llm_runtime,
+                    case_policy=mode_prompt_policy(case_profile),
+                )
+
             text_generation_map = _build_text_generation_source_per_column(
                 llm_columns=llm_text_columns,
                 fallback_columns=fallback_columns,
             )
 
             llm_ready = bool(llm_text_columns.get("_llm_text_ready"))
-            llm_required = cfg is not None and (backend_effective or cfg.analyzer_backend) in {"hybrid", "ollama"}
             if llm_required and not llm_ready:
                 continue
             key_takeaway_text = llm_text_columns.get("Ключевой вывод", "") if llm_ready else fallback_key_takeaway
             strong_text = llm_text_columns.get("Сильные стороны", "") if llm_ready else fallback_strong_text
-            growth_text = (
-                llm_text_columns.get("Зоны роста", "")
-                if llm_ready
-                else _daily_user_text("; ".join(str(x) for x in growth_compact))
-            )
+            growth_text = llm_text_columns.get("Зоны роста", "") if llm_ready else _daily_user_text("; ".join(str(x) for x in growth_compact))
             why_important_text = llm_text_columns.get("Почему это важно", "") if llm_ready else fallback_why_important
             reinforce_text = llm_text_columns.get("Что закрепить", "") if llm_ready else fallback_reinforce
             fix_text = llm_text_columns.get("Что исправить", "") if llm_ready else fallback_fix
@@ -4756,7 +4843,13 @@ def _build_daily_control_sheet_payload(
                     "Оценка 0-100": avg_score if avg_score is not None else "",
                     "Критичность": criticality,
                     "selection_reason": selection_reason,
-                    "daily_analysis_mode": analysis_mode,
+                    "daily_analysis_mode": (
+                        "dial_discipline_analysis"
+                        if analysis_mode == "redial_discipline_analysis"
+                        else analysis_mode
+                    ),
+                    "daily_analysis_mode_reason": case_profile.mode_reason,
+                    "daily_analysis_mode_confidence": case_profile.confidence,
                     "daily_selection_reason": selection_reason,
                     "daily_package_quality_label": package_quality,
                     "daily_package_has_forced_fallback": bool(forced_fallback),
@@ -4780,6 +4873,8 @@ def _build_daily_control_sheet_payload(
                     "numbers_not_fully_covered_flag": numbers_not_fully_covered_flag,
                     "style_layer_applied": bool(llm_text_columns.get("_style_layer_applied")),
                     "llm_text_ready": llm_ready,
+                    "daily_multistep_source_of_truth": str(llm_text_columns.get("_pipeline_source_of_truth") or ""),
+                    "daily_multistep_assembler_only": bool(llm_text_columns.get("_pipeline_assembler_only")),
                     "text_generation_source_per_column": text_generation_map,
                     "transcript_quality_retry_used": any(
                         bool(x.get("transcript_quality_retry_used"))
@@ -4811,6 +4906,11 @@ def _build_daily_control_sheet_payload(
                             "skip_for_daily_reason": c.get("skip_for_daily_reason", ""),
                             "transcript_usability_label": c.get("transcript_usability_label", ""),
                             "transcript_usability_score_final": c.get("transcript_usability_score_final", ""),
+                            "daily_tier": c.get("_daily_tier", ""),
+                            "call_role_signal": c.get("_call_role_signal", ""),
+                            "autoanswer_flag": c.get("_autoanswer_flag", False),
+                            "redial_flag": c.get("_redial_flag", False),
+                            "usable_flag": c.get("_usable_flag", False),
                             "evidence_richness_score": c.get("_evidence_richness_score", ""),
                             "funnel_relevance_score": c.get("_funnel_relevance_score", ""),
                             "management_value_score": c.get("_management_value_score", ""),
@@ -4836,6 +4936,13 @@ def _build_daily_control_sheet_payload(
         "columns": list(DAILY_CONTROL_COLUMNS),
         "rows": rows,
         "rows_count": len(rows),
+        "daily_multistep_pipeline": {
+            "enabled": True,
+            "step_failures_count": len(step_failures),
+            "step_failures": step_failures,
+            "step_artifacts_count": len(step_artifact_paths),
+            "step_artifacts": step_artifact_paths,
+        },
     }
 
 
@@ -4897,6 +5004,287 @@ def _load_daily_style_source_excerpt(*, logger: Any | None, cfg: DealAnalyzerCon
     return " ".join(chunks)[:5000]
 
 
+def _safe_slug(value: str) -> str:
+    text = "".join(ch if ch.isalnum() else "_" for ch in str(value or ""))
+    text = re.sub(r"_+", "_", text).strip("_")
+    return text or "unknown"
+
+
+def _write_step_artifact(path: Path, payload: dict[str, Any] | list[Any] | str) -> str:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(payload, str):
+        path.write_text(payload, encoding="utf-8")
+    else:
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return str(path)
+
+
+def _build_daily_primary_messages(*, factual_payload: dict[str, Any]) -> list[dict[str, str]]:
+    system = (
+        "Ты сильный руководитель продаж. Разбери кейс живым рабочим языком, без канцелярита. "
+        "Опирайся только на факты из входа. Не выдумывай."
+    )
+    user = (
+        "Сделай свободный разбор кейса (без JSON), коротко и предметно:\n"
+        "1) что реально произошло в коммуникации,\n"
+        "2) что было хорошо,\n"
+        "3) где недожали,\n"
+        "4) какой конкретный рычаг правки.\n\n"
+        f"FACTS:\n{json.dumps(factual_payload, ensure_ascii=False, indent=2)}"
+    )
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def _build_daily_effect_messages(
+    *,
+    factual_payload: dict[str, Any],
+    free_text: str,
+    effect_forecast: dict[str, Any],
+) -> list[dict[str, str]]:
+    system = (
+        "Ты дополняешь готовый разбор управленческим смыслом. Не переписывай разбор заново, "
+        "не меняй факты, не выдумывай."
+    )
+    user = (
+        "Добавь второй слой:\n"
+        "- зачем сотруднику закрыть эти зоны,\n"
+        "- что станет лучше по качеству,\n"
+        "- какой осторожный эффект в количестве (в штуках за неделю).\n\n"
+        f"FREE_ANALYSIS:\n{free_text}\n\n"
+        f"FORECAST_HINT:\n{json.dumps(effect_forecast, ensure_ascii=False, indent=2)}\n\n"
+        f"FACTS:\n{json.dumps(factual_payload, ensure_ascii=False, indent=2)}"
+    )
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def _build_daily_block_split_messages(
+    *,
+    free_text: str,
+    effect_text: str,
+    case_policy: dict[str, Any],
+) -> list[dict[str, str]]:
+    blocked = case_policy.get("blocked_topics", []) if isinstance(case_policy, dict) else []
+    allowed = case_policy.get("allowed_topics", []) if isinstance(case_policy, dict) else []
+    required_headers = "\n".join(f"### {k}" for k in DAILY_BLOCK_KEYS)
+    system = (
+        "Разложи готовый смысл по блокам. Не анализируй заново, не добавляй новые сущности, "
+        "не уходи в CRM hygiene по умолчанию."
+    )
+    user = (
+        "Нужен markdown только с такими заголовками и в таком формате:\n"
+        f"{required_headers}\n\n"
+        "Жесткие правила:\n"
+        "- сохранить смысл из входного анализа;\n"
+        "- не добавлять новые факты;\n"
+        f"- запрещенные темы: {', '.join(str(x) for x in blocked) or '-'};\n"
+        f"- разрешенные акценты: {', '.join(str(x) for x in allowed) or '-'}.\n\n"
+        f"PRIMARY_ANALYSIS:\n{free_text}\n\nEFFECT_LAYER:\n{effect_text}"
+    )
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def _build_daily_style_messages(
+    *,
+    blocks_markdown: str,
+    style_source_excerpt: str,
+) -> list[dict[str, str]]:
+    style_hint = style_source_excerpt[:3000] if style_source_excerpt else "(style source unavailable)"
+    system = (
+        "Ты редактор управленческого текста. Сделай только style rewrite под рабочий живой лексикон. "
+        "Не меняй факты и смысл, не добавляй новые сущности."
+    )
+    user = (
+        "Перепиши стиль блоков ниже, сохрани те же заголовки `### key` и тот же смысл.\n"
+        "Без JSON, только markdown блоки.\n\n"
+        f"Style source:\n{style_hint}\n\n"
+        f"BLOCKS:\n{blocks_markdown}"
+    )
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def _run_daily_multistep_pipeline(
+    *,
+    cfg: DealAnalyzerConfig | None,
+    logger: Any | None,
+    llm_runtime: dict[str, Any] | None,
+    manager: str,
+    control_day: str,
+    package_items: list[dict[str, Any]],
+    factual_payload: dict[str, Any],
+    effect_forecast: dict[str, Any],
+    style_source_excerpt: str,
+    case_policy: dict[str, Any],
+    debug_root: Path | None,
+) -> dict[str, Any]:
+    runtime = llm_runtime or {}
+    if cfg is None or not debug_root:
+        return {"ok": False, "failed_step": "pipeline_not_configured", "error": "missing_cfg_or_debug_root"}
+    selected = str(runtime.get("selected") or "none")
+    if selected not in {"main", "fallback"}:
+        return {"ok": False, "failed_step": "runtime", "error": f"selected_runtime={selected}"}
+
+    manager_slug = _safe_slug(manager)
+    day_slug = _safe_slug(control_day)
+    run_key = f"{control_day}_{manager}_{len(package_items)}"
+    run_slug = _safe_slug(run_key)[:80]
+    row_dir = debug_root / f"{day_slug}__{manager_slug}__{run_slug}"
+    step_artifacts: dict[str, str] = {}
+    source_by_step: dict[str, str] = {}
+
+    try:
+        # step 1: candidate selection
+        step1 = {
+            "step": "candidate_selection",
+            "manager": manager,
+            "control_day": control_day,
+            "selected_count": len(package_items),
+            "selected_deals": [
+                {
+                    "deal_id": item.get("deal_id"),
+                    "deal_name": item.get("deal_name", ""),
+                    "daily_selection_rank": item.get("_daily_selection_rank", ""),
+                    "daily_selection_reason": item.get("_daily_selection_reason", ""),
+                    "skip_for_daily_reason": item.get("skip_for_daily_reason", ""),
+                    "transcript_usability_label": item.get("transcript_usability_label", ""),
+                }
+                for item in package_items
+                if isinstance(item, dict)
+            ],
+            "skipped_candidates": (
+                package_items[0].get("_daily_skipped_candidates", [])
+                if package_items and isinstance(package_items[0], dict)
+                else []
+            ),
+        }
+        step_artifacts["1_candidate_selection"] = _write_step_artifact(row_dir / "01_candidate_selection.json", step1)
+
+        # step 2: primary free-form analysis
+        messages_step2 = _build_daily_primary_messages(factual_payload=factual_payload)
+        text2, source2 = _llm_chat_text_with_runtime(
+            runtime=runtime,
+            messages=messages_step2,
+            logger=logger,
+            log_prefix=f"daily step2 primary manager={manager} day={control_day}",
+        )
+        if not text2:
+            return {"ok": False, "failed_step": "primary_free_form", "error": source2, "step_artifacts": step_artifacts}
+        source_by_step["primary_free_form"] = source2
+        step_artifacts["2_primary_free_form"] = _write_step_artifact(row_dir / "02_primary_free_form.md", text2)
+
+        # step 3: effect/motivation layer
+        messages_step3 = _build_daily_effect_messages(
+            factual_payload=factual_payload,
+            free_text=text2,
+            effect_forecast=effect_forecast,
+        )
+        text3, source3 = _llm_chat_text_with_runtime(
+            runtime=runtime,
+            messages=messages_step3,
+            logger=logger,
+            log_prefix=f"daily step3 effect manager={manager} day={control_day}",
+        )
+        if not text3:
+            return {"ok": False, "failed_step": "effect_layer", "error": source3, "step_artifacts": step_artifacts}
+        source_by_step["effect_layer"] = source3
+        step_artifacts["3_effect_layer"] = _write_step_artifact(row_dir / "03_effect_layer.md", text3)
+
+        # step 4: block split
+        messages_step4 = _build_daily_block_split_messages(
+            free_text=text2,
+            effect_text=text3,
+            case_policy=case_policy,
+        )
+        text4, source4 = _llm_chat_text_with_runtime(
+            runtime=runtime,
+            messages=messages_step4,
+            logger=logger,
+            log_prefix=f"daily step4 block_split manager={manager} day={control_day}",
+        )
+        if not text4:
+            return {"ok": False, "failed_step": "block_split", "error": source4, "step_artifacts": step_artifacts}
+        source_by_step["block_split"] = source4
+        step_artifacts["4_block_split_md"] = _write_step_artifact(row_dir / "04_block_split.md", text4)
+        blocks = parse_blocks_markdown(text4)
+        missing_step4 = validate_blocks(blocks)
+        step_artifacts["4_block_split_json"] = _write_step_artifact(
+            row_dir / "04_block_split.json",
+            {"blocks": blocks, "missing_blocks": missing_step4},
+        )
+        if missing_step4:
+            return {
+                "ok": False,
+                "failed_step": "block_split_validation",
+                "error": f"missing_blocks={','.join(missing_step4)}",
+                "step_artifacts": step_artifacts,
+            }
+
+        # step 5: style rewrite
+        blocks_md = "\n\n".join([f"### {k}\n{blocks.get(k, '')}" for k in DAILY_BLOCK_KEYS]).strip()
+        messages_step5 = _build_daily_style_messages(
+            blocks_markdown=blocks_md,
+            style_source_excerpt=style_source_excerpt,
+        )
+        text5, source5 = _llm_chat_text_with_runtime(
+            runtime=runtime,
+            messages=messages_step5,
+            logger=logger,
+            log_prefix=f"daily step5 style manager={manager} day={control_day}",
+        )
+        if not text5:
+            return {"ok": False, "failed_step": "style_rewrite", "error": source5, "step_artifacts": step_artifacts}
+        source_by_step["style_rewrite"] = source5
+        step_artifacts["5_style_rewrite_md"] = _write_step_artifact(row_dir / "05_style_rewrite.md", text5)
+        styled_blocks = parse_blocks_markdown(text5)
+        missing_step5 = validate_blocks(styled_blocks)
+        step_artifacts["5_style_rewrite_json"] = _write_step_artifact(
+            row_dir / "05_style_rewrite.json",
+            {"styled_blocks": styled_blocks, "missing_blocks": missing_step5},
+        )
+        if missing_step5:
+            return {
+                "ok": False,
+                "failed_step": "style_validation",
+                "error": f"missing_blocks={','.join(missing_step5)}",
+                "step_artifacts": step_artifacts,
+            }
+
+        # step 6: final JSON assembler
+        columns = assemble_writer_columns(styled_blocks)
+        step6 = {
+            "source_of_truth": "styled_blocks",
+            "assembler_only": True,
+            "columns": columns,
+            "blocks": styled_blocks,
+        }
+        step_artifacts["6_final_assemble"] = _write_step_artifact(row_dir / "06_final_assemble.json", step6)
+
+        # step 7: writer is handled outside, here we only mark readiness
+        step_artifacts["7_writer_ready"] = _write_step_artifact(
+            row_dir / "07_writer_ready.json",
+            {
+                "ready": True,
+                "source_of_truth": "styled_blocks",
+                "assembler_only": True,
+            },
+        )
+        return {
+            "ok": True,
+            "columns": columns,
+            "step_artifacts": step_artifacts,
+            "source_by_step": source_by_step,
+            "source_of_truth": "styled_blocks",
+            "assembler_only": True,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "failed_step": "unexpected",
+            "error": str(exc),
+            "step_artifacts": step_artifacts,
+            "source_by_step": source_by_step,
+        }
+
+
 def _generate_daily_table_text_columns(
     *,
     cfg: DealAnalyzerConfig | None,
@@ -4919,6 +5307,7 @@ def _generate_daily_table_text_columns(
     effect_forecast: dict[str, Any],
     style_source_excerpt: str,
     llm_runtime: dict[str, Any] | None = None,
+    case_policy: dict[str, Any] | None = None,
 ) -> dict[str, str]:
     if cfg is None:
         out = dict(fallback_columns)
@@ -4952,6 +5341,7 @@ def _generate_daily_table_text_columns(
         growth_candidates=growth_candidates,
         fallback_columns=fallback_columns,
         effect_forecast=effect_forecast,
+        case_policy=case_policy or {},
     )
     messages = build_daily_table_messages(
         factual_payload=factual_payload,
@@ -4983,6 +5373,7 @@ def _generate_daily_table_text_columns(
         payload=payload if isinstance(payload, dict) else {},
         fallback=fallback_columns,
         role=role,
+        case_policy=case_policy or {},
     )
     rewritten, style_applied = _style_rewrite_daily_columns(
         cfg=cfg,
@@ -5148,6 +5539,7 @@ def _build_daily_table_factual_payload(
     growth_candidates: list[str],
     fallback_columns: dict[str, str],
     effect_forecast: dict[str, Any],
+    case_policy: dict[str, Any],
 ) -> dict[str, Any]:
     short_deals: list[dict[str, Any]] = []
     for item in package_items[:12]:
@@ -5200,6 +5592,7 @@ def _build_daily_table_factual_payload(
         "deals": short_deals,
         "growth_candidates": growth_candidates,
         "effect_forecast_facts": effect_forecast,
+        "case_policy": case_policy,
         "role_forbidden_topics": role_forbidden_topics,
         "sales_toolbox_modules": sales_toolbox_modules,
         "product_reference_urls": product_reference_urls,
@@ -5233,7 +5626,13 @@ def _daily_analysis_mode(items: list[dict[str, Any]]) -> str:
     return "none"
 
 
-def _sanitize_daily_llm_columns(*, payload: dict[str, Any], fallback: dict[str, str], role: str) -> dict[str, str]:
+def _sanitize_daily_llm_columns(
+    *,
+    payload: dict[str, Any],
+    fallback: dict[str, str],
+    role: str,
+    case_policy: dict[str, Any] | None = None,
+) -> dict[str, str]:
     mapped = {
         "Ключевой вывод": _daily_user_text(str(payload.get("key_takeaway") or "")),
         "Сильные стороны": _daily_user_text(str(payload.get("strong_sides") or "")),
@@ -5261,16 +5660,36 @@ def _sanitize_daily_llm_columns(*, payload: dict[str, Any], fallback: dict[str, 
 
     mapped["Что донес сотруднику"] = _sanitize_daily_coaching_text(
         value=mapped["Что донес сотруднику"],
-        fallback="",
+        fallback=str(fallback.get("Что донес сотруднику") or ""),
     )
     mapped["Ожидаемый эффект - количество"] = _sanitize_daily_expected_quantity(
         value=mapped["Ожидаемый эффект - количество"],
-        fallback="",
+        fallback=str(fallback.get("Ожидаемый эффект - количество") or ""),
     )
     mapped["Ожидаемый эффект - качество"] = _sanitize_daily_expected_quality(
         value=mapped["Ожидаемый эффект - качество"],
-        fallback="",
+        fallback=str(fallback.get("Ожидаемый эффект - качество") or ""),
     )
+    banned_topics = case_policy.get("banned_topics", []) if isinstance(case_policy, dict) else []
+    if banned_topics:
+        # apply explicit policy bans verbatim (for stricter mode-specific contract)
+        for key in (
+            "Ключевой вывод",
+            "Сильные стороны",
+            "Зоны роста",
+            "Почему это важно",
+            "Что закрепить",
+            "Что исправить",
+            "Что донес сотруднику",
+        ):
+            text = " ".join(str(mapped.get(key) or "").split()).strip()
+            low = text.lower()
+            for token in banned_topics:
+                token_low = str(token or "").strip().lower()
+                if token_low and token_low in low:
+                    text = re.sub(re.escape(token_low), "", text, flags=re.IGNORECASE)
+                    low = text.lower()
+            mapped[key] = " ".join(text.split()).strip(" .;,-")
     return mapped
 
 
@@ -5350,6 +5769,8 @@ def _sanitize_daily_expected_quantity(*, value: str, fallback: str) -> str:
     if "этап" in low and not any(ch.isdigit() for ch in low):
         return fallback
     if re.fullmatch(r"[+\-]?\d+(?:-\d+)?", low):
+        return fallback
+    if re.search(r"\+?0(?:[.,]0+)?\b", low):
         return fallback
     if not any(token in low for token in ("+1", "+2", "1-2", "-1", "1 дополнитель")) and not any(
         ch.isdigit() for ch in low
@@ -5645,59 +6066,7 @@ def _top_product_focus(records: list[dict[str, Any]]) -> str:
 
 
 def _build_base_mix_text(records: list[dict[str, Any]]) -> str:
-    segments: Counter[str] = Counter()
-    for item in records:
-        # 1) deal tags
-        for key in ("tags",):
-            values = item.get(key)
-            if not isinstance(values, list):
-                continue
-            for raw in values:
-                text = " ".join(str(raw or "").split()).strip()
-                if text:
-                    segments[text] += 1
-        # 2) company tags
-        for key in ("company_tags",):
-            values = item.get(key)
-            if not isinstance(values, list):
-                continue
-            for raw in values:
-                text = " ".join(str(raw or "").split()).strip()
-                if text:
-                    segments[text] += 1
-        # 3) source / utm / pipeline hints
-        for key in ("source_values",):
-            values = item.get(key)
-            if not isinstance(values, list):
-                continue
-            for raw in values:
-                text = " ".join(str(raw or "").split()).strip()
-                if text:
-                    segments[text] += 1
-        # 4) comments / notes / okved hints
-        notes = item.get("notes_summary_raw") if isinstance(item.get("notes_summary_raw"), list) else []
-        for note in notes:
-            if not isinstance(note, dict):
-                continue
-            raw = str(note.get("text") or "").strip().lower()
-            if "оквэд" in raw:
-                segments["ОКВЭД/сегмент из комментариев"] += 1
-            if "тендер" in raw:
-                segments["тендерные"] += 1
-            if "закуп" in raw:
-                segments["закупки"] += 1
-        for key in ("company_comment", "contact_comment"):
-            raw_comment = str(item.get(key) or "").strip().lower()
-            if "оквэд" in raw_comment:
-                segments["ОКВЭД/сегмент из комментариев"] += 1
-            if "тендер" in raw_comment:
-                segments["тендерные"] += 1
-            if "закуп" in raw_comment:
-                segments["закупки"] += 1
-    if segments:
-        top = [name for name, _ in segments.most_common(3)]
-        return "; ".join(top)
-    return "солянка"
+    return build_base_mix_text_priority(records)
 
 
 def _manager_role_label(manager_name: str) -> str:
@@ -5847,10 +6216,18 @@ def _select_daily_package_records(
         carry_penalty = 0 if (dt and dt.date() == day) else 1
         tie_id = did
         tier, tier_reason = _daily_candidate_tier(item, transcript_score=transcript_score, evidence_score=evidence_score)
-        key = (tier, -funnel_score, -evidence_score, -mgmt, -freshness, carry_penalty, tie_id)
+        key = (tier, -transcript_score, -evidence_score, -funnel_score, -mgmt, -freshness, carry_penalty, tie_id)
         ranked.append((key, item, tier_reason))
 
     ranked.sort(key=lambda x: x[0])
+    has_real_conversation_in_pool = False
+    for _, item, _ in ranked:
+        transcript_score = _transcript_usability_score(item)
+        role_signal = _call_role_signal(item)
+        if _is_real_conversation_candidate(item, role_signal=role_signal, transcript_score=transcript_score):
+            has_real_conversation_in_pool = True
+            break
+
     prefiltered: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
     for idx, (_, item, tier_reason) in enumerate(ranked, start=1):
@@ -5860,17 +6237,32 @@ def _select_daily_package_records(
         management_score = _management_value_rank(item)
         funnel_score = _funnel_relevance_score(item, stage_priority_weights=stage_priority_weights)
         role_signal = _call_role_signal(item)
+        tier_num, _ = _daily_candidate_tier(
+            item,
+            transcript_score=transcript_score,
+            evidence_score=evidence_score,
+        )
+        autoanswer_flag = _is_autoanswer_like_candidate(item)
+        redial_flag = bool(item.get("repeated_dead_redial_day_flag")) or int(item.get("repeated_dead_redial_count", 0) or 0) > 0
+        usable_flag = _is_real_conversation_candidate(item, role_signal=role_signal, transcript_score=transcript_score)
         skip_reason = ""
         if (
             transcript_label in {"weak", "noisy", "empty"}
             and evidence_score < 5
-            and role_signal not in {"history_pattern", "secretary"}
+            and role_signal not in {"history_pattern", "secretary", "supplier_inbound", "warm_inbound"}
             and int(item.get("call_history_pattern_score", 0) or 0) < 45
         ):
             skip_reason = "weak_transcript_and_thin_crm"
+        if not skip_reason and has_real_conversation_in_pool and autoanswer_flag and tier_num >= 5:
+            skip_reason = "autoanswer_low_priority_when_real_conversation_exists"
         enriched = dict(item)
         enriched["_daily_selection_rank"] = idx
         enriched["_daily_selection_reason"] = tier_reason
+        enriched["_daily_tier"] = tier_num
+        enriched["_call_role_signal"] = role_signal
+        enriched["_autoanswer_flag"] = bool(autoanswer_flag)
+        enriched["_redial_flag"] = bool(redial_flag)
+        enriched["_usable_flag"] = bool(usable_flag)
         enriched["_transcript_usability_score"] = transcript_score
         enriched["_evidence_richness_score"] = evidence_score
         enriched["_funnel_relevance_score"] = funnel_score
@@ -5925,7 +6317,7 @@ def _select_daily_package_records(
                 candidate.setdefault("llm_call_analysis_viability_reason", "")
 
     selected: list[dict[str, Any]] = []
-    tier_selected: dict[int, int] = {0: 0, 1: 0, 2: 0}
+    tier_selected: dict[int, int] = {}
     seen: set[str] = set()
     for item in prefiltered:
         did = str(item.get("deal_id") or "")
@@ -5936,8 +6328,8 @@ def _select_daily_package_records(
             transcript_score=_transcript_usability_score(item),
             evidence_score=_evidence_richness_score(item),
         )
-        # Weak tier is used only as honest fallback when no richer candidates are available.
-        if tier_num == 2 and (tier_selected[0] > 0 or tier_selected[1] > 0):
+        # Autoanswer/no-answer tiers are only honest fallback when richer modes are unavailable.
+        if tier_num >= 5 and any(v > 0 for k, v in tier_selected.items() if k <= 4):
             continue
         if did:
             seen.add(did)
@@ -5951,7 +6343,9 @@ def _select_daily_package_records(
         # Honest fallback: only when we still have nothing and there is at least some meaningful call-history pattern.
         if selected:
             break
-        if int(item.get("call_history_pattern_score", 0) or 0) < 45 and _call_role_signal(item) not in {"secretary", "history_pattern"}:
+        if has_real_conversation_in_pool:
+            continue
+        if int(item.get("call_history_pattern_score", 0) or 0) < 45 and _call_role_signal(item) not in {"secretary", "history_pattern", "supplier_inbound", "warm_inbound"}:
             continue
         thin = dict(item)
         thin["skip_for_daily_reason"] = str(thin.get("skip_for_daily_reason") or "fallback_fill")
@@ -5964,6 +6358,11 @@ def _select_daily_package_records(
                 "transcript_usability_label": str(x.get("transcript_usability_label") or ""),
                 "transcript_usability_score_final": int(x.get("transcript_usability_score_final", 0) or 0),
                 "evidence_richness_score": int(x.get("_evidence_richness_score", 0) or 0),
+                "daily_tier": int(x.get("_daily_tier", 0) or 0),
+                "call_role_signal": str(x.get("_call_role_signal", "") or ""),
+                "autoanswer_flag": bool(x.get("_autoanswer_flag")),
+                "redial_flag": bool(x.get("_redial_flag")),
+                "usable_flag": bool(x.get("_usable_flag")),
                 "llm_daily_rank": x.get("llm_daily_rank", ""),
                 "llm_daily_rank_reason": str(x.get("llm_daily_rank_reason") or ""),
             }
@@ -6175,6 +6574,8 @@ def _management_value_rank(item: dict[str, Any]) -> int:
 def _transcript_usability_score(item: dict[str, Any]) -> int:
     if not isinstance(item, dict):
         return 0
+    if _is_autoanswer_like_candidate(item):
+        return 0
     score_from_signal = item.get("transcript_usability_score_final")
     try:
         if score_from_signal is not None:
@@ -6189,6 +6590,8 @@ def _transcript_usability_score(item: dict[str, Any]) -> int:
         pass
     label = str(item.get("transcript_usability_label") or "").strip().lower()
     if label == "usable":
+        if _is_autoanswer_like_candidate(item):
+            return 1
         return 3
     if label in {"weak", "noisy"}:
         return 1
@@ -6200,12 +6603,80 @@ def _transcript_usability_score(item: dict[str, Any]) -> int:
     if not available and not excerpt and not call_summary:
         return 0
     text = (excerpt + " " + call_summary).lower()
+    if _is_autoanswer_like_candidate(item):
+        return 0
     noise_markers = ("шум", "неразборчив", "обрыв", "тишин", "пусто", "непонят")
     if any(marker in text for marker in noise_markers):
         return 1
     if len(excerpt) >= 120 or len(call_summary) >= 60:
         return 3
     return 2
+
+
+def _is_autoanswer_like_candidate(item: dict[str, Any]) -> bool:
+    if not isinstance(item, dict):
+        return False
+    text_parts = [
+        str(item.get("transcript_text_excerpt") or ""),
+        str(item.get("call_signal_summary_short") or ""),
+        str(item.get("call_history_pattern_summary") or ""),
+        str(item.get("status_name") or ""),
+    ]
+    text = " ".join(" ".join(x.split()).strip().lower() for x in text_parts if isinstance(x, str))
+    autoanswer_markers = (
+        "абонент сейчас не может ответить",
+        "пожалуйста, дождитесь ответа оператора",
+        "записать свое сообщение",
+        "оставьте сообщение",
+        "оставить сообщение",
+        "после звукового сигнала",
+        "автоответ",
+        "автоответчик",
+        "voicemail",
+        "no_answer",
+        "not available",
+        "занят",
+        "гудки",
+        "перезвонить позже",
+    )
+    if any(marker in text for marker in autoanswer_markers):
+        positive_conversation_markers = (
+            "лпр",
+            "директор",
+            "собственник",
+            "встреч",
+            "демо",
+            "демонстрац",
+            "тест",
+            "закуп",
+            "поставщик",
+            "презентац",
+        )
+        if any(marker in text for marker in positive_conversation_markers):
+            return False
+        return True
+    transcript_label = str(item.get("transcript_usability_label") or "").strip().lower()
+    duration = int(item.get("longest_call_duration_seconds", 0) or 0)
+    has_any_transcript_text = bool(str(item.get("transcript_text_excerpt") or "").strip())
+    has_call_summary = bool(str(item.get("call_signal_summary_short") or "").strip())
+    dead_call_markers = ("абонент", "не может ответить", "сигнал", "сообщени", "оператор", "voicemail", "auto")
+    if (
+        (has_any_transcript_text or has_call_summary)
+        and duration <= 30
+        and transcript_label in {"weak", "noisy", "empty"}
+        and any(marker in text for marker in dead_call_markers)
+        and "следующ" not in text
+    ):
+        return True
+    return False
+
+
+def _is_real_conversation_candidate(item: dict[str, Any], *, role_signal: str, transcript_score: int) -> bool:
+    if transcript_score < 2:
+        return False
+    if _is_autoanswer_like_candidate(item):
+        return False
+    return role_signal in {"lpr", "secretary", "supplier_inbound", "warm_inbound"}
 
 
 def _evidence_richness_score(item: dict[str, Any]) -> int:
@@ -6286,24 +6757,29 @@ def _stage_priority_weight_value_for_item(
 
 def _daily_candidate_tier(item: dict[str, Any], *, transcript_score: int, evidence_score: int) -> tuple[int, str]:
     role_signal = _call_role_signal(item)
+    autoanswer_like = _is_autoanswer_like_candidate(item)
     has_call = (
         bool(item.get("transcript_available"))
         or bool(str(item.get("call_signal_summary_short") or "").strip())
         or int(item.get("call_candidates_count") or 0) > 0
     )
-    if role_signal == "lpr" and has_call and transcript_score >= 1 and evidence_score >= 4:
+    if role_signal == "lpr" and has_call and transcript_score >= 2 and evidence_score >= 4 and not autoanswer_like:
         return 0, "has_call_priority"
-    if role_signal == "secretary" and has_call and transcript_score >= 1 and evidence_score >= 3:
+    if role_signal == "secretary" and has_call and transcript_score >= 1 and evidence_score >= 3 and not autoanswer_like:
         return 1, "secretary_fallback_priority"
+    if role_signal in {"supplier_inbound", "warm_inbound"} and has_call and transcript_score >= 2 and evidence_score >= 3 and not autoanswer_like:
+        return 2, "warm_supplier_priority"
     if role_signal == "history_pattern" and int(item.get("call_history_pattern_score", 0) or 0) >= 45:
-        return 1, "call_history_pattern_priority"
+        return 3, "call_history_pattern_priority"
     if bool(item.get("repeated_dead_redial_day_flag")) or int(item.get("repeated_dead_redial_count", 0) or 0) > 0:
-        return 1, "dial_discipline_priority"
-    if has_call and transcript_score >= 1 and evidence_score >= 5:
-        return 0, "has_call_priority"
+        return 4, "dial_discipline_priority"
+    if has_call and transcript_score >= 2 and evidence_score >= 5 and not autoanswer_like:
+        return 2, "has_call_priority"
+    if autoanswer_like:
+        return 5, "autoanswer_low_priority"
     if evidence_score >= 5:
-        return 1, "rich_context_priority"
-    return 2, "fallback_fill"
+        return 6, "rich_context_priority"
+    return 7, "fallback_fill"
 
 
 def _call_role_signal(item: dict[str, Any]) -> str:
@@ -6311,10 +6787,29 @@ def _call_role_signal(item: dict[str, Any]) -> str:
         str(item.get(k) or "").strip().lower()
         for k in ("call_signal_summary_short", "transcript_text_excerpt", "manager_summary")
     )
+    if _is_autoanswer_like_candidate(item):
+        return "autoanswer"
     if any(token in text for token in ("лпр", "директор", "собственник", "руководител", "лицо принима")):
         return "lpr"
-    if any(token in text for token in ("секретар", "ресепш", "переадрес", "соедините")):
+    if any(
+        token in text
+        for token in (
+            "секретар",
+            "ресепш",
+            "переадрес",
+            "соедините",
+            "на почту",
+            "почту направ",
+            "как связаться",
+            "снабжением связаться",
+            "отдела снабжения нет",
+        )
+    ):
         return "secretary"
+    if any(token in text for token in ("поставщик", "закуп", "тендер", "кп", "supplier", "etp", "регистрац", "площадк")):
+        return "supplier_inbound"
+    if any(token in text for token in ("демо", "демонстрац", "бриф", "тест", "встреч", "презентац", "оплат", "счет")):
+        return "warm_inbound"
     if bool(item.get("call_history_pattern_dead_redials")) or int(item.get("call_history_pattern_score", 0) or 0) >= 45:
         return "history_pattern"
     if bool(item.get("repeated_dead_redial_day_flag")):
@@ -6489,20 +6984,21 @@ def _estimate_base_absolute_delta(*, role: str, avg_score: int | None, stage_foc
 
 
 def _compose_quantity_from_cascade(*, stage_focus: str, base_delta: int, conversions: dict[str, float]) -> str:
-    downstream = 0
+    base = max(0.1, float(base_delta))
+    downstream = 0.1
     if stage_focus in {"lpr", "qualification"}:
         lpr_to_meeting = conversions.get("lpr_to_meeting", conversions.get("lpr_meeting", 0.35))
-        downstream = max(0, round(base_delta * lpr_to_meeting))
-        return f"+{base_delta} качественных ЛПР за неделю, это даст примерно +{downstream} встреч в работу."
+        downstream = max(0.1, round(base * lpr_to_meeting, 1))
+        return f"+{base:.1f} качественных ЛПР в неделю; каскадом это около +{downstream:.1f} встреч в работу."
     if stage_focus in {"meeting", "meeting_to_next"}:
         meeting_to_next = conversions.get("meeting_to_next", conversions.get("meeting_next", 0.4))
-        downstream = max(0, round(base_delta * meeting_to_next))
-        return f"+{base_delta} подтвержденная встреча в неделю, из них примерно +{downstream} перейдут в следующий шаг."
+        downstream = max(0.1, round(base * meeting_to_next, 1))
+        return f"+{base:.1f} подтвержденных встреч в неделю; из них примерно +{downstream:.1f} перейдут в следующий шаг."
     if stage_focus == "next_step":
         next_to_progress = conversions.get("next_to_progress", conversions.get("next_progress", 0.5))
-        downstream = max(0, round(base_delta * next_to_progress))
-        return f"{base_delta}-2 сделки меньше будут зависать; это даст примерно +{downstream} сделок с понятным движением вниз."
-    return f"+{base_delta} дополнительный рабочий шаг в неделю."
+        downstream = max(0.1, round(base * next_to_progress, 1))
+        return f"На {base:.1f} сделки в неделю меньше зависаний; это даст около +{downstream:.1f} сделок с понятным движением вниз."
+    return f"+{base:.1f} дополнительного рабочего шага в неделю."
 
 
 def _compose_quality_from_cascade(*, stage_focus: str, criticality: str, role: str, with_roks: bool) -> str:

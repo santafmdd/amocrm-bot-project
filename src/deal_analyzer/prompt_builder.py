@@ -122,6 +122,10 @@ def build_daily_table_messages(
     config: DealAnalyzerConfig,
     style_source_excerpt: str,
 ) -> list[dict[str, str]]:
+    case_policy = factual_payload.get("case_policy", {}) if isinstance(factual_payload.get("case_policy"), dict) else {}
+    mode = str(case_policy.get("daily_analysis_mode") or "general").strip()
+    allowed_axes = case_policy.get("allowed_axes", []) if isinstance(case_policy.get("allowed_axes"), list) else []
+    banned_topics = case_policy.get("banned_topics", []) if isinstance(case_policy.get("banned_topics"), list) else []
     system_prompt = (
         "Ты формируешь текст ячеек для таблицы ежедневного управленческого контроля продаж. "
         "Пиши живым рабочим русским языком руководителя: коротко, по делу, без бюрократии. "
@@ -155,6 +159,10 @@ def build_daily_table_messages(
         "7) coaching_list: только нумерованный формат '1) ...\\n2) ...\\n3) ...', без слова 'донес'.\n"
         "8) expected_quantity: только абсолютные значения, без процентов и без обещаний конверсии.\n"
         "9) expected_quality: можно аккуратно описывать влияние на этапы/конверсию как гипотезу.\n\n"
+        f"Режим кейса: {mode}\n"
+        f"Разрешенные оси разбора: {', '.join(str(x) for x in allowed_axes) if allowed_axes else 'по фактам кейса'}\n"
+        f"Запрещенные темы: {', '.join(str(x) for x in banned_topics) if banned_topics else 'нет специальных запретов'}\n"
+        "Жесткое правило: не подставляй запрещенные темы в сильные стороны/зоны роста/действия.\n\n"
         "Важно: не скатывайся в техно-термины и канцелярит. Не повторяй одинаковые шаблоны между строками.\n\n"
         "Style source excerpt:\n"
         f"{style_hint or '(style source unavailable)'}"
