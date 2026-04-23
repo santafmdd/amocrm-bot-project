@@ -21,10 +21,14 @@ from src.deal_analyzer.cli import (
     _daily_candidate_tier,
     _transcript_usability_score,
     _select_daily_package_records,
+    _build_call_pool_artifacts,
+    _build_transcription_shortlist_payload,
+    _build_daily_table_factual_payload,
     _run_analyze_period,
 )
-from src.deal_analyzer.daily_case_modes import classify_daily_case
+from src.deal_analyzer.daily_case_modes import classify_daily_case, get_role_scope_policy
 from src.deal_analyzer.config import DealAnalyzerConfig
+from src.deal_analyzer.prompt_builder import build_daily_table_messages
 
 
 class _Logger:
@@ -209,6 +213,17 @@ def test_analyze_period_creates_run_dir_and_summary_json():
     transcription_impact_md_path = run_dirs[0] / "transcription_impact.md"
     transcription_impact_json_path = run_dirs[0] / "transcription_impact.json"
     queue_sheets_dry_run_path = run_dirs[0] / "meeting_queue_sheets_dry_run.json"
+    call_pool_debug_json_path = run_dirs[0] / "call_pool_debug.json"
+    call_pool_debug_md_path = run_dirs[0] / "call_pool_debug.md"
+    conversation_pool_json_path = run_dirs[0] / "conversation_pool.json"
+    conversation_pool_md_path = run_dirs[0] / "conversation_pool.md"
+    discipline_pool_json_path = run_dirs[0] / "discipline_pool.json"
+    discipline_pool_md_path = run_dirs[0] / "discipline_pool.md"
+    discipline_report_json_path = run_dirs[0] / "discipline_report.json"
+    discipline_report_md_path = run_dirs[0] / "discipline_report.md"
+    transcription_shortlist_json_path = run_dirs[0] / "transcription_shortlist.json"
+    transcription_shortlist_md_path = run_dirs[0] / "transcription_shortlist.md"
+    daily_selection_debug_path = run_dirs[0] / "daily_selection_debug.json"
     assert summary_path.exists()
     assert summary_md_path.exists()
     assert top_risks_path.exists()
@@ -218,6 +233,17 @@ def test_analyze_period_creates_run_dir_and_summary_json():
     assert transcription_impact_md_path.exists()
     assert transcription_impact_json_path.exists()
     assert queue_sheets_dry_run_path.exists()
+    assert call_pool_debug_json_path.exists()
+    assert call_pool_debug_md_path.exists()
+    assert conversation_pool_json_path.exists()
+    assert conversation_pool_md_path.exists()
+    assert discipline_pool_json_path.exists()
+    assert discipline_pool_md_path.exists()
+    assert discipline_report_json_path.exists()
+    assert discipline_report_md_path.exists()
+    assert transcription_shortlist_json_path.exists()
+    assert transcription_shortlist_md_path.exists()
+    assert daily_selection_debug_path.exists()
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     assert summary["total_deals_seen"] == 2
     assert summary["total_deals_analyzed"] == 2
@@ -228,6 +254,28 @@ def test_analyze_period_creates_run_dir_and_summary_json():
     assert "call_runtime_diagnostics" in summary
     assert "transcript_runtime_diagnostics" in summary
     assert "meeting_queue_writer" in summary
+    assert "deals_total_before_limit" in summary
+    assert "deals_with_any_calls" in summary
+    assert "deals_with_recordings" in summary
+    assert "deals_with_long_calls" in summary
+    assert "deals_with_only_short_calls" in summary
+    assert "deals_with_autoanswer_pattern" in summary
+    assert "deals_with_redial_pattern" in summary
+    assert "conversation_pool_total" in summary
+    assert "discipline_pool_total" in summary
+    assert "lpr_conversation_total" in summary
+    assert "secretary_case_total" in summary
+    assert "supplier_inbound_total" in summary
+    assert "warm_inbound_total" in summary
+    assert "redial_discipline_total" in summary
+    assert "autoanswer_noise_total" in summary
+    assert "transcription_shortlist_diagnostics" in summary
+    assert "discipline_report_summary" in summary
+    assert "daily_rows_from_conversation_pool" in summary
+    assert "daily_rows_from_discipline_pool" in summary
+    assert "daily_rows_skipped_crm_only" in summary
+    assert "daily_rows_with_real_transcript" in summary
+    assert "daily_rows_with_only_discipline_signals" in summary
     call_diag = summary["call_runtime_diagnostics"]
     assert "call_collection_mode_effective" in call_diag
     assert "deals_with_call_candidates" in call_diag
@@ -262,6 +310,9 @@ def test_analyze_period_creates_run_dir_and_summary_json():
     assert "## Call-Aware Signals" in md
     assert "## Проверка транскрибации" in md
     assert "## E2E проверка звонков" in md
+    assert "## Transcription Shortlist" in md
+    assert "## negotiation_analysis" in md
+    assert "## discipline_analysis" in md
     assert "## Weekly Meeting Focus" in md
     assert "### Что просело сильнее всего" in md
     assert "### Что можно исправить за 1 неделю" in md
@@ -333,6 +384,76 @@ def test_analyze_period_creates_run_dir_and_summary_json():
     if queue_dry_run["rows"]:
         first_row = queue_dry_run["rows"][0]
         assert first_row.get("why_in_queue_human")
+    call_pool_debug = json.loads(call_pool_debug_json_path.read_text(encoding="utf-8"))
+    assert call_pool_debug["deals_total_before_limit"] == 2
+    assert isinstance(call_pool_debug.get("items"), list)
+    if call_pool_debug["items"]:
+        first_pool = call_pool_debug["items"][0]
+        for key in (
+            "deal_id",
+            "owner_name",
+            "status_name",
+            "pipeline_name",
+            "calls_total",
+            "outbound_calls",
+            "inbound_calls",
+            "max_duration_seconds",
+            "total_duration_seconds",
+            "recording_url_count",
+            "audio_path_count",
+            "short_calls_0_20_count",
+            "medium_calls_21_60_count",
+            "long_calls_61_plus_count",
+            "no_answer_like_count",
+            "autoanswer_like_count",
+            "repeated_dead_redial_count",
+            "same_time_redial_pattern_flag",
+            "unique_phone_count",
+            "numbers_not_fully_covered_flag",
+            "pool_type",
+            "pool_reason",
+            "pool_priority_score",
+            "call_case_type",
+        ):
+            assert key in first_pool
+    conversation_pool = json.loads(conversation_pool_json_path.read_text(encoding="utf-8"))
+    discipline_pool = json.loads(discipline_pool_json_path.read_text(encoding="utf-8"))
+    discipline_report = json.loads(discipline_report_json_path.read_text(encoding="utf-8"))
+    assert "total" in conversation_pool and "items" in conversation_pool
+    assert "total" in discipline_pool and "items" in discipline_pool
+    assert "summary" in discipline_report and "items" in discipline_report
+    if discipline_report["items"]:
+        row = discipline_report["items"][0]
+        for key in (
+            "deal_id",
+            "unique_phone_count",
+            "attempts_total",
+            "attempts_per_phone",
+            "phones_over_2_attempts",
+            "repeated_dead_redial_count",
+            "same_time_redial_pattern_flag",
+            "numbers_not_fully_covered_flag",
+            "short_call_cluster_flag",
+            "autoanswer_cluster_flag",
+            "discipline_summary_short",
+            "discipline_risk_level",
+        ):
+            assert key in row
+    discipline_md = discipline_report_md_path.read_text(encoding="utf-8")
+    assert "## Сделки, где дрочат один номер" in discipline_md
+    assert "## Сделки, где не покрыты все номера" in discipline_md
+    assert "## Сделки, где день ушел в пустые наборы" in discipline_md
+    assert "## Сделки, где звонят в одно и то же время" in discipline_md
+    transcription_shortlist = json.loads(transcription_shortlist_json_path.read_text(encoding="utf-8"))
+    assert "items" in transcription_shortlist
+    if transcription_shortlist["items"]:
+        first = transcription_shortlist["items"][0]
+        assert "selected_for_transcription" in first
+        assert "transcription_selection_reason" in first
+        assert "selected_call_ids" in first
+        assert "selected_call_count" in first
+    daily_selection_debug = json.loads(daily_selection_debug_path.read_text(encoding="utf-8"))
+    assert "summary" in daily_selection_debug and "rows" in daily_selection_debug
     brief = manager_brief_path.read_text(encoding="utf-8")
     assert "# Manager Brief" in brief
     assert "Backend requested:" in brief
@@ -341,6 +462,8 @@ def test_analyze_period_creates_run_dir_and_summary_json():
     assert "Низкая надежность интерпретации:" in brief
     assert "## Call-aware срез" in brief
     assert "## Проверка транскрибации" in brief
+    assert "## negotiation_analysis" in brief
+    assert "## discipline_analysis" in brief
     assert "## Что просело сильнее всего" in brief
     assert "## Что можно исправить за 1 неделю" in brief
     assert "## Что нельзя интерпретировать уверенно из-за качества CRM" in brief
@@ -1995,6 +2118,64 @@ def test_daily_selection_prefers_call_rich_and_can_stay_thin():
     assert len(selected_ids) == 1
 
 
+def test_daily_selection_blocks_crm_only_and_discipline_when_negotiation_exists():
+    records = [
+        {
+            "deal_id": 4101,
+            "updated_at": "2026-04-14T09:00:00+00:00",
+            "status_name": "В работе",
+            "pipeline_name": "Привлечение",
+            "transcript_available": True,
+            "transcript_usability_label": "usable",
+            "transcript_usability_score_final": 78,
+            "transcript_text_excerpt": "Говорили с ЛПР, договорились про следующий шаг",
+            "call_signal_summary_short": "ЛПР и следующий шаг",
+            "notes_summary_raw": [{"text": "контекст"}],
+            "tasks_summary_raw": [{"text": "задача"}],
+            "risk_flags": [],
+        },
+        {
+            "deal_id": 4102,
+            "updated_at": "2026-04-14T09:10:00+00:00",
+            "status_name": "В работе",
+            "pipeline_name": "Привлечение",
+            "transcript_available": False,
+            "transcript_usability_label": "empty",
+            "transcript_usability_score_final": 0,
+            "transcript_text_excerpt": "",
+            "call_signal_summary_short": "",
+            "notes_summary_raw": [{"text": "очень бедный комментарий"}],
+            "tasks_summary_raw": [],
+            "risk_flags": [],
+        },
+        {
+            "deal_id": 4103,
+            "updated_at": "2026-04-14T09:20:00+00:00",
+            "status_name": "В работе",
+            "pipeline_name": "Привлечение",
+            "transcript_available": False,
+            "transcript_usability_label": "empty",
+            "transcript_usability_score_final": 0,
+            "transcript_text_excerpt": "",
+            "call_signal_summary_short": "",
+            "repeated_dead_redial_day_flag": True,
+            "repeated_dead_redial_count": 3,
+            "notes_summary_raw": [],
+            "tasks_summary_raw": [],
+            "risk_flags": [],
+        },
+    ]
+    selected = _select_daily_package_records(
+        manager_records=records,
+        control_day="2026-04-14",
+        package_target=3,
+        carryover_days=7,
+        exclude_deal_ids=set(),
+    )
+    selected_ids = {int(x.get("deal_id")) for x in selected if str(x.get("deal_id") or "").isdigit()}
+    assert selected_ids == {4101}
+
+
 def test_daily_payload_has_ranking_debug_fields():
     summary = {
         "period_start": "2026-04-13",
@@ -2205,7 +2386,10 @@ def test_daily_ranking_prioritizes_lpr_and_secretary_over_autoanswer_control_cas
     for row in selected:
         skipped.extend(row.get("_daily_skipped_candidates", []) if isinstance(row, dict) else [])
     skip_32160389 = next((x for x in skipped if str(x.get("deal_id") or "") == "32160389"), {})
-    assert str(skip_32160389.get("skip_for_daily_reason") or "") == "autoanswer_low_priority_when_real_conversation_exists"
+    assert str(skip_32160389.get("skip_for_daily_reason") or "") in {
+        "autoanswer_low_priority_when_real_conversation_exists",
+        "discipline_deferred_due_to_negotiation_cases",
+    }
 
 
 def test_control_cases_have_expected_daily_ranking_signals():
@@ -2429,8 +2613,16 @@ def test_daily_payload_contains_package_quality_and_generation_diagnostics():
     assert "crm_only_bias_flag" in row
     assert "style_layer_applied" in row
     assert isinstance(row.get("text_generation_source_per_column"), dict)
+    assert "role_scope_applied" in row
+    assert "role_blocked_topics" in row
+    assert "role_allowed_topics" in row
+    assert "role_scope_conflict_flag" in row
     assert row.get("transcript_quality_retry_used") is True
     assert row.get("transcript_quality_retry_improved") is True
+    assert row.get("daily_primary_source") in {"conversation_pool", "discipline_pool"}
+    assert row.get("daily_case_type")
+    assert row.get("daily_selection_reason_v2")
+    assert "excluded_crm_only_cases_count" in row
 
 
 def test_daily_payload_antirepeat_rewrites_duplicate_key_takeaway_for_same_manager():
@@ -2556,7 +2748,7 @@ def test_daily_payload_can_use_dial_discipline_mode_without_negotiation():
             daily_step_artifacts_dir=Path("workspace/tmp_tests/deal_analyzer/daily_steps_dial_discipline"),
         )
     assert payload["rows"]
-    assert payload["rows"][0].get("daily_analysis_mode") == "dial_discipline_analysis"
+    assert payload["rows"][0].get("daily_analysis_mode") == "discipline_analysis"
 
 
 def test_no_real_write_when_daily_llm_unavailable():
@@ -2728,6 +2920,75 @@ def test_sanitize_daily_columns_applies_case_bans_for_secretary():
     assert cols["Ожидаемый эффект - количество"] == "+0.3 встречи в неделю"
 
 
+def test_role_scope_policy_telemarketer_blocks_warm_topics_by_default():
+    policy = get_role_scope_policy(
+        role="телемаркетолог",
+        items=[
+            {
+                "transcript_usability_label": "usable",
+                "transcript_text_excerpt": "Секретарь переключил на отдел, без демо.",
+                "call_signal_summary_short": "маршрутизация через секретаря",
+            }
+        ],
+    )
+    blocked = [str(x).lower() for x in policy.get("role_blocked_topics", [])]
+    assert policy.get("role_scope_applied") is True
+    assert policy.get("role_scope_conflict_flag") is False
+    assert any("презентац" in x for x in blocked)
+    assert any("бриф" in x for x in blocked)
+
+
+def test_role_scope_policy_telemarketer_allows_warm_override_on_explicit_signal():
+    policy = get_role_scope_policy(
+        role="телемаркетолог",
+        items=[
+            {
+                "transcript_usability_label": "usable",
+                "transcript_text_excerpt": "С ЛПР обсудили демонстрацию и тест, зафиксировали следующий шаг.",
+                "call_signal_summary_short": "явный переход в демо/тест",
+            }
+        ],
+    )
+    blocked = [str(x).lower() for x in policy.get("role_blocked_topics", [])]
+    assert policy.get("role_scope_applied") is True
+    assert policy.get("role_scope_conflict_flag") is True
+    assert not any("презентац" in x for x in blocked)
+    assert not any("бриф" in x for x in blocked)
+
+
+def test_sanitize_daily_columns_role_scope_filters_fix_and_coaching_for_telemarketer():
+    payload = {
+        "key_takeaway": "Не подтверждена презентация.",
+        "strong_sides": "Хорошо провел демонстрацию.",
+        "growth_zones": "Нужно заполнить бриф и подтвердить презентацию.",
+        "why_important": "Поможет быстрее закрывать оплату.",
+        "reinforce": "Модуль выхода на ЛПР.",
+        "fix_action": "Дожать демо и отправить коммерческое предложение.",
+        "coaching_list": "1) Разобрали презентацию.\n2) Дали модуль demo close.\n3) Вести клиента до оплаты.",
+        "expected_quantity": "+1 встреча в неделю",
+        "expected_quality": "Конверсия демо в тест улучшится.",
+    }
+    cols = _sanitize_daily_llm_columns(
+        payload=payload,
+        fallback={"Ожидаемый эффект - количество": "+0.4 встречи в неделю"},
+        role="телемаркетолог",
+        case_policy={
+            "banned_topics": ["презентация", "демонстрация", "бриф", "кп", "оплата"],
+            "role_scope_applied": True,
+            "role_allowed_topics": ["проход секретаря", "выход на ЛПР"],
+            "role_blocked_topics": ["презентация", "демонстрация", "бриф", "тест", "кп", "оплата"],
+            "role_scope_conflict_flag": False,
+        },
+    )
+    low_join = " ".join(str(cols.get(k) or "") for k in ("Сильные стороны", "Зоны роста", "Что исправить", "Что донес сотруднику")).lower()
+    assert "презентац" not in low_join
+    assert "демонстрац" not in low_join
+    assert "бриф" not in low_join
+    assert "оплат" not in low_join
+    assert cols.get("_role_scope_applied") is True
+    assert cols.get("_role_scope_conflict_flag") is False
+
+
 def test_quantity_effect_keeps_decimals_and_never_plus_zero():
     payload = {
         "key_takeaway": "test",
@@ -2848,5 +3109,224 @@ def test_daily_multistep_pipeline_success_populates_llm_columns() -> None:
     assert row["daily_multistep_assembler_only"] is True
     diag = payload.get("daily_multistep_pipeline", {})
     assert diag.get("step_artifacts_count", 0) >= 1
+
+
+def test_call_pool_split_prioritizes_conversation_over_autoanswer_noise() -> None:
+    call_pool_debug = {
+        "items": [
+            {
+                "deal_id": "32162059",
+                "owner_name": "Рустам",
+                "call_case_type": "lpr_conversation",
+                "pool_type": "conversation_pool",
+                "pool_reason": "lpr_conversation",
+                "pool_priority_score": 78,
+                "recording_url_count": 2,
+                "max_duration_seconds": 412,
+                "short_calls_0_20_count": 0,
+                "repeated_dead_redial_count": 0,
+            },
+            {
+                "deal_id": "32165731",
+                "owner_name": "Рустам",
+                "call_case_type": "secretary_case",
+                "pool_type": "conversation_pool",
+                "pool_reason": "secretary_case",
+                "pool_priority_score": 64,
+                "recording_url_count": 1,
+                "max_duration_seconds": 44,
+                "short_calls_0_20_count": 0,
+                "repeated_dead_redial_count": 0,
+            },
+            {
+                "deal_id": "32160389",
+                "owner_name": "Рустам",
+                "call_case_type": "autoanswer_noise",
+                "pool_type": "discipline_pool",
+                "pool_reason": "autoanswer_noise",
+                "pool_priority_score": 62,
+                "recording_url_count": 0,
+                "max_duration_seconds": 7,
+                "short_calls_0_20_count": 3,
+                "repeated_dead_redial_count": 1,
+            },
+        ]
+    }
+    conv, disc, agg = _build_call_pool_artifacts(call_pool_debug=call_pool_debug)
+    conv_ids = [str(x.get("deal_id") or "") for x in conv.get("items", [])]
+    disc_ids = [str(x.get("deal_id") or "") for x in disc.get("items", [])]
+    assert conv_ids[:2] == ["32162059", "32165731"]
+    assert "32160389" in disc_ids
+    assert agg["conversation_pool_total"] == 2
+    assert agg["discipline_pool_total"] == 1
+
+
+def test_transcription_shortlist_selects_only_conversation_calls() -> None:
+    conv_payload = {
+        "items": [
+            {
+                "deal_id": "10",
+                "pool_type": "conversation_pool",
+                "call_case_type": "lpr_conversation",
+                "call_items": [
+                    {"call_id": "a1", "duration_seconds": 160, "recording_url": "https://x/1.mp3", "direction": "outbound", "status": "", "result": "", "disposition": "", "quality_flags": [], "timestamp": "2026-04-21T10:10:00+00:00"},
+                    {"call_id": "a2", "duration_seconds": 48, "recording_url": "https://x/2.mp3", "direction": "outbound", "status": "", "result": "", "disposition": "", "quality_flags": [], "timestamp": "2026-04-21T11:10:00+00:00"},
+                    {"call_id": "a3", "duration_seconds": 9, "recording_url": "", "direction": "outbound", "status": "no_answer", "result": "", "disposition": "", "quality_flags": [], "timestamp": "2026-04-21T12:10:00+00:00"},
+                ],
+            }
+        ]
+    }
+    disc_payload = {
+        "items": [
+            {
+                "deal_id": "20",
+                "pool_type": "discipline_pool",
+                "call_case_type": "autoanswer_noise",
+                "calls_total": 3,
+                "call_items": [],
+            }
+        ]
+    }
+    shortlist = _build_transcription_shortlist_payload(
+        conversation_pool_payload=conv_payload,
+        discipline_pool_payload=disc_payload,
+    )
+    by_deal = {str(x.get("deal_id")): x for x in shortlist.get("items", [])}
+    assert by_deal["10"]["selected_for_transcription"] is True
+    assert by_deal["10"]["selected_call_count"] >= 1
+    assert "a1" in by_deal["10"]["selected_call_ids"]
+    assert by_deal["20"]["selected_for_transcription"] is False
+    assert by_deal["20"]["transcription_selection_reason"] == "discipline_pool_not_in_main_stt"
+
+
+def test_analyze_period_limit_applies_to_conversation_shortlist_not_raw_rows() -> None:
+    output_dir = _fresh_output_dir("period_batch_limit_conversation_shortlist")
+    payload = {
+        "normalized_deals": [
+            {"deal_id": 1, "deal_name": "d1", "responsible_user_name": "Рустам"},
+            {"deal_id": 2, "deal_name": "d2", "responsible_user_name": "Рустам"},
+            {"deal_id": 3, "deal_name": "d3", "responsible_user_name": "Рустам"},
+        ]
+    }
+    logger = _Logger()
+    processed_ids: list[int] = []
+
+    fake_call_pool_debug = {
+        "deals_total_before_limit": 3,
+        "deals_with_any_calls": 3,
+        "deals_with_recordings": 3,
+        "deals_with_long_calls": 2,
+        "deals_with_only_short_calls": 1,
+        "deals_with_autoanswer_pattern": 1,
+        "deals_with_redial_pattern": 1,
+        "items": [
+            {"deal_id": "1", "pool_type": "conversation_pool", "call_case_type": "lpr_conversation", "pool_priority_score": 90, "call_items": [{"call_id": "c1", "duration_seconds": 120, "recording_url": "https://x/1.mp3", "direction": "outbound", "status": "", "result": "", "disposition": "", "quality_flags": []}]},
+            {"deal_id": "2", "pool_type": "discipline_pool", "call_case_type": "autoanswer_noise", "pool_priority_score": 80, "calls_total": 2, "call_items": []},
+            {"deal_id": "3", "pool_type": "conversation_pool", "call_case_type": "secretary_case", "pool_priority_score": 70, "call_items": [{"call_id": "c3", "duration_seconds": 50, "recording_url": "https://x/3.mp3", "direction": "outbound", "status": "", "result": "", "disposition": "", "quality_flags": []}]},
+        ],
+    }
+
+    def _fake_snapshot(*, normalized_deal, config, logger, raw_bundle, selected_call_ids=None, transcription_selection_reason=""):
+        did = int(normalized_deal["deal_id"])
+        processed_ids.append(did)
+        return _snapshot_for_deal(did)
+
+    def _fake_analyze(normalized, cfg, logger, *, deal_hint, backend_override):
+        return _analysis_for_deal(int(normalized["deal_id"]), score=60)
+
+    with patch("src.deal_analyzer.cli._collect_call_pool_debug", return_value=fake_call_pool_debug), patch(
+        "src.deal_analyzer.cli.build_deal_snapshot", side_effect=_fake_snapshot
+    ), patch("src.deal_analyzer.cli._analyze_one_with_isolation", side_effect=_fake_analyze):
+        _run_analyze_period(
+            _cfg(),
+            output_dir,
+            payload,
+            "period.json",
+            True,
+            logger,
+            period_mode=None,
+            date_from=None,
+            date_to=None,
+            limit=1,
+        )
+
+    # limit=1 should apply to conversation shortlist [deal 1, deal 3], so only deal 1 is processed.
+    assert processed_ids == [1]
+
+
+def test_daily_factual_payload_includes_reference_stack_and_disabled_external_retrieval() -> None:
+    cfg = _cfg_hybrid()
+    payload = _build_daily_table_factual_payload(
+        cfg=cfg,
+        logger=_Logger(),
+        manager="Илья",
+        role="менеджер по продажам",
+        control_day="2026-04-20",
+        period_start="2026-04-20",
+        period_end="2026-04-24",
+        package_items=[
+            {
+                "deal_id": "32162059",
+                "status_name": "В работе",
+                "pipeline_name": "Продажи",
+                "risk_flags": ["process_hygiene: missing next step"],
+                "call_signal_summary_short": "обсудили следующий шаг по демо",
+                "transcript_text_excerpt": "договорились о следующем созвоне",
+                "manager_summary": "нужно дожать следующий шаг",
+                "employee_coaching": "добавить уточняющие вопросы",
+            }
+        ],
+        links="https://example.test/deal/32162059",
+        focus="линк",
+        base_mix="выставка",
+        avg_score=61,
+        criticality="средняя",
+        selection_reason="has_call_priority",
+        growth_candidates=["не дожал следующий шаг"],
+        fallback_columns={"Ключевой вывод": "x"},
+        effect_forecast={"source": "fallback"},
+        case_policy={"daily_analysis_mode": "negotiation_lpr_analysis"},
+    )
+    reference_stack = payload.get("reference_stack", {})
+    assert isinstance(reference_stack, dict)
+    assert isinstance(reference_stack.get("source_order"), list)
+    assert "internal_references" in reference_stack.get("source_order", [])
+    assert isinstance(reference_stack.get("internal_sources"), list)
+    external = reference_stack.get("external_retrieval", {})
+    assert isinstance(external, dict)
+    assert external.get("enabled") is False
+    assert external.get("used") is False
+
+
+def test_daily_table_prompt_includes_reference_stack_and_style_mode() -> None:
+    cfg = replace(_cfg_hybrid(), daily_style_mode="work_rude")
+    factual_payload = {
+        "manager_name": "Илья",
+        "role": "менеджер по продажам",
+        "case_policy": {"daily_analysis_mode": "negotiation_lpr_analysis", "allowed_axes": [], "banned_topics": []},
+        "role_allowed_topics": ["демо"],
+        "role_forbidden_topics": ["бриф"],
+        "role_scope_conflict_flag": False,
+        "reference_stack": {
+            "source_order": ["internal_references", "product_reference_urls", "external_retrieval_optional"],
+            "prompt_snippets": [
+                {"layer": "internal", "source": "docs/sales.md", "snippet": "Фокус на следующий шаг."},
+                {"layer": "product_url", "source": "https://istock.link/", "snippet": "LINK: сценарии для закупок."},
+            ],
+            "external_retrieval": {"enabled": True, "used": False, "reason": "disabled_by_config"},
+        },
+    }
+    messages = build_daily_table_messages(
+        factual_payload=factual_payload,
+        config=cfg,
+        style_source_excerpt="живой стиль",
+        style_mode="work_rude",
+    )
+    assert len(messages) == 2
+    combined = "\n".join(str(x.get("content") or "") for x in messages if isinstance(x, dict))
+    assert "Reference stack order" in combined
+    assert "external_retrieval" in combined or "External retrieval" in combined
+    assert "Фокус на следующий шаг." in combined
+    assert "Режим стиля" in combined or "Стиль:" in combined
 
 

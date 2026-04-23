@@ -266,6 +266,35 @@ LLM генерирует поля:
 
 Style source: `docs/мой паттерн общения.txt` (используется как ориентир тона; если недоступен — включается безопасный fallback).
 
+### Reference Stack (обязательный порядок)
+Для смысловых колонок (`Ключевой вывод`, `Сильные стороны`, `Зоны роста`, `Почему это важно`, `Что закрепить`, `Что исправить`, `Что донес сотруднику`, `Ожидаемый эффект-*`) prompt собирается с обязательным стеком источников:
+1. Внутренние референсы (sales scripts + локальные reference docs).
+2. Продуктовые URL из `product_reference_urls`.
+3. Внешний retrieval (опционально, только если включен).
+
+Диагностика по реально подмешанным источникам пишется в:
+- `period_runs/<run_id>/daily_reference_stack_debug.json`
+- row-level debug в `daily_control_sheet_payload.json` (`reference_sources_*`, `external_retrieval_*`).
+
+### Optional External Retrieval Layer
+Локальная Ollama не ходит в интернет сама. Для внешних рекомендаций есть отдельный optional adapter-слой:
+- `external_retrieval_enabled` (`false` по умолчанию)
+- `external_retrieval_adapter` (`none|http_json`)
+- `external_retrieval_endpoint`
+- `external_retrieval_timeout_seconds`
+- `external_retrieval_top_k`
+- `external_retrieval_api_key`
+- `external_retrieval_query_prefix`
+
+Если retrieval выключен/не настроен/ошибся, pipeline не падает: работает только на внутренних источниках + product URLs.
+
+### Style Mode
+`daily_style_mode`:
+- `mild` (по умолчанию): живой рабочий текст без грубости.
+- `work_rude`: допускается умеренно жесткая лексика (без оскорблений и буллинга).
+
+Style layer меняет только формулировку, не факты и не структуру блоков.
+
 ### Daily candidate pool and ranking
 Daily row собирается не из первых сделок периода, а через `candidate-pool -> ranking -> top selection`:
 - приоритет 1: call-rich и информативные сделки (usable transcript / сигнал из звонка);
@@ -278,6 +307,107 @@ Debug-only поля в `daily_control_sheet_payload.json`:
 - `funnel_relevance_score`
 - `daily_selection_rank`
 - `daily_selection_reason`
+
+### Conversation/Discipline pool split (pre-limit)
+Перед применением `--limit` analyzer строит два отдельных пула по звонковой мете:
+- `conversation_pool` (переговорные кейсы),
+- `discipline_pool` (дисциплина звонков и dead-redial паттерны).
+
+Артефакты run-папки:
+- `conversation_pool.json` / `conversation_pool.md`
+- `discipline_pool.json` / `discipline_pool.md`
+- `discipline_report.json` / `discipline_report.md`
+
+Для каждой сделки фиксируются:
+- `pool_type`
+- `pool_reason`
+- `pool_priority_score`
+- `call_case_type` (`lpr_conversation`, `secretary_case`, `supplier_inbound`, `warm_inbound`, `redial_discipline`, `autoanswer_noise`, `unknown`)
+
+`--limit` после этого шага применяется к shortlist из `conversation_pool`, а не к сырому списку period deals.
+
+В STT-поток идут только shortlist-calls из `conversation_pool`:
+- 1 основной разговор + до 1-2 связанных follow-up звонков;
+- short/no-answer/autoanswer шум отсекается;
+- `discipline_pool` не отправляется в основной STT.
+
+### Daily package selection order (call-first)
+Daily package теперь выбирается в явном порядке:
+1. usable `conversation_pool` кейсы (`lpr/secretary/supplier/warm`);
+2. `discipline_pool` только если нет нормальных negotiation-кейсов;
+3. CRM-thin filler (без usable звонка и без meaningful discipline-pattern) блокируется.
+
+Новые debug-поля в daily row:
+- `daily_primary_source` (`conversation_pool|discipline_pool`)
+- `daily_case_type`
+- `daily_selection_reason_v2`
+- `excluded_crm_only_cases_count`
+
+Новый run-артефакт:
+- `daily_selection_debug.json`
+
+Новые summary-поля:
+- `daily_rows_from_conversation_pool`
+- `daily_rows_from_discipline_pool`
+- `daily_rows_skipped_crm_only`
+- `daily_rows_with_real_transcript`
+- `daily_rows_with_only_discipline_signals`
+
+### Role-aware scope (телемаркетолог vs менеджер по продажам)
+Система применяет role-scope не косметически, а как отдельный фильтр для:
+- `strong_sides`
+- `growth_zones`
+- `fix_action`
+- `coaching`
+- `why_important`
+- `expected effect`
+
+Матрица:
+- `телемаркетолог` (allowed):
+  - проход секретаря, выход на ЛПР, квалификация, назначение встречи,
+  - дисциплина звонков, покрытие номеров, недозвоны/автоответчики/повторы наборов.
+- `телемаркетолог` (blocked by default):
+  - презентация, демонстрация, бриф, тест, КП/счет/оплата, дожим после демо.
+- `менеджер по продажам` (allowed):
+  - демонстрация, бриф, тест, следующий шаг после встречи, счет/КП/оплата,
+  - зависание после теплого этапа, quality follow-up после демо/теста.
+
+Role conflict behavior:
+- если для телемаркетолога есть сильный явный звонковый сигнал, что кейс реально ушел в warm/demo/test,
+  блок по части warm-тем ослабляется (`role_scope_conflict_flag=true`);
+- иначе warm-темы вырезаются из user-facing текста.
+
+Debug поля в daily row:
+- `role_scope_applied`
+- `role_blocked_topics`
+- `role_allowed_topics`
+- `role_scope_conflict_flag`
+
+### Conversation insight vs discipline insight
+- `conversation insight`:
+  - разбор содержательных разговоров (LPR/secretary/supplier/warm inbound),
+  - используется для переговорного анализа и транскрибации.
+- `discipline insight`:
+  - отдельный контур по дисциплине звонков (повторы, недозвоны, автоответчики, покрытие номеров),
+  - не подменяет переговорный анализ,
+  - оформляется в `discipline_report.*`.
+
+`discipline_report.json` по каждой сделке discipline_pool включает:
+- `unique_phone_count`
+- `attempts_total`
+- `attempts_per_phone`
+- `phones_over_2_attempts`
+- `repeated_dead_redial_count`
+- `same_time_redial_pattern_flag`
+- `numbers_not_fully_covered_flag`
+- `short_call_cluster_flag`
+- `autoanswer_cluster_flag`
+- `discipline_summary_short`
+- `discipline_risk_level`
+
+В `summary.md` и `manager_brief.md` секции разделены явно:
+- `negotiation_analysis`
+- `discipline_analysis`
 
 ### ROKS hook for ranking/effect forecast
 Добавлен подготовительный hook под stage-priority weighting из ROKS:

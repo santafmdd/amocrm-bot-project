@@ -121,11 +121,33 @@ def build_daily_table_messages(
     factual_payload: dict[str, Any],
     config: DealAnalyzerConfig,
     style_source_excerpt: str,
+    style_mode: str = "mild",
 ) -> list[dict[str, str]]:
     case_policy = factual_payload.get("case_policy", {}) if isinstance(factual_payload.get("case_policy"), dict) else {}
     mode = str(case_policy.get("daily_analysis_mode") or "general").strip()
     allowed_axes = case_policy.get("allowed_axes", []) if isinstance(case_policy.get("allowed_axes"), list) else []
     banned_topics = case_policy.get("banned_topics", []) if isinstance(case_policy.get("banned_topics"), list) else []
+    role_allowed_topics = factual_payload.get("role_allowed_topics", []) if isinstance(factual_payload.get("role_allowed_topics"), list) else []
+    role_forbidden_topics = factual_payload.get("role_forbidden_topics", []) if isinstance(factual_payload.get("role_forbidden_topics"), list) else []
+    role_scope_conflict_flag = bool(factual_payload.get("role_scope_conflict_flag", False))
+    reference_stack = factual_payload.get("reference_stack", {}) if isinstance(factual_payload.get("reference_stack"), dict) else {}
+    prompt_snippets = reference_stack.get("prompt_snippets", []) if isinstance(reference_stack.get("prompt_snippets"), list) else []
+    reference_lines: list[str] = []
+    for idx, item in enumerate(prompt_snippets[:12], start=1):
+        if not isinstance(item, dict):
+            continue
+        source = str(item.get("source") or "")
+        layer = str(item.get("layer") or "reference")
+        snippet = str(item.get("snippet") or "").strip()
+        if not snippet:
+            continue
+        reference_lines.append(f"{idx}. [{layer}] {source}: {snippet}")
+    external = reference_stack.get("external_retrieval", {}) if isinstance(reference_stack.get("external_retrieval"), dict) else {}
+    style_mode_line = (
+        "Стиль: рабочий, можно умеренно жестко (например: завис, проебал шаг, просрал момент), без оскорблений."
+        if str(style_mode or "mild") == "work_rude"
+        else "Стиль: живой, рабочий, разговорный. Без бюрократического мусора."
+    )
     system_prompt = (
         "Ты формируешь текст ячеек для таблицы ежедневного управленческого контроля продаж. "
         "Пиши живым рабочим русским языком руководителя: коротко, по делу, без бюрократии. "
@@ -133,6 +155,8 @@ def build_daily_table_messages(
         "Можно выбирать подходящие инструменты продаж (вопросы, модуль следующего шага, квалификация), "
         "если это подтверждается фактурой звонков/CRM. "
         "Если переговорного материала мало, честно пиши про дисциплину набора->дозвона без выдумки. "
+        "Для strong_sides/growth_zones/fix_action/coaching/why_important обязательно опирайся на reference stack. "
+        f"{style_mode_line} "
         "Верни только JSON-объект без markdown."
     )
     style_hint = style_source_excerpt.strip()
@@ -162,6 +186,16 @@ def build_daily_table_messages(
         f"Режим кейса: {mode}\n"
         f"Разрешенные оси разбора: {', '.join(str(x) for x in allowed_axes) if allowed_axes else 'по фактам кейса'}\n"
         f"Запрещенные темы: {', '.join(str(x) for x in banned_topics) if banned_topics else 'нет специальных запретов'}\n"
+        f"Роль-разрешенные темы: {', '.join(str(x) for x in role_allowed_topics) if role_allowed_topics else 'по роли не задано'}\n"
+        f"Роль-заблокированные темы: {', '.join(str(x) for x in role_forbidden_topics) if role_forbidden_topics else 'нет'}\n"
+        f"Role conflict flag (allow override by explicit call evidence): {role_scope_conflict_flag}\n"
+        "Reference stack order:\n"
+        "- 1) обязательные внутренние референсы\n"
+        "- 2) продуктовые страницы/сайты\n"
+        "- 3) внешний retrieval (если включен)\n"
+        f"External retrieval enabled={bool(external.get('enabled'))} used={bool(external.get('used'))} reason={str(external.get('reason') or '')}\n"
+        "Reference snippets:\n"
+        f"{chr(10).join(reference_lines) if reference_lines else '(no snippets loaded)'}\n"
         "Жесткое правило: не подставляй запрещенные темы в сильные стороны/зоны роста/действия.\n\n"
         "Важно: не скатывайся в техно-термины и канцелярит. Не повторяй одинаковые шаблоны между строками.\n\n"
         "Style source excerpt:\n"

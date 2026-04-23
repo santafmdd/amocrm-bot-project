@@ -17,6 +17,8 @@ def build_deal_snapshot(
     config,
     logger,
     raw_bundle: dict[str, Any] | None = None,
+    selected_call_ids: set[str] | None = None,
+    transcription_selection_reason: str = "",
 ) -> dict[str, Any]:
     snapshot_warnings: list[str] = []
     enriched = _safe_enrich_one(normalized_deal=normalized_deal, config=config, logger=logger, warnings=snapshot_warnings)
@@ -28,9 +30,22 @@ def build_deal_snapshot(
     roks = _safe_extract_roks_snapshot(config=config, logger=logger, manager=manager or None, team=not bool(manager), warnings=snapshot_warnings)
 
     call_downloader = CallDownloader(config=config, logger=logger)
-    call_result = _safe_collect_deal_calls(call_downloader=call_downloader, deal=enriched, raw_bundle=raw_bundle, logger=logger, warnings=snapshot_warnings)
+    call_result = _safe_collect_deal_calls(
+        call_downloader=call_downloader,
+        deal=enriched,
+        raw_bundle=raw_bundle,
+        logger=logger,
+        warnings=snapshot_warnings,
+        selected_call_ids=selected_call_ids,
+    )
     call_dicts = call_evidence_to_dicts(call_result.calls)
-    transcripts = _safe_transcribe_call_evidence(calls=call_dicts, config=config, logger=logger, warnings=snapshot_warnings)
+    transcripts = _safe_transcribe_call_evidence(
+        calls=call_dicts,
+        config=config,
+        logger=logger,
+        warnings=snapshot_warnings,
+        selected_call_ids=selected_call_ids,
+    )
 
     return {
         "snapshot_generated_at": datetime.now(timezone.utc).isoformat(),
@@ -50,6 +65,10 @@ def build_deal_snapshot(
             "warnings": call_result.warnings,
             "items": call_dicts,
             "summary": build_call_summary(call_result.calls),
+            "selected_for_transcription": bool(selected_call_ids),
+            "selected_call_ids": sorted(selected_call_ids) if isinstance(selected_call_ids, set) else [],
+            "selected_call_count": len(selected_call_ids) if isinstance(selected_call_ids, set) else 0,
+            "transcription_selection_reason": str(transcription_selection_reason or ""),
         },
         "transcripts": transcripts,
         "call_derived_summary": _build_call_derived_summary(call_result.calls, transcripts),
@@ -209,9 +228,22 @@ def _safe_extract_roks_snapshot(*, config, logger, warnings: list[str], manager:
         )
 
 
-def _safe_collect_deal_calls(*, call_downloader, deal: dict[str, Any], raw_bundle: dict[str, Any] | None, logger, warnings: list[str]):
+def _safe_collect_deal_calls(
+    *,
+    call_downloader,
+    deal: dict[str, Any],
+    raw_bundle: dict[str, Any] | None,
+    logger,
+    warnings: list[str],
+    selected_call_ids: set[str] | None = None,
+):
     try:
-        return call_downloader.collect_deal_calls(deal=deal, raw_bundle=raw_bundle)
+        return call_downloader.collect_deal_calls(
+            deal=deal,
+            raw_bundle=raw_bundle,
+            resolve_audio=True,
+            audio_call_ids=selected_call_ids,
+        )
     except Exception as exc:
         deal_id = deal.get("deal_id") or deal.get("amo_lead_id") or ""
         logger.warning("snapshot call collection failed: deal_id=%s error=%s", deal_id, exc)
@@ -223,7 +255,20 @@ def _safe_collect_deal_calls(*, call_downloader, deal: dict[str, Any], raw_bundl
         )
 
 
-def _safe_transcribe_call_evidence(*, calls: list[dict[str, Any]], config, logger, warnings: list[str]) -> list[dict[str, Any]]:
+def _safe_transcribe_call_evidence(
+    *,
+    calls: list[dict[str, Any]],
+    config,
+    logger,
+    warnings: list[str],
+    selected_call_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    if isinstance(selected_call_ids, set):
+        if not selected_call_ids:
+            return []
+        calls = [x for x in calls if str(x.get("call_id") or "").strip() in selected_call_ids]
+        if not calls:
+            return []
     try:
         return transcribe_call_evidence(calls=calls, config=config, logger=logger)
     except Exception as exc:

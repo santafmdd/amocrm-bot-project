@@ -242,3 +242,19 @@ Janitor coverage was expanded beyond analyzer/collector exports. It now has expl
 - logs
 
 All cleanup is still allowlist-only and supports dry-run reporting before any deletion.
+
+## Update (2026-04-23): Call Metadata Pass Before Limit (Analyzer)
+
+For `src/deal_analyzer/cli.py -> analyze-period`, pipeline order now includes a dedicated call-first pre-limit stage:
+
+1. period resolution + live refresh (API-first) or fallback input JSON,
+2. **pre-limit lightweight call metadata pass** over all period deals,
+3. write debug artifacts:
+   - `period_runs/<run_id>/call_pool_debug.json`
+   - `period_runs/<run_id>/call_pool_debug.md`
+4. apply `--limit` for heavy per-deal snapshot/transcription/analyzer execution.
+
+This stage is intentionally lightweight:
+- no heavy STT execution,
+- no forced audio download,
+- only metadata diagnostics used to show whether period contains meaningful call evidence before truncation.

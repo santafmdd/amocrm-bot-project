@@ -31,6 +31,7 @@ class DealAnalyzerConfig:
     ollama_model: str
     ollama_timeout_seconds: int
     style_profile_name: str
+    daily_style_mode: str = "mild"
     ollama_fallback_enabled: bool = False
     ollama_fallback_base_url: str = ""
     ollama_fallback_model: str = ""
@@ -86,6 +87,13 @@ class DealAnalyzerConfig:
     daily_manager_allowlist: tuple[str, ...] = ("Илья", "Рустам")
     product_reference_urls: dict[str, str] | None = None
     sales_module_references: tuple[str, ...] = ()
+    external_retrieval_enabled: bool = False
+    external_retrieval_adapter: str = "none"
+    external_retrieval_endpoint: str = ""
+    external_retrieval_timeout_seconds: int = 10
+    external_retrieval_top_k: int = 3
+    external_retrieval_api_key: str = ""
+    external_retrieval_query_prefix: str = ""
     janitor_enabled: bool = False
     janitor_dry_run_default: bool = True
     retention_days_exports: int = 30
@@ -177,6 +185,9 @@ def load_deal_analyzer_config(config_path: str | None = None) -> DealAnalyzerCon
         ollama_fallback_timeout_seconds = 60
 
     style_profile_name = str(raw.get("style_profile_name", "manager_ru_v1")).strip() or "manager_ru_v1"
+    daily_style_mode = str(raw.get("daily_style_mode", "mild")).strip().lower() or "mild"
+    if daily_style_mode not in {"mild", "work_rude"}:
+        raise RuntimeError("Unsupported daily_style_mode. Allowed values: ['mild', 'work_rude']")
 
     period_mode = str(raw.get("period_mode", "smart_manager_default")).strip().lower() or "smart_manager_default"
     if period_mode not in PERIOD_MODES:
@@ -283,6 +294,21 @@ def load_deal_analyzer_config(config_path: str | None = None) -> DealAnalyzerCon
             if key_norm and val_norm:
                 product_reference_urls[key_norm] = val_norm
     sales_module_references = tuple(_parse_str_list(raw.get("sales_module_references", [])))
+    external_retrieval_enabled = bool(raw.get("external_retrieval_enabled", False))
+    external_retrieval_adapter = str(raw.get("external_retrieval_adapter", "none")).strip().lower() or "none"
+    if external_retrieval_adapter not in {"none", "http_json"}:
+        raise RuntimeError("Unsupported external_retrieval_adapter. Allowed values: ['none', 'http_json']")
+    external_retrieval_endpoint = str(raw.get("external_retrieval_endpoint", "")).strip()
+    try:
+        external_retrieval_timeout_seconds = max(1, int(raw.get("external_retrieval_timeout_seconds", 10)))
+    except (TypeError, ValueError):
+        external_retrieval_timeout_seconds = 10
+    try:
+        external_retrieval_top_k = max(1, int(raw.get("external_retrieval_top_k", 3)))
+    except (TypeError, ValueError):
+        external_retrieval_top_k = 3
+    external_retrieval_api_key = str(raw.get("external_retrieval_api_key", "")).strip()
+    external_retrieval_query_prefix = str(raw.get("external_retrieval_query_prefix", "")).strip()
 
     janitor_enabled = bool(raw.get("janitor_enabled", False))
     janitor_dry_run_default = bool(raw.get("janitor_dry_run_default", True))
@@ -320,6 +346,7 @@ def load_deal_analyzer_config(config_path: str | None = None) -> DealAnalyzerCon
         ollama_fallback_model=ollama_fallback_model,
         ollama_fallback_timeout_seconds=ollama_fallback_timeout_seconds,
         style_profile_name=style_profile_name,
+        daily_style_mode=daily_style_mode,
         period_mode=period_mode,
         custom_date_from=custom_date_from,
         custom_date_to=custom_date_to,
@@ -371,6 +398,13 @@ def load_deal_analyzer_config(config_path: str | None = None) -> DealAnalyzerCon
         daily_manager_allowlist=daily_manager_allowlist,
         product_reference_urls=product_reference_urls or None,
         sales_module_references=sales_module_references,
+        external_retrieval_enabled=external_retrieval_enabled,
+        external_retrieval_adapter=external_retrieval_adapter,
+        external_retrieval_endpoint=external_retrieval_endpoint,
+        external_retrieval_timeout_seconds=external_retrieval_timeout_seconds,
+        external_retrieval_top_k=external_retrieval_top_k,
+        external_retrieval_api_key=external_retrieval_api_key,
+        external_retrieval_query_prefix=external_retrieval_query_prefix,
         janitor_enabled=janitor_enabled,
         janitor_dry_run_default=janitor_dry_run_default,
         retention_days_exports=retention_days_exports,

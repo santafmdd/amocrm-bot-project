@@ -1,3 +1,54 @@
+## Analytics Runtime: Known Failure Classes
+
+- `duplicate visible tags / different backend ids`:
+  signals: `duplicate_tag_candidates_found=true`, `duplicate_tag_candidates=[...]`, `selected_tag_candidate_id`, `duplicate_retry_attempt`.
+- `wrong route launch vs batch DSL launch`:
+  signals: `execution_mode=static_profile` (unexpected), `source_of_filter_value=static_profile`, no `parsed_sheet_tasks_count`.
+- `stale parse false negative after successful apply`:
+  signals: `tag_verify_success=url_marker_after_apply` + `apply_confirmed_but_parse_suspicious=true`.
+- `writer accepted but nothing persisted`:
+  signals: `planned_writes>0` with `validated_writes=0` or `validation_failed_cells>0`.
+
+## Analytics Runtime: Golden Commands
+
+- Dry-run batch DSL:
+  `python -m src.run_profile_analytics --report-id analytics_tag_layout_example --browser-backend openclaw_cdp --tag-selection-mode script --writer-layout-api-batch-from-sheet-dsl --writer-layout-api-batch-from-sheet-dsl-dry-run`
+- Live-run batch DSL:
+  `python -m src.run_profile_analytics --report-id analytics_tag_layout_example --browser-backend openclaw_cdp --tag-selection-mode script --writer-layout-api-batch-from-sheet-dsl`
+- Narrow duplicate-tag debug run:
+  `python -m src.run_profile_analytics --report-id analytics_tag_layout_example --browser-backend openclaw_cdp --tag-selection-mode script --writer-layout-api-target-dsl-cell A29 --writer-layout-api-batch-from-sheet-dsl`
+
+## Analytics Runtime: Stop-Loss Rules
+
+- Stop and do not debug tag layer further if logs show:
+  - mass `goto_cell` / long cell scan loops,
+  - wrong writer mode in final routing,
+  - writer path mismatch (expected API batch, got UI/grid path).
+- First fix routing/execution mode, then return to tag duplicate debugging.
+
+## Analytics Runtime: Debug Artifacts to Save Before Any Risky Fix
+
+- last command line
+- `git status`
+- current branch (`git rev-parse --abbrev-ref HEAD`)
+- related runtime log file
+- latest `layout_api_write_summary_*.json` / `*.txt`
+- latest related right-panel/filter debug dumps from `exports/debug/`
+
+## Update (2026-04-18): Duplicate Tag Candidates in amoCRM
+
+- amoCRM popup can show visually identical tag suggestions with different internal IDs.
+- Runtime now logs duplicate candidates as structured list:
+  - `duplicate_tag_candidates_found`
+  - `duplicate_tag_candidates=[{text,id,index}]`
+  - `selected_tag_candidate_id`
+  - `selected_tag_candidate_index`
+- If apply URL confirms tag filter but parse is suspicious, runtime can retry the next duplicate candidate:
+  - `apply_confirmed_but_parse_suspicious=true`
+  - `duplicate_retry_attempt`
+  - `duplicate_retry_exhausted`
+  - `final_selected_tag_candidate_id`
+
 ## Update (2026-04-12): Google OAuth Auth Modes
 
 Why system browser opens:
@@ -66,6 +117,26 @@ Token/credentials storage:
 - Current UI path is **best-effort** and uses direct value entry/selection in available control.
 - There is no guaranteed dedicated amoCRM UI operator for true prefix query in every account layout.
 - If UI does not expose deterministic prefix semantics, runtime logs warning/failure explicitly.
+
+## Update (2026-04-23): Deal Analyzer Call-First Pre-Limit Metadata Pass
+
+`analyze-period` now runs an explicit lightweight call metadata pass **before** applying `--limit` and before heavy transcription work.
+
+What it does:
+- scans all period deals (after live refresh or fallback input source),
+- collects lightweight call stats (counts, durations, recording/audio references, redial patterns),
+- writes run artifacts:
+  - `workspace/deal_analyzer/period_runs/<run_id>/call_pool_debug.json`
+  - `workspace/deal_analyzer/period_runs/<run_id>/call_pool_debug.md`
+
+New pre-limit aggregates are also stored in `summary.json`:
+- `deals_total_before_limit`
+- `deals_with_any_calls`
+- `deals_with_recordings`
+- `deals_with_long_calls`
+- `deals_with_only_short_calls`
+- `deals_with_autoanswer_pattern`
+- `deals_with_redial_pattern`
 
 
 ## Update (2026-04-11): DSL Encoding + Date Normalization

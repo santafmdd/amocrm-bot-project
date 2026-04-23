@@ -49,7 +49,14 @@ class CallDownloader:
         self.audio_cache_dir.mkdir(parents=True, exist_ok=True)
         self._auth_header_token: str | None = None
 
-    def collect_deal_calls(self, *, deal: dict[str, Any], raw_bundle: dict[str, Any] | None = None) -> CallCollectionResult:
+    def collect_deal_calls(
+        self,
+        *,
+        deal: dict[str, Any],
+        raw_bundle: dict[str, Any] | None = None,
+        resolve_audio: bool = True,
+        audio_call_ids: set[str] | None = None,
+    ) -> CallCollectionResult:
         deal_id = str(deal.get("deal_id") or deal.get("amo_lead_id") or "")
         mode = str(getattr(self.config, "call_collection_mode", "disabled") or "disabled").strip().lower()
         warnings: list[str] = []
@@ -87,7 +94,8 @@ class CallDownloader:
                 source_used = "normalized_fallback"
 
         deduped = deduplicate_calls(candidates)
-        deduped = [self._resolve_call_audio(call) for call in deduped]
+        if resolve_audio:
+            deduped = [self._resolve_call_audio(call, audio_call_ids=audio_call_ids) for call in deduped]
         return CallCollectionResult(deal_id=deal_id, calls=deduped, warnings=warnings, source_used=source_used)
 
     def collect_period_calls(
@@ -95,15 +103,35 @@ class CallDownloader:
         *,
         deals: list[dict[str, Any]],
         raw_bundles_by_deal: dict[str, dict[str, Any]] | None = None,
+        resolve_audio: bool = True,
+        audio_call_ids_by_deal: dict[str, set[str]] | None = None,
     ) -> dict[str, CallCollectionResult]:
         out: dict[str, CallCollectionResult] = {}
         raw_bundles_by_deal = raw_bundles_by_deal or {}
+        audio_call_ids_by_deal = audio_call_ids_by_deal or {}
         for deal in deals:
             deal_id = str(deal.get("deal_id") or deal.get("amo_lead_id") or "")
-            out[deal_id] = self.collect_deal_calls(deal=deal, raw_bundle=raw_bundles_by_deal.get(deal_id))
+            out[deal_id] = self.collect_deal_calls(
+                deal=deal,
+                raw_bundle=raw_bundles_by_deal.get(deal_id),
+                resolve_audio=resolve_audio,
+                audio_call_ids=audio_call_ids_by_deal.get(deal_id),
+            )
         return out
 
-    def _resolve_call_audio(self, call: CallEvidence) -> CallEvidence:
+    def _resolve_call_audio(self, call: CallEvidence, *, audio_call_ids: set[str] | None = None) -> CallEvidence:
+        if isinstance(audio_call_ids, set) and audio_call_ids and str(call.call_id or "").strip() not in audio_call_ids:
+            return replace(
+                call,
+                audio_download_status="not_selected_for_transcription",
+                audio_download_error="",
+            )
+        if isinstance(audio_call_ids, set) and not audio_call_ids:
+            return replace(
+                call,
+                audio_download_status="not_selected_for_transcription",
+                audio_download_error="",
+            )
         local_audio_path = str(call.audio_path or "").strip()
         if local_audio_path:
             local_path = Path(local_audio_path)

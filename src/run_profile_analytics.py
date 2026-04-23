@@ -1245,6 +1245,9 @@ def _run_api_layout_batch_from_sheet_dsl(
             row_summary["compiled_profile_path"] = str(compiled_json_path)
             row_summary["compiled_stage_pivot_path"] = str(pivot_path)
             row_summary["layout_api_write_summary_path"] = str(latest_summary_path) if latest_summary_path else ""
+            suspicious_parse = bool(
+                getattr(block_result.best_scenario, "apply_confirmed_but_parse_suspicious", False)
+            )
             row_summary["selected_block_boundaries"] = {
                 "next_anchor_dsl_row": (latest_summary_payload or {}).get("next_anchor_dsl_row") if latest_summary_payload else None,
                 "hard_row_upper_bound": (latest_summary_payload or {}).get("hard_row_upper_bound") if latest_summary_payload else None,
@@ -1252,8 +1255,31 @@ def _run_api_layout_batch_from_sheet_dsl(
                 "stage_rows_selected_count": (latest_summary_payload or {}).get("stage_rows_selected_count") if latest_summary_payload else None,
                 "stop_reason": (latest_summary_payload or {}).get("stop_reason") if latest_summary_payload else None,
             }
+            row_summary["apply_confirmed_but_parse_suspicious"] = suspicious_parse
 
-            if dry_run:
+            stage_rows_selected_count = int(
+                (latest_summary_payload or {}).get("stage_rows_selected_count", 0) or 0
+            )
+            stop_reason = str((latest_summary_payload or {}).get("stop_reason", "") or "").strip()
+            suspicious_skip = bool(
+                suspicious_parse
+                and (
+                    stage_rows_selected_count == 0
+                    or stop_reason == "unmapped_stage_row"
+                )
+            )
+            row_summary["suspicious_parse_skip"] = suspicious_skip
+
+            if suspicious_skip:
+                row_summary["status"] = "manual_review_required"
+                row_summary["block_status"] = "manual_review_required"
+                row_summary["skip_reason"] = "suspicious_parse_unmapped_stage_row"
+                row_summary["updated_cells_count"] = int(response.get("totalUpdatedCells", 0) or 0) if not dry_run else 0
+                row_summary["planned_updates"] = int(response.get("planned_updates", 0) or 0) if dry_run else None
+                logger.warning("suspicious_parse_skip=true dsl_row=%s", dsl_row)
+                logger.warning("block_status=manual_review_required dsl_row=%s", dsl_row)
+                logger.warning("skip_reason=suspicious_parse_unmapped_stage_row dsl_row=%s", dsl_row)
+            elif dry_run:
                 row_summary["status"] = "dry_run_planned"
                 row_summary["planned_updates"] = int(response.get("planned_updates", 0) or 0)
                 row_summary["updated_cells_count"] = 0
@@ -1270,7 +1296,8 @@ def _run_api_layout_batch_from_sheet_dsl(
                     dsl_row,
                     row_summary["updated_cells_count"],
                 )
-            successes += 1
+            if not suspicious_skip:
+                successes += 1
         except Exception as exc:
             row_summary["status"] = "write_failed"
             row_summary["error"] = str(exc)
@@ -1290,6 +1317,7 @@ def _run_api_layout_batch_from_sheet_dsl(
         "successes": successes,
         "dry_run": bool(dry_run),
         "rows": summary_rows,
+        "manual_review_required_count": sum(1 for row in summary_rows if row.get("status") == "manual_review_required"),
     }
     summary_path.write_text(json.dumps(summary_payload, ensure_ascii=False, indent=2), encoding="utf-8")
     logger.info("api batch from sheet dsl summary saved: %s", summary_path)

@@ -24,6 +24,48 @@ DAILY_CASE_MODES = {
 }
 
 
+ROLE_SCOPE_MATRIX: dict[str, dict[str, tuple[str, ...]]] = {
+    "телемаркетолог": {
+        "allowed_topics": (
+            "проход секретаря",
+            "выход на ЛПР",
+            "качество квалификации",
+            "назначение встречи",
+            "дисциплина звонков",
+            "покрытие номеров",
+            "недозвоны",
+            "автоответчики",
+            "повторы наборов",
+        ),
+        "blocked_topics": (
+            "презентация",
+            "демонстрация",
+            "бриф",
+            "тест",
+            "коммерческое предложение",
+            "кп",
+            "оплата",
+            "дожим после демо",
+        ),
+    },
+    "менеджер по продажам": {
+        "allowed_topics": (
+            "демонстрация",
+            "бриф",
+            "тест",
+            "следующий шаг после встречи",
+            "счет",
+            "коммерческое предложение",
+            "кп",
+            "оплата",
+            "зависание после теплого этапа",
+            "качество follow-up после демо и теста",
+        ),
+        "blocked_topics": (),
+    },
+}
+
+
 def classify_daily_case(*, role: str, items: list[dict[str, Any]]) -> DailyCaseProfile:
     role_norm = str(role or "").strip().lower()
     text = _items_text(items)
@@ -80,6 +122,22 @@ def mode_prompt_policy(profile: DailyCaseProfile) -> dict[str, Any]:
         "allowed_axes": list(profile.allowed_axes),
         "banned_topics": list(profile.banned_topics),
         "preferred_modules": list(profile.preferred_modules),
+    }
+
+
+def get_role_scope_policy(*, role: str, items: list[dict[str, Any]]) -> dict[str, Any]:
+    role_norm = str(role or "").strip().lower()
+    base = ROLE_SCOPE_MATRIX.get(role_norm, ROLE_SCOPE_MATRIX["менеджер по продажам"])
+    allowed_topics = list(base.get("allowed_topics", ()))
+    blocked_topics = list(base.get("blocked_topics", ()))
+    warm_allowed_by_signal = _telemarketer_warm_override_allowed(items=items) if "телемаркетолог" in role_norm else False
+    if warm_allowed_by_signal and blocked_topics:
+        blocked_topics = [x for x in blocked_topics if x not in {"презентация", "демонстрация", "бриф", "тест"}]
+    return {
+        "role_scope_applied": True,
+        "role_allowed_topics": allowed_topics,
+        "role_blocked_topics": blocked_topics,
+        "role_scope_conflict_flag": bool(warm_allowed_by_signal),
     }
 
 
@@ -248,3 +306,35 @@ def _transcript_usable_score(item: dict[str, Any]) -> int:
     if len(excerpt) >= 120 or len(call_summary) >= 80:
         return 2
     return 1
+
+
+def _telemarketer_warm_override_allowed(*, items: list[dict[str, Any]]) -> bool:
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if _transcript_usable_score(item) < 2:
+            continue
+        text = " ".join(
+            str(item.get(key) or "").strip().lower()
+            for key in ("transcript_text_excerpt", "call_signal_summary_short", "manager_summary")
+        )
+        warm_tokens = ("демо", "демонстрац", "бриф", "тест", "кп", "оплат", "счет")
+        has_warm = any(token in text for token in warm_tokens)
+        has_negation = any(
+            marker in text
+            for marker in (
+                "без демо",
+                "без демонстрац",
+                "не было демо",
+                "нет демо",
+                "не дошли до демо",
+                "без тест",
+                "не было тест",
+                "не дошли до тест",
+                "без бриф",
+                "не заполняли бриф",
+            )
+        )
+        if has_warm and not has_negation:
+            return True
+    return False
