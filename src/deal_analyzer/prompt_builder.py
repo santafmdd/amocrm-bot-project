@@ -132,7 +132,14 @@ def build_daily_table_messages(
     role_scope_conflict_flag = bool(factual_payload.get("role_scope_conflict_flag", False))
     reference_stack = factual_payload.get("reference_stack", {}) if isinstance(factual_payload.get("reference_stack"), dict) else {}
     prompt_snippets = reference_stack.get("prompt_snippets", []) if isinstance(reference_stack.get("prompt_snippets"), list) else []
+    required_layers = reference_stack.get("required_layers", {}) if isinstance(reference_stack.get("required_layers"), dict) else {}
     reference_lines: list[str] = []
+    for key in ("internal_references", "role_context", "product_reference_urls"):
+        row = required_layers.get(key, {})
+        if isinstance(row, dict):
+            reference_lines.append(
+                f"required[{key}] ok={bool(row.get('ok'))} snippets={int(row.get('snippets_used', 0) or 0)}"
+            )
     for idx, item in enumerate(prompt_snippets[:12], start=1):
         if not isinstance(item, dict):
             continue
@@ -155,7 +162,8 @@ def build_daily_table_messages(
         "Можно выбирать подходящие инструменты продаж (вопросы, модуль следующего шага, квалификация), "
         "если это подтверждается фактурой звонков/CRM. "
         "Если переговорного материала мало, честно пиши про дисциплину набора->дозвона без выдумки. "
-        "Для strong_sides/growth_zones/fix_action/coaching/why_important обязательно опирайся на reference stack. "
+        "Для strong_sides/growth_zones/fix_action/reinforce/coaching/why_important обязательно опирайся на reference stack. "
+        "Для product_focus и понимания этапа разговора используй продуктовые URL-референсы и role context из factual payload. "
         f"{style_mode_line} "
         "Верни только JSON-объект без markdown."
     )

@@ -23,6 +23,60 @@ DAILY_CASE_MODES = {
     "skip_no_meaningful_case",
 }
 
+TELEMARKETER_SCOPE = {
+    "allowed_topics": (
+        "проход секретаря",
+        "выход на ЛПР",
+        "выявление актуальности",
+        "формирование потребности",
+        "презентация встречи",
+        "закрытие на встречу",
+        "отработка возражений верхней воронки",
+        "дисциплина звонков",
+        "покрытие номеров",
+        "недозвоны",
+        "автоответчики",
+        "повторы наборов",
+        "качество фиксации сути разговора в CRM",
+    ),
+    "blocked_topics": (
+        "презентация продукта",
+        "демонстрация",
+        "бриф",
+        "тест",
+        "коммерческое предложение",
+        "кп",
+        "оплата",
+        "дожим после демо",
+    ),
+}
+
+SALES_MANAGER_SCOPE = {
+    "allowed_topics": (
+        "входящие обращения",
+        "полухолодные кейсы",
+        "выставка и визитки",
+        "холодные касания",
+        "проход секретаря",
+        "выход на ЛПР",
+        "выявление актуальности",
+        "формирование потребности",
+        "назначение встречи",
+        "демонстрация",
+        "бриф",
+        "тест",
+        "обратная связь после теста",
+        "следующий шаг после встречи",
+        "счет",
+        "коммерческое предложение",
+        "кп",
+        "оплата",
+        "дожим после демо",
+        "зависание после теплого этапа",
+    ),
+    "blocked_topics": (),
+}
+
 
 ROLE_SCOPE_MATRIX: dict[str, dict[str, tuple[str, ...]]] = {
     "телемаркетолог": {
@@ -96,8 +150,10 @@ def classify_daily_case(*, role: str, items: list[dict[str, Any]]) -> DailyCaseP
     if dead_redial:
         return _profile_redial("dial_pattern_detected")
     if has_usable:
-        if "телемаркетолог" in role_norm:
+        if _is_telemarketer_role(role_norm):
             return _profile_secretary("usable_call_without_lpr_for_cold_role")
+        if _is_sales_manager_role(role_norm) and (lpr_hits > 0 or secretary_hits > 0 or supplier_hits > 0):
+            return _profile_lpr("usable_upper_or_mid_funnel_for_sales_manager")
         return _profile_warm("usable_call_general")
 
     return DailyCaseProfile(
@@ -127,12 +183,15 @@ def mode_prompt_policy(profile: DailyCaseProfile) -> dict[str, Any]:
 
 def get_role_scope_policy(*, role: str, items: list[dict[str, Any]]) -> dict[str, Any]:
     role_norm = str(role or "").strip().lower()
-    base = ROLE_SCOPE_MATRIX.get(role_norm, ROLE_SCOPE_MATRIX["менеджер по продажам"])
+    if _is_telemarketer_role(role_norm):
+        base = TELEMARKETER_SCOPE
+    else:
+        base = SALES_MANAGER_SCOPE
     allowed_topics = list(base.get("allowed_topics", ()))
     blocked_topics = list(base.get("blocked_topics", ()))
-    warm_allowed_by_signal = _telemarketer_warm_override_allowed(items=items) if "телемаркетолог" in role_norm else False
+    warm_allowed_by_signal = _telemarketer_warm_override_allowed(items=items) if _is_telemarketer_role(role_norm) else False
     if warm_allowed_by_signal and blocked_topics:
-        blocked_topics = [x for x in blocked_topics if x not in {"презентация", "демонстрация", "бриф", "тест"}]
+        blocked_topics = [x for x in blocked_topics if x not in {"презентация продукта", "демонстрация", "бриф", "тест"}]
     return {
         "role_scope_applied": True,
         "role_allowed_topics": allowed_topics,
@@ -338,3 +397,13 @@ def _telemarketer_warm_override_allowed(*, items: list[dict[str, Any]]) -> bool:
         if has_warm and not has_negation:
             return True
     return False
+
+
+def _is_telemarketer_role(role_text: str) -> bool:
+    low = str(role_text or "").strip().lower()
+    return "телемаркетолог" in low or "рустам" in low
+
+
+def _is_sales_manager_role(role_text: str) -> bool:
+    low = str(role_text or "").strip().lower()
+    return "менеджер по продажам" in low or "илья" in low

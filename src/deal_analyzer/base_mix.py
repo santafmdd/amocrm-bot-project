@@ -1,15 +1,31 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import re
 from collections import Counter
 from typing import Any
 
+from src.deal_analyzer.tag_normalization import normalize_tag_value, sanitize_raw_tag
 
 def normalize_tag_values(values: list[Any]) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
     for raw in values:
-        text = " ".join(str(raw or "").split()).strip()
+        raw_tag, normalized_tag, _mapped = normalize_tag_value(raw)
+        if not raw_tag:
+            continue
+        key = normalized_tag.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(normalized_tag)
+    return out
+
+
+def collect_raw_tag_values(values: list[Any]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        text = sanitize_raw_tag(raw)
         if not text:
             continue
         key = text.lower()
@@ -20,29 +36,98 @@ def normalize_tag_values(values: list[Any]) -> list[str]:
     return out
 
 
-def build_base_mix_text(records: list[dict[str, Any]]) -> str:
+def build_tag_entries(values: list[Any], *, source_of_tag: str) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for raw in values:
+        raw_tag, normalized_tag, _mapped = normalize_tag_value(raw)
+        if not raw_tag:
+            continue
+        pair = (raw_tag.lower(), normalized_tag.lower())
+        if pair in seen:
+            continue
+        seen.add(pair)
+        out.append(
+            {
+                "raw_tag": raw_tag,
+                "normalized_tag": normalized_tag,
+                "source_of_tag": source_of_tag,
+            }
+        )
+    return out
+
+
+def resolve_base_mix(records: list[dict[str, Any]]) -> dict[str, Any]:
     # 1) deal tags
     use_raw = any(isinstance(item.get("deal_tags_raw"), list) for item in records)
     deal_tags = _collect_values(records, keys=("deal_tags_raw",) if use_raw else ("tags",))
+    raw_tags_deal = _collect_raw_values(records, keys=("deal_tags_raw", "tags"))
+    raw_tags_company = _collect_raw_values(records, keys=("company_tags",))
+    deal_tag_entries = _collect_tag_entries(records, keys=("deal_tags_raw", "tags"), source_of_tag="deal")
+    company_tag_entries = _collect_tag_entries(records, keys=("company_tags",), source_of_tag="company")
     if deal_tags:
-        return _top_joined(deal_tags)
+        return {
+            "selected_source": "deal_tags",
+            "selected_value": _top_joined(deal_tags),
+            "fallback_used": False,
+            "raw_tags_deal": raw_tags_deal,
+            "raw_tags_company": raw_tags_company,
+            "deal_tag_entries": deal_tag_entries,
+            "company_tag_entries": company_tag_entries,
+        }
 
     # 2) company tags
     company_tags = _collect_values(records, keys=("company_tags",))
     if company_tags:
-        return _top_joined(company_tags)
+        return {
+            "selected_source": "company_tags",
+            "selected_value": _top_joined(company_tags),
+            "fallback_used": False,
+            "raw_tags_deal": raw_tags_deal,
+            "raw_tags_company": raw_tags_company,
+            "deal_tag_entries": deal_tag_entries,
+            "company_tag_entries": company_tag_entries,
+        }
 
     # 3) source/form/url/title hints
     source_hints = _collect_source_hints(records)
     if source_hints:
-        return _top_joined(source_hints)
+        return {
+            "selected_source": "source_hints",
+            "selected_value": _top_joined(source_hints),
+            "fallback_used": False,
+            "raw_tags_deal": raw_tags_deal,
+            "raw_tags_company": raw_tags_company,
+            "deal_tag_entries": deal_tag_entries,
+            "company_tag_entries": company_tag_entries,
+        }
 
-    # 4) company meaning / OKVED / comments
+    # 4) company meaning / OKVED / comments hints
     semantic_hints = _collect_semantic_hints(records)
     if semantic_hints:
-        return _top_joined(semantic_hints)
+        return {
+            "selected_source": "semantic_hints",
+            "selected_value": _top_joined(semantic_hints),
+            "fallback_used": False,
+            "raw_tags_deal": raw_tags_deal,
+            "raw_tags_company": raw_tags_company,
+            "deal_tag_entries": deal_tag_entries,
+            "company_tag_entries": company_tag_entries,
+        }
 
-    return "солянка"
+    return {
+        "selected_source": "fallback",
+        "selected_value": "солянка",
+        "fallback_used": True,
+        "raw_tags_deal": raw_tags_deal,
+        "raw_tags_company": raw_tags_company,
+        "deal_tag_entries": deal_tag_entries,
+        "company_tag_entries": company_tag_entries,
+    }
+
+
+def build_base_mix_text(records: list[dict[str, Any]]) -> str:
+    return str(resolve_base_mix(records).get("selected_value") or "солянка")
 
 
 def _collect_values(records: list[dict[str, Any]], *, keys: tuple[str, ...]) -> list[str]:
@@ -55,6 +140,44 @@ def _collect_values(records: list[dict[str, Any]], *, keys: tuple[str, ...]) -> 
             for value in normalize_tag_values(values):
                 counter[value] += 1
     return [name for name, _ in counter.most_common(6)]
+
+
+def _collect_raw_values(records: list[dict[str, Any]], *, keys: tuple[str, ...]) -> list[str]:
+    counter: Counter[str] = Counter()
+    for item in records:
+        for key in keys:
+            values = item.get(key)
+            if not isinstance(values, list):
+                continue
+            for value in collect_raw_tag_values(values):
+                counter[value] += 1
+    return [name for name, _ in counter.most_common(12)]
+
+
+def _collect_tag_entries(
+    records: list[dict[str, Any]],
+    *,
+    keys: tuple[str, ...],
+    source_of_tag: str,
+) -> list[dict[str, str]]:
+    entries: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for item in records:
+        for key in keys:
+            values = item.get(key)
+            if not isinstance(values, list):
+                continue
+            for entry in build_tag_entries(values, source_of_tag=source_of_tag):
+                marker = (
+                    entry.get("raw_tag", "").lower(),
+                    entry.get("normalized_tag", "").lower(),
+                    entry.get("source_of_tag", "").lower(),
+                )
+                if marker in seen:
+                    continue
+                seen.add(marker)
+                entries.append(entry)
+    return entries[:20]
 
 
 def _collect_source_hints(records: list[dict[str, Any]]) -> list[str]:

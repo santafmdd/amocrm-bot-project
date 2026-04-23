@@ -23,25 +23,74 @@ def build_daily_reference_stack(
 
     internal_sources = _collect_internal_reference_paths(cfg=cfg, project_root=app.project_root)
     internal_snippets = _collect_local_snippets(paths=internal_sources, query=query, top_k=8, logger=logger)
-
+    role_snippets = _collect_role_context_snippets(factual_payload=factual_payload)
     product_snippets = _collect_product_reference_snippets(cfg=cfg)
     external = _external_retrieval(cfg=cfg, query=query, logger=logger)
 
     combined: list[dict[str, Any]] = []
     combined.extend(internal_snippets)
+    combined.extend(role_snippets)
     combined.extend(product_snippets)
     if isinstance(external.get("snippets"), list):
         combined.extend([x for x in external["snippets"] if isinstance(x, dict)])
 
     prompt_snippets = combined[:12]
-    source_order = ["internal_references", "product_reference_urls", "external_retrieval_optional"]
+    source_order = ["internal_references", "role_context", "product_reference_urls", "external_retrieval_optional"]
+
+    configured_product_urls_count = 0
+    if cfg is not None and isinstance(getattr(cfg, "product_reference_urls", None), dict):
+        configured_product_urls_count = sum(
+            1 for x in getattr(cfg, "product_reference_urls", {}).values() if str(x or "").strip()
+        )
+
+    required_layers = {
+        "internal_references": {
+            "required": True,
+            "sources_total": len(internal_sources),
+            "snippets_used": len(internal_snippets),
+            "ok": bool(internal_snippets),
+        },
+        "role_context": {
+            "required": True,
+            "snippets_used": len(role_snippets),
+            "ok": bool(role_snippets),
+        },
+        "product_reference_urls": {
+            "required": True,
+            "urls_configured": int(configured_product_urls_count),
+            "snippets_used": len(product_snippets),
+            "ok": bool(product_snippets),
+        },
+    }
+
+    prompt_layers = [str(x.get("layer") or "") for x in prompt_snippets if isinstance(x, dict)]
+    layer_presence = {
+        "internal_in_prompt": any(x == "internal" for x in prompt_layers),
+        "role_context_in_prompt": any(x == "role_context" for x in prompt_layers),
+        "product_reference_in_prompt": any(x == "product_url" for x in prompt_layers),
+    }
+
+    if logger is not None:
+        logger.info(
+            "daily reference stack built: snippets=%s internal=%s role=%s product=%s external_used=%s",
+            len(prompt_snippets),
+            required_layers["internal_references"]["ok"],
+            required_layers["role_context"]["ok"],
+            required_layers["product_reference_urls"]["ok"],
+            bool(external.get("used")),
+        )
+
     return {
         "query": query,
         "source_order": source_order,
+        "required_layers": required_layers,
+        "layer_presence": layer_presence,
         "internal_sources": [str(x) for x in internal_sources],
         "internal_sources_count": len(internal_sources),
         "internal_snippets": internal_snippets,
         "internal_snippets_count": len(internal_snippets),
+        "role_snippets": role_snippets,
+        "role_snippets_count": len(role_snippets),
         "product_snippets": product_snippets,
         "product_snippets_count": len(product_snippets),
         "external_retrieval": external,
@@ -56,7 +105,17 @@ def build_reference_prompt_section(reference_stack: dict[str, Any]) -> str:
     lines: list[str] = []
     order = reference_stack.get("source_order", [])
     if isinstance(order, list) and order:
-        lines.append(f"Порядок источников: {', '.join(str(x) for x in order)}")
+        lines.append(f"??????? ??????????: {', '.join(str(x) for x in order)}")
+
+    required = reference_stack.get("required_layers", {})
+    if isinstance(required, dict) and required:
+        for key in ("internal_references", "role_context", "product_reference_urls"):
+            row = required.get(key, {})
+            if not isinstance(row, dict):
+                continue
+            lines.append(
+                f"required[{key}] ok={bool(row.get('ok'))} snippets={int(row.get('snippets_used', 0) or 0)}"
+            )
 
     snippets = reference_stack.get("prompt_snippets", [])
     if isinstance(snippets, list):
@@ -73,7 +132,7 @@ def build_reference_prompt_section(reference_stack: dict[str, Any]) -> str:
     ext = reference_stack.get("external_retrieval", {})
     if isinstance(ext, dict):
         lines.append(
-            "Внешний retrieval: "
+            "External retrieval: "
             f"enabled={bool(ext.get('enabled'))}, used={bool(ext.get('used'))}, reason={str(ext.get('reason') or '')}"
         )
     return "\n".join(lines).strip()
@@ -183,11 +242,50 @@ def _collect_product_reference_snippets(*, cfg: DealAnalyzerConfig | None) -> li
             {
                 "layer": "product_url",
                 "source": url,
-                "snippet": f"Продуктовый референс {key}: {url}",
+                "snippet": f"??????????? ???????? {key}: {url}",
                 "score": 1,
             }
         )
     return out
+
+
+def _collect_role_context_snippets(*, factual_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    manager = str(factual_payload.get("manager_name") or "").strip()
+    role = str(factual_payload.get("role") or "").strip()
+    case_policy = factual_payload.get("case_policy", {}) if isinstance(factual_payload.get("case_policy"), dict) else {}
+    mode = str(case_policy.get("daily_analysis_mode") or "").strip()
+    allowed_axes = (
+        [str(x).strip() for x in case_policy.get("allowed_axes", []) if str(x).strip()]
+        if isinstance(case_policy.get("allowed_axes"), list)
+        else []
+    )
+    banned_topics = (
+        [str(x).strip() for x in case_policy.get("banned_topics", []) if str(x).strip()]
+        if isinstance(case_policy.get("banned_topics"), list)
+        else []
+    )
+    role_allowed_topics = (
+        [str(x).strip() for x in factual_payload.get("role_allowed_topics", []) if str(x).strip()]
+        if isinstance(factual_payload.get("role_allowed_topics"), list)
+        else []
+    )
+    role_forbidden_topics = (
+        [str(x).strip() for x in factual_payload.get("role_forbidden_topics", []) if str(x).strip()]
+        if isinstance(factual_payload.get("role_forbidden_topics"), list)
+        else []
+    )
+
+    if not manager and not role and not mode and not allowed_axes and not role_allowed_topics and not banned_topics:
+        return []
+
+    snippet = (
+        f"role context: manager={manager or '-'}; role={role or '-'}; mode={mode or '-'}; "
+        f"allowed_axes={', '.join(allowed_axes[:8]) if allowed_axes else '-'}; "
+        f"banned_topics={', '.join(banned_topics[:8]) if banned_topics else '-'}; "
+        f"role_allowed={', '.join(role_allowed_topics[:8]) if role_allowed_topics else '-'}; "
+        f"role_blocked={', '.join(role_forbidden_topics[:8]) if role_forbidden_topics else '-'}"
+    )
+    return [{"layer": "role_context", "source": "factual_payload.role_context", "snippet": snippet[:900], "score": 1}]
 
 
 def _external_retrieval(*, cfg: DealAnalyzerConfig | None, query: str, logger: Any | None) -> dict[str, Any]:
@@ -303,8 +401,8 @@ def _external_retrieval(*, cfg: DealAnalyzerConfig | None, query: str, logger: A
 
 
 def _query_tokens(query: str) -> set[str]:
-    tokens = set(re.findall(r"[a-zA-Zа-яА-Я0-9]{4,}", str(query or "").lower()))
-    return {t for t in tokens if t not in {"менеджер", "сделка", "контроль", "анализ", "период"}}
+    tokens = set(re.findall(r"[a-zA-Z?-??-?0-9]{4,}", str(query or "").lower()))
+    return {t for t in tokens if t not in {"????????", "??????", "????????", "??????", "??????"}}
 
 
 def _token_overlap_score(text: str, query_tokens: set[str]) -> int:

@@ -23,7 +23,10 @@ from src.deal_analyzer.cli import (
     _select_daily_package_records,
     _build_call_pool_artifacts,
     _build_transcription_shortlist_payload,
+    _build_analysis_shortlist_payload,
     _build_daily_table_factual_payload,
+    _expand_daily_rows_to_case_rows,
+    _build_company_tag_propagation_dry_run_plan,
     _run_analyze_period,
 )
 from src.deal_analyzer.daily_case_modes import classify_daily_case, get_role_scope_policy
@@ -224,6 +227,8 @@ def test_analyze_period_creates_run_dir_and_summary_json():
     transcription_shortlist_json_path = run_dirs[0] / "transcription_shortlist.json"
     transcription_shortlist_md_path = run_dirs[0] / "transcription_shortlist.md"
     daily_selection_debug_path = run_dirs[0] / "daily_selection_debug.json"
+    company_tag_plan_json_path = run_dirs[0] / "company_tag_propagation_dry_run.json"
+    company_tag_plan_md_path = run_dirs[0] / "company_tag_propagation_dry_run.md"
     assert summary_path.exists()
     assert summary_md_path.exists()
     assert top_risks_path.exists()
@@ -244,6 +249,8 @@ def test_analyze_period_creates_run_dir_and_summary_json():
     assert transcription_shortlist_json_path.exists()
     assert transcription_shortlist_md_path.exists()
     assert daily_selection_debug_path.exists()
+    assert company_tag_plan_json_path.exists()
+    assert company_tag_plan_md_path.exists()
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     assert summary["total_deals_seen"] == 2
     assert summary["total_deals_analyzed"] == 2
@@ -257,6 +264,7 @@ def test_analyze_period_creates_run_dir_and_summary_json():
     assert "deals_total_before_limit" in summary
     assert "deals_with_any_calls" in summary
     assert "deals_with_recordings" in summary
+    assert "company_tag_propagation_dry_run" in summary
     assert "deals_with_long_calls" in summary
     assert "deals_with_only_short_calls" in summary
     assert "deals_with_autoanswer_pattern" in summary
@@ -394,6 +402,10 @@ def test_analyze_period_creates_run_dir_and_summary_json():
             "owner_name",
             "status_name",
             "pipeline_name",
+            "runtime_effective_tags",
+            "runtime_tag_source",
+            "runtime_company_tag_promoted",
+            "runtime_propagated_company_tags",
             "calls_total",
             "outbound_calls",
             "inbound_calls",
@@ -1602,7 +1614,7 @@ def test_daily_control_payload_uses_business_columns_only():
         }
     ]
     payload = _build_daily_control_sheet_payload(summary=summary, period_deal_records=records)
-    assert payload["sheet_name"] == "Дневной контроль"
+    assert payload["sheet_name"] == "Разбор звонков"
     assert payload["start_cell"] == "A2"
     assert "deal_id" not in payload["columns"]
     assert "artifact_path" not in payload["columns"]
@@ -1619,6 +1631,29 @@ def test_daily_control_payload_uses_business_columns_only():
     ).lower()
     for bad in ("qualified loss", "anti-fit", "owner", "closeout", "follow-up"):
         assert bad not in joined
+
+
+def test_expand_daily_rows_to_case_rows_writes_one_row_per_meaningful_case():
+    rows = [
+        {
+            "Дата контроля": "2026-04-21",
+            "Менеджер": "Илья",
+            "llm_text_ready": True,
+            "Проанализировано сделок": 3,
+            "Ссылки на сделки": "legacy",
+            "selection_candidates_debug": [
+                {"deal_id": "32162059", "daily_tier": "priority_1_meaningful_conversation", "transcript_usability_label": "usable"},
+                {"deal_id": "32160389", "daily_tier": "priority_6_noise", "skip_for_daily_reason": "noise_short_or_autoanswer"},
+                {"deal_id": "32165731", "daily_tier": "priority_2_secretary_case", "call_role_signal": "secretary"},
+            ],
+        }
+    ]
+    out = _expand_daily_rows_to_case_rows(rows=rows, base_domain="https://example.amocrm.ru")
+    assert len(out) == 2
+    links = [str(x.get("Ссылки на сделки") or "") for x in out]
+    assert any("32162059" in x for x in links)
+    assert any("32165731" in x for x in links)
+    assert all("32160389" not in x for x in links)
 
 
 def test_daily_control_writer_starts_from_a2_and_does_not_write_header_row():
@@ -2695,6 +2730,72 @@ def test_secretary_touch_counts_as_attempt():
     assert sig["dial_unique_phones_count"] == 1
 
 
+def test_dial_discipline_tracks_known_vs_attempted_phones_for_closed_deal():
+    snapshot = {
+        "normalized_deal": {
+            "contact_phone": "+7 (900) 111-22-33",
+            "phones": ["8 900 222 33 44", "+7 (900) 333-44-55"],
+        },
+        "call_evidence": {
+            "items": [
+                {"phone": "+7 900 1112233", "status": "no_answer", "timestamp": "2026-04-21T10:00:00+00:00"},
+                {"phone": "8(900)1112233", "status": "busy", "timestamp": "2026-04-21T12:00:00+00:00"},
+            ]
+        },
+    }
+    sig = _build_dial_discipline_signals(snapshot, status_name="Закрыто и не реализовано")
+    assert sig["dial_known_unique_phones_count"] == 3
+    assert sig["dial_unique_phones_count"] == 1
+    assert sig["dial_attempted_phones"] == ["1112233"]
+    assert sorted(sig["dial_not_attempted_phones"]) == ["2223344", "3334455"]
+    assert sig["numbers_not_fully_covered_flag"] is True
+
+
+def test_dial_discipline_attempt_types_include_autoanswer_no_answer_short_drop_and_secretary():
+    snapshot = {
+        "call_evidence": {
+            "items": [
+                {"phone": "+7 900 111 22 33", "status": "secretary", "timestamp": "2026-04-21T10:00:00+00:00", "duration_seconds": 18},
+                {"phone": "+7 900 111 22 33", "status": "no_answer", "timestamp": "2026-04-21T10:10:00+00:00", "duration_seconds": 0},
+                {"phone": "+7 900 111 22 33", "status": "autoanswer", "timestamp": "2026-04-21T10:20:00+00:00", "duration_seconds": 3},
+                {"phone": "+7 900 111 22 33", "status": "", "timestamp": "2026-04-21T10:30:00+00:00", "duration_seconds": 2},
+            ]
+        }
+    }
+    sig = _build_dial_discipline_signals(snapshot, status_name="В работе")
+    assert sig["dial_attempts_total"] == 4
+    assert sig["dial_secretary_touch_count"] == 1
+    assert sig["dial_no_answer_attempts_count"] == 1
+    assert sig["dial_autoanswer_attempts_count"] == 1
+    assert sig["dial_short_drop_attempts_count"] >= 1
+
+
+def test_dial_discipline_detects_day_time_patterns_and_massive_empty_attempts():
+    items = []
+    for idx in range(10):
+        items.append(
+            {
+                "phone": "+7 900 777 88 99",
+                "status": "no_answer",
+                "timestamp": f"2026-04-21T10:{idx:02d}:00+00:00",
+            }
+        )
+    items.extend(
+        [
+            {"phone": "+7 900 777 88 99", "status": "busy", "timestamp": "2026-04-22T10:05:00+00:00"},
+            {"phone": "+7 900 777 88 99", "status": "busy", "timestamp": "2026-04-23T10:05:00+00:00"},
+            {"phone": "+7 900 777 88 99", "status": "busy", "timestamp": "2026-04-23T15:05:00+00:00"},
+        ]
+    )
+    snapshot = {"call_evidence": {"items": items}}
+    sig = _build_dial_discipline_signals(snapshot, status_name="В работе")
+    assert sig["same_day_repeat_attempts_flag"] is True
+    assert sig["different_days_same_time_flag"] is True
+    assert sig["different_days_different_time_flag"] is True
+    assert sig["massive_empty_attempts_day_flag"] is True
+    assert sig["dial_redial_suspicion_flag"] is True
+
+
 def test_daily_payload_can_use_dial_discipline_mode_without_negotiation():
     summary = {
         "period_start": "2026-04-20",
@@ -2954,6 +3055,67 @@ def test_role_scope_policy_telemarketer_allows_warm_override_on_explicit_signal(
     assert policy.get("role_scope_conflict_flag") is True
     assert not any("презентац" in x for x in blocked)
     assert not any("бриф" in x for x in blocked)
+
+
+def test_role_scope_policy_sales_manager_includes_upper_funnel_topics():
+    policy = get_role_scope_policy(
+        role="менеджер по продажам",
+        items=[
+            {
+                "transcript_usability_label": "usable",
+                "transcript_text_excerpt": "Первый контакт, прошли секретаря, вышли на ЛПР и зафиксировали встречу.",
+            }
+        ],
+    )
+    allowed = [str(x).lower() for x in policy.get("role_allowed_topics", [])]
+    assert any("секретар" in x for x in allowed)
+    assert any("лпр" in x for x in allowed)
+    assert any("демонстрац" in x for x in allowed)
+
+
+def test_classify_daily_case_sales_manager_allows_upper_funnel_secretary_case():
+    profile = classify_daily_case(
+        role="менеджер по продажам",
+        items=[
+            {
+                "transcript_usability_label": "usable",
+                "transcript_text_excerpt": "Секретарь маршрутизировал на закупки, попросил отправить на почту.",
+                "call_signal_summary_short": "секретарь, маршрутизация, следующий шаг",
+            }
+        ],
+    )
+    assert profile.mode == "secretary_analysis"
+
+
+def test_classify_daily_case_sales_manager_allows_upper_funnel_lpr_case():
+    profile = classify_daily_case(
+        role="Илья",
+        items=[
+            {
+                "transcript_usability_label": "usable",
+                "transcript_text_excerpt": "Говорили с ЛПР, уточнили актуальность и назначили встречу.",
+                "call_signal_summary_short": "ЛПР, актуальность, встреча",
+            }
+        ],
+    )
+    assert profile.mode == "negotiation_lpr_analysis"
+
+
+def test_role_scope_policy_telemarketer_keeps_low_funnel_blocked_without_explicit_signal():
+    policy = get_role_scope_policy(
+        role="Рустам",
+        items=[
+            {
+                "transcript_usability_label": "weak",
+                "transcript_text_excerpt": "Недозвон, перезвон позже.",
+                "call_signal_summary_short": "без содержательного warm-сигнала",
+            }
+        ],
+    )
+    blocked = [str(x).lower() for x in policy.get("role_blocked_topics", [])]
+    assert any("демонстрац" in x for x in blocked)
+    assert any("оплат" in x for x in blocked)
+    assert any("коммерческое предложение" in x or x == "кп" for x in blocked)
 
 
 def test_sanitize_daily_columns_role_scope_filters_fix_and_coaching_for_telemarketer():
@@ -3254,8 +3416,78 @@ def test_analyze_period_limit_applies_to_conversation_shortlist_not_raw_rows() -
     assert processed_ids == [1]
 
 
+def test_analysis_shortlist_ranking_prefers_meaningful_over_autoanswer() -> None:
+    shortlist_items = [
+        {
+            "deal_id": "32160389",
+            "pool_type": "discipline_pool",
+            "call_case_type": "autoanswer_noise",
+            "pool_priority_score": 90,
+            "selected_for_transcription": False,
+            "selected_call_count": 0,
+            "calls_total": 3,
+            "short_calls_0_20_count": 3,
+            "autoanswer_like_count": 3,
+        },
+        {
+            "deal_id": "32165731",
+            "pool_type": "conversation_pool",
+            "call_case_type": "secretary_case",
+            "pool_priority_score": 70,
+            "selected_for_transcription": True,
+            "selected_call_count": 1,
+            "calls_total": 1,
+            "short_calls_0_20_count": 0,
+            "autoanswer_like_count": 0,
+        },
+        {
+            "deal_id": "32162059",
+            "pool_type": "conversation_pool",
+            "call_case_type": "lpr_conversation",
+            "pool_priority_score": 65,
+            "selected_for_transcription": True,
+            "selected_call_count": 2,
+            "calls_total": 2,
+            "short_calls_0_20_count": 0,
+            "autoanswer_like_count": 0,
+        },
+    ]
+    payload = _build_analysis_shortlist_payload(
+        shortlist_items=shortlist_items,
+        normalized_rows_ranked=[],
+        limit=2,
+    )
+    selected = payload.get("selected_items", [])
+    assert isinstance(selected, list)
+    selected_ids = [str(x.get("deal_id") or "") for x in selected]
+    assert selected_ids == ["32162059", "32165731"]
+    assert all(not bool(x.get("forced_fallback")) for x in selected)
+
+
+def test_analysis_shortlist_forced_fallback_is_explicit_when_no_candidates() -> None:
+    payload = _build_analysis_shortlist_payload(
+        shortlist_items=[],
+        normalized_rows_ranked=[
+            {"deal_id": 10},
+            {"deal_id": 20},
+        ],
+        limit=1,
+    )
+    selected = payload.get("selected_items", [])
+    assert isinstance(selected, list)
+    assert len(selected) == 1
+    row = selected[0]
+    assert str(row.get("deal_id") or "") == "10"
+    assert bool(row.get("forced_fallback")) is True
+    assert str(row.get("shortlist_reason") or "") == "forced_fallback_no_call_signal"
+
+
 def test_daily_factual_payload_includes_reference_stack_and_disabled_external_retrieval() -> None:
-    cfg = _cfg_hybrid()
+    cfg = replace(
+        _cfg_hybrid(),
+        sales_module_references=("docs/sales_context/scripts/link_base.md",),
+        product_reference_urls={"info": "https://info.example.local", "link": "https://link.example.local"},
+    )
     payload = _build_daily_table_factual_payload(
         cfg=cfg,
         logger=_Logger(),
@@ -3291,7 +3523,17 @@ def test_daily_factual_payload_includes_reference_stack_and_disabled_external_re
     assert isinstance(reference_stack, dict)
     assert isinstance(reference_stack.get("source_order"), list)
     assert "internal_references" in reference_stack.get("source_order", [])
+    assert "role_context" in reference_stack.get("source_order", [])
+    assert "product_reference_urls" in reference_stack.get("source_order", [])
     assert isinstance(reference_stack.get("internal_sources"), list)
+    required_layers = reference_stack.get("required_layers", {})
+    assert isinstance(required_layers, dict)
+    assert bool((required_layers.get("role_context", {}) if isinstance(required_layers.get("role_context"), dict) else {}).get("ok")) is True
+    assert bool((required_layers.get("product_reference_urls", {}) if isinstance(required_layers.get("product_reference_urls"), dict) else {}).get("ok")) is True
+    layer_presence = reference_stack.get("layer_presence", {})
+    assert isinstance(layer_presence, dict)
+    assert bool(layer_presence.get("role_context_in_prompt")) is True
+    assert bool(layer_presence.get("product_reference_in_prompt")) is True
     external = reference_stack.get("external_retrieval", {})
     assert isinstance(external, dict)
     assert external.get("enabled") is False
@@ -3308,9 +3550,15 @@ def test_daily_table_prompt_includes_reference_stack_and_style_mode() -> None:
         "role_forbidden_topics": ["бриф"],
         "role_scope_conflict_flag": False,
         "reference_stack": {
-            "source_order": ["internal_references", "product_reference_urls", "external_retrieval_optional"],
+            "source_order": ["internal_references", "role_context", "product_reference_urls", "external_retrieval_optional"],
+            "required_layers": {
+                "internal_references": {"ok": True, "snippets_used": 1},
+                "role_context": {"ok": True, "snippets_used": 1},
+                "product_reference_urls": {"ok": True, "snippets_used": 1},
+            },
             "prompt_snippets": [
                 {"layer": "internal", "source": "docs/sales.md", "snippet": "Фокус на следующий шаг."},
+                {"layer": "role_context", "source": "factual_payload.role_context", "snippet": "role context: manager=Илья; role=менеджер по продажам"},
                 {"layer": "product_url", "source": "https://istock.link/", "snippet": "LINK: сценарии для закупок."},
             ],
             "external_retrieval": {"enabled": True, "used": False, "reason": "disabled_by_config"},
@@ -3327,6 +3575,114 @@ def test_daily_table_prompt_includes_reference_stack_and_style_mode() -> None:
     assert "Reference stack order" in combined
     assert "external_retrieval" in combined or "External retrieval" in combined
     assert "Фокус на следующий шаг." in combined
+    assert "role context: manager=Илья" in combined
+    assert "required[role_context] ok=True" in combined
+    assert "required[product_reference_urls] ok=True" in combined
     assert "Режим стиля" in combined or "Стиль:" in combined
 
 
+
+def test_daily_control_base_mix_debug_fields_present():
+    summary = {
+        "period_start": "2026-04-14",
+        "period_end": "2026-04-20",
+        "run_timestamp": "2026-04-19T10:10:00+00:00",
+    }
+    records = [
+        {
+            "deal_id": 101,
+            "owner_name": "Илья",
+            "product_name": "ИНФО",
+            "score": 55,
+            "risk_flags": [],
+            "strong_sides": ["Есть рабочий контакт с ЛПР"],
+            "growth_zones": ["Дожать следующий шаг"],
+            "employee_coaching": "",
+            "status_name": "В работе",
+            "deal_tags_raw": ["машэкспо"],
+            "company_tags": ["тендерные"],
+        }
+    ]
+    payload = _build_daily_control_sheet_payload(summary=summary, period_deal_records=records)
+    row = payload["rows"][0]
+    assert row.get("base_mix_selected_source") == "deal_tags"
+    assert str(row.get("base_mix_selected_value") or "").strip()
+    assert isinstance(row.get("base_mix_raw_tags_deal"), list)
+    assert isinstance(row.get("base_mix_raw_tags_company"), list)
+    assert isinstance(row.get("base_mix_fallback_used"), bool)
+    assert isinstance(row.get("base_mix_deal_tag_entries"), list)
+    assert isinstance(row.get("base_mix_company_tag_entries"), list)
+    first_deal_entry = row.get("base_mix_deal_tag_entries")[0]
+    assert first_deal_entry["raw_tag"] == "машэкспо"
+    assert first_deal_entry["normalized_tag"] == "машэкспо"
+    assert first_deal_entry["source_of_tag"] == "deal"
+
+
+def test_daily_control_base_mix_uses_company_tag_when_deal_tag_missing():
+    summary = {
+        "period_start": "2026-04-14",
+        "period_end": "2026-04-20",
+        "run_timestamp": "2026-04-19T10:10:00+00:00",
+    }
+    records = [
+        {
+            "deal_id": 202,
+            "owner_name": "Илья",
+            "product_name": "ИНФО",
+            "score": 60,
+            "risk_flags": [],
+            "strong_sides": ["Есть содержательный контакт"],
+            "growth_zones": ["Зафиксировать следующий шаг"],
+            "employee_coaching": "",
+            "status_name": "В работе",
+            "deal_tags_raw": [],
+            "company_tags": ["машиностроение"],
+        }
+    ]
+    payload = _build_daily_control_sheet_payload(summary=summary, period_deal_records=records)
+    row = payload["rows"][0]
+    assert row.get("base_mix_selected_source") == "company_tags"
+    assert row.get("base_mix_selected_value") == "машиностроение"
+    assert row.get("base_mix_fallback_used") is False
+    assert row.get("base_mix_deal_tag_entries") == []
+    company_entries = row.get("base_mix_company_tag_entries")
+    assert isinstance(company_entries, list) and company_entries
+    assert company_entries[0]["source_of_tag"] == "company"
+
+
+def test_company_tag_propagation_dry_run_plan_safe_and_conflict_cases():
+    plan = _build_company_tag_propagation_dry_run_plan(
+        rows=[
+            {
+                "deal_id": 1,
+                "company_id": 101,
+                "tags": [],
+                "company_tags": ["машиностроение"],
+                "company_tags_source": "api_tags",
+            },
+            {
+                "deal_id": 2,
+                "company_id": 102,
+                "tags": ["инфо"],
+                "company_tags": ["машиностроение"],
+                "company_tags_source": "api_tags",
+            },
+            {
+                "deal_id": 3,
+                "company_id": 103,
+                "tags": [],
+                "company_tags": ["инфо", "линк"],
+                "company_tags_source": "api_tags",
+            },
+        ]
+    )
+    assert plan["rows_total"] == 3
+    assert plan["safe_to_propagate_total"] == 1
+    rows = plan["items"]
+    assert rows[0]["safe_to_propagate"] is True
+    assert rows[0]["proposed_tags_to_add"] == ["машиностроение"]
+    assert rows[0]["reason"] == "single_company_tag_safe_to_propagate"
+    assert rows[1]["safe_to_propagate"] is False
+    assert rows[1]["reason"] == "deal_has_own_tags"
+    assert rows[2]["safe_to_propagate"] is False
+    assert rows[2]["reason"] == "company_has_multiple_tags_conflict"
