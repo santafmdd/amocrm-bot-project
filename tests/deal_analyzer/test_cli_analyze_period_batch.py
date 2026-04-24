@@ -1,6 +1,7 @@
 ﻿import json
 import shutil
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -24,6 +25,8 @@ from src.deal_analyzer.cli import (
     _build_call_pool_artifacts,
     _build_transcription_shortlist_payload,
     _build_analysis_shortlist_payload,
+    _business_window_date_for_call,
+    _open_business_window_date,
     _build_daily_table_factual_payload,
     _expand_daily_rows_to_case_rows,
     _build_company_tag_propagation_dry_run_plan,
@@ -175,6 +178,14 @@ def _fresh_output_dir(name: str) -> Path:
         shutil.rmtree(root, ignore_errors=True)
     root.mkdir(parents=True, exist_ok=True)
     return root
+
+
+def _parse_utc(value: str) -> datetime:
+    raw = value[:-1] + "+00:00" if value.endswith("Z") else value
+    dt = datetime.fromisoformat(raw)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 def test_analyze_period_creates_run_dir_and_summary_json():
@@ -527,6 +538,38 @@ def test_analyze_period_limit_is_applied():
     assert summary["total_deals_seen"] == 3
     assert summary["total_deals_analyzed"] == 1
     assert summary["limit"] == 1
+
+
+def test_business_window_date_for_call_respects_weekend_and_15_cutoff():
+    # Fri 16:00 MSK -> Monday bucket.
+    dt_fri_after_cutoff = _parse_utc("2026-04-24T13:00:00+00:00")
+    assert _business_window_date_for_call(dt_fri_after_cutoff).isoformat() == "2026-04-27"
+
+    # Sat morning -> Monday bucket (no weekend bucket).
+    dt_sat = _parse_utc("2026-04-25T08:00:00+00:00")
+    assert _business_window_date_for_call(dt_sat).isoformat() == "2026-04-27"
+
+    # Mon before cutoff -> Monday bucket.
+    dt_mon_before_cutoff = _parse_utc("2026-04-27T10:30:00+00:00")
+    assert _business_window_date_for_call(dt_mon_before_cutoff).isoformat() == "2026-04-27"
+
+    # Mon after cutoff -> Tuesday bucket.
+    dt_mon_after_cutoff = _parse_utc("2026-04-27T13:30:00+00:00")
+    assert _business_window_date_for_call(dt_mon_after_cutoff).isoformat() == "2026-04-28"
+
+
+def test_open_business_window_date_respects_weekend_and_15_cutoff():
+    # Weekend run -> Monday open window.
+    run_sat = _parse_utc("2026-04-25T09:00:00+00:00")
+    assert _open_business_window_date(run_sat).isoformat() == "2026-04-27"
+
+    # Monday before cutoff -> Monday open window (current day still open).
+    run_mon_before_cutoff = _parse_utc("2026-04-27T10:00:00+00:00")
+    assert _open_business_window_date(run_mon_before_cutoff).isoformat() == "2026-04-27"
+
+    # Monday after cutoff -> Tuesday open window.
+    run_mon_after_cutoff = _parse_utc("2026-04-27T13:10:00+00:00")
+    assert _open_business_window_date(run_mon_after_cutoff).isoformat() == "2026-04-28"
 
 
 def test_analyze_period_partial_snapshot_warnings_do_not_fail_batch():
@@ -1423,7 +1466,10 @@ def test_meeting_queue_writer_real_write_path_via_mock():
         "_llm_text_ready": True,
     }
 
-    with patch("src.deal_analyzer.cli._prepare_call_review_llm_fields", side_effect=_mock_prepare_call_review_llm_fields), patch("src.deal_analyzer.cli.GoogleSheetsApiClient", return_value=fake_client), patch(
+    with patch("src.deal_analyzer.cli._prepare_call_review_llm_fields", side_effect=_mock_prepare_call_review_llm_fields), patch(
+        "src.deal_analyzer.cli._collect_call_pool_debug",
+        return_value=_mock_call_pool_debug_for_writer(deal_id=1),
+    ), patch("src.deal_analyzer.cli.GoogleSheetsApiClient", return_value=fake_client), patch(
         "src.deal_analyzer.cli.load_config",
         return_value=SimpleNamespace(project_root=Path("D:/AI_Automation/amocrm_bot/project")),
     ), patch(
@@ -1496,6 +1542,9 @@ def test_meeting_queue_writer_safe_skip_when_target_missing():
     }
 
     with patch("src.deal_analyzer.cli._prepare_call_review_llm_fields", side_effect=_mock_prepare_call_review_llm_fields), patch(
+        "src.deal_analyzer.cli._collect_call_pool_debug",
+        return_value=_mock_call_pool_debug_for_writer(deal_id=1),
+    ), patch(
         "src.deal_analyzer.cli._resolve_daily_llm_runtime",
         return_value={"enabled": True, "selected": "main", "reason": "main_ok", "main_ok": True, "fallback_ok": False, "main": {"base_url": "http://m", "model": "m", "timeout_seconds": 10}},
     ), patch(
@@ -1575,7 +1624,10 @@ def test_meeting_queue_writer_appends_below_existing_rows():
         "_llm_text_ready": True,
     }
 
-    with patch("src.deal_analyzer.cli._prepare_call_review_llm_fields", side_effect=_mock_prepare_call_review_llm_fields), patch("src.deal_analyzer.cli.GoogleSheetsApiClient", return_value=fake_client), patch(
+    with patch("src.deal_analyzer.cli._prepare_call_review_llm_fields", side_effect=_mock_prepare_call_review_llm_fields), patch(
+        "src.deal_analyzer.cli._collect_call_pool_debug",
+        return_value=_mock_call_pool_debug_for_writer(deal_id=1),
+    ), patch("src.deal_analyzer.cli.GoogleSheetsApiClient", return_value=fake_client), patch(
         "src.deal_analyzer.cli.load_config",
         return_value=SimpleNamespace(project_root=Path("D:/AI_Automation/amocrm_bot/project")),
     ), patch(
@@ -1721,7 +1773,10 @@ def test_daily_control_writer_starts_from_a2_and_does_not_write_header_row():
         "Ожидаемый эффект - качество": "Этап станет управляемее.",
         "_llm_text_ready": True,
     }
-    with patch("src.deal_analyzer.cli._prepare_call_review_llm_fields", side_effect=_mock_prepare_call_review_llm_fields), patch("src.deal_analyzer.cli.GoogleSheetsApiClient", return_value=fake_client), patch(
+    with patch("src.deal_analyzer.cli._prepare_call_review_llm_fields", side_effect=_mock_prepare_call_review_llm_fields), patch(
+        "src.deal_analyzer.cli._collect_call_pool_debug",
+        return_value=_mock_call_pool_debug_for_writer(deal_id=1),
+    ), patch("src.deal_analyzer.cli.GoogleSheetsApiClient", return_value=fake_client), patch(
         "src.deal_analyzer.cli.load_config",
         return_value=SimpleNamespace(project_root=Path("D:/AI_Automation/amocrm_bot/project")),
     ), patch(
@@ -1803,7 +1858,10 @@ def test_daily_control_writer_uses_append_mode_by_default():
         "Ожидаемый эффект - качество": "Этап станет управляемее.",
         "_llm_text_ready": True,
     }
-    with patch("src.deal_analyzer.cli._prepare_call_review_llm_fields", side_effect=_mock_prepare_call_review_llm_fields), patch("src.deal_analyzer.cli.GoogleSheetsApiClient", return_value=fake_client), patch(
+    with patch("src.deal_analyzer.cli._prepare_call_review_llm_fields", side_effect=_mock_prepare_call_review_llm_fields), patch(
+        "src.deal_analyzer.cli._collect_call_pool_debug",
+        return_value=_mock_call_pool_debug_for_writer(deal_id=1),
+    ), patch("src.deal_analyzer.cli.GoogleSheetsApiClient", return_value=fake_client), patch(
         "src.deal_analyzer.cli.load_config",
         return_value=SimpleNamespace(project_root=Path("D:/AI_Automation/amocrm_bot/project")),
     ), patch(
@@ -3214,6 +3272,82 @@ def _mock_prepare_call_review_llm_fields(**kwargs):
     assert "оплат" not in low_join
     assert cols.get("_role_scope_applied") is True
     assert cols.get("_role_scope_conflict_flag") is False
+
+
+def _mock_call_pool_debug_for_writer(*, deal_id: int = 1) -> dict:
+    return {
+        "generated_at": "2026-04-24T10:00:00+00:00",
+        "deals_total_before_limit": 1,
+        "deals_with_any_calls": 1,
+        "deals_with_recordings": 1,
+        "deals_with_long_calls": 1,
+        "deals_with_only_short_calls": 0,
+        "deals_with_autoanswer_pattern": 0,
+        "deals_with_redial_pattern": 0,
+        "items": [
+            {
+                "deal_id": str(deal_id),
+                "deal_name": f"Deal {deal_id}",
+                "owner_name": "Илья",
+                "status_name": "В работе",
+                "pipeline_name": "Pipeline",
+                "updated_at": "2026-04-23T10:00:00+00:00",
+                "created_at": "2026-04-20T10:00:00+00:00",
+                "calls_total": 2,
+                "outbound_calls": 2,
+                "inbound_calls": 0,
+                "max_duration_seconds": 130,
+                "total_duration_seconds": 195,
+                "recording_url_count": 2,
+                "audio_path_count": 0,
+                "short_calls_0_20_count": 0,
+                "medium_calls_21_60_count": 0,
+                "long_calls_61_plus_count": 2,
+                "no_answer_like_count": 0,
+                "autoanswer_like_count": 0,
+                "repeated_dead_redial_count": 0,
+                "same_time_redial_pattern_flag": False,
+                "unique_phone_count": 1,
+                "numbers_not_fully_covered_flag": False,
+                "pool_type": "conversation_pool",
+                "pool_reason": "lpr_conversation; conversation_case_priority rec=2; dur=130s",
+                "pool_priority_score": 88,
+                "call_case_type": "lpr_conversation",
+                "runtime_effective_tags": [],
+                "runtime_tag_source": "none",
+                "runtime_company_tag_promoted": False,
+                "runtime_propagated_company_tags": [],
+                "call_items": [
+                    {
+                        "call_id": f"c-{deal_id}",
+                        "timestamp": "2026-04-16T10:15:00+00:00",
+                        "duration_seconds": 95,
+                        "direction": "outbound",
+                        "recording_url": f"https://example.test/{deal_id}.mp3",
+                        "audio_path": "",
+                        "phone": "+7 (999) 100-20-30",
+                        "status": "secretary",
+                        "result": "",
+                        "disposition": "",
+                        "quality_flags": [],
+                    },
+                    {
+                        "call_id": f"c-{deal_id}-prev",
+                        "timestamp": "2026-04-15T13:40:00+00:00",
+                        "duration_seconds": 65,
+                        "direction": "outbound",
+                        "recording_url": f"https://example.test/{deal_id}-prev.mp3",
+                        "audio_path": "",
+                        "phone": "+7 (999) 100-20-30",
+                        "status": "completed",
+                        "result": "",
+                        "disposition": "",
+                        "quality_flags": [],
+                    },
+                ],
+            }
+        ],
+    }
 
 
 def test_quantity_effect_keeps_decimals_and_never_plus_zero():

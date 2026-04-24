@@ -105,7 +105,7 @@ def build_reference_prompt_section(reference_stack: dict[str, Any]) -> str:
     lines: list[str] = []
     order = reference_stack.get("source_order", [])
     if isinstance(order, list) and order:
-        lines.append(f"??????? ??????????: {', '.join(str(x) for x in order)}")
+        lines.append(f"Порядок источников: {', '.join(str(x) for x in order)}")
 
     required = reference_stack.get("required_layers", {})
     if isinstance(required, dict) and required:
@@ -416,8 +416,12 @@ def _external_retrieval(*, cfg: DealAnalyzerConfig | None, query: str, logger: A
 
 
 def _query_tokens(query: str) -> set[str]:
-    tokens = set(re.findall(r"[a-zA-Z?-??-?0-9]{4,}", str(query or "").lower()))
-    return {t for t in tokens if t not in {"????????", "??????", "????????", "??????", "??????"}}
+    tokens = set(re.findall(r"[a-zA-Zа-яА-ЯёЁ0-9]{4,}", str(query or "").lower()))
+    return {
+        t
+        for t in tokens
+        if t not in {"кейс", "сделка", "менеджер", "анализ", "звонок", "звонки", "этап", "день"}
+    }
 
 
 def _token_overlap_score(text: str, query_tokens: set[str]) -> int:

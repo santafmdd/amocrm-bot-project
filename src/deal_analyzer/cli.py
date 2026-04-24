@@ -23,11 +23,8 @@ from src.safety import ensure_inside_root
 
 from .call_downloader import CallDownloader
 from .call_evidence import build_call_summary, call_evidence_to_dicts
-from .call_review_sheet import (
-    CALL_REVIEW_DEFAULT_COLUMNS,
-    build_call_review_payload,
-    rows_to_sheet_matrix,
-)
+from .call_review_v3_builder import build_call_review_v3_payload
+from .call_review_v3_row_schema import CALL_REVIEW_V3_COLUMNS, rows_to_sheet_matrix_v3
 from .base_mix import (
     build_base_mix_text as build_base_mix_text_priority,
     collect_raw_tag_values,
@@ -1796,13 +1793,14 @@ def _run_analyze_period(
         step_artifacts_root=run_dir / "call_review_step_artifacts",
     )
     summary_payload["call_review_llm_generation"] = call_review_llm_generation
-    call_review_payload = build_call_review_payload(
+    call_review_payload = build_call_review_v3_payload(
         summary=summary_payload,
         period_deal_records=period_deal_records,
         analysis_shortlist_payload=analysis_shortlist_payload,
         base_domain=_resolve_amo_base_domain_for_links(cfg=cfg),
         manager_allowlist=list(getattr(cfg, "daily_manager_allowlist", ()) or ()),
         manager_role_registry=dict(getattr(cfg, "manager_role_registry", {}) or {}),
+        run_dir=run_dir,
     )
     call_review_payload_path = run_dir / "call_review_sheet_payload.json"
     _write_json_path(call_review_payload_path, call_review_payload)
@@ -2370,6 +2368,12 @@ def _next_workday(day: datetime.date) -> datetime.date:
 
 def _business_window_date_for_call(ts_utc: datetime) -> datetime.date:
     local = ts_utc.astimezone(MSK_TZ)
+    # Weekend calls always belong to Monday control bucket.
+    if local.weekday() >= 5:
+        cur = local.date()
+        while cur.weekday() >= 5:
+            cur = cur + timedelta(days=1)
+        return cur
     if (local.hour, local.minute, local.second) < (15, 0, 0):
         return local.date()
     return _next_workday(local.date())
@@ -2377,6 +2381,12 @@ def _business_window_date_for_call(ts_utc: datetime) -> datetime.date:
 
 def _open_business_window_date(run_started_at_utc: datetime) -> datetime.date:
     local = run_started_at_utc.astimezone(MSK_TZ)
+    # No Saturday/Sunday review bucket: open window on weekend is Monday.
+    if local.weekday() >= 5:
+        cur = local.date()
+        while cur.weekday() >= 5:
+            cur = cur + timedelta(days=1)
+        return cur
     if (local.hour, local.minute, local.second) < (15, 0, 0):
         return local.date()
     return _next_workday(local.date())
@@ -2694,6 +2704,104 @@ def _call_review_llm_fields_ready(*, fields: dict[str, str], case_mode: str) -> 
     return True, ""
 
 
+def _resolve_call_review_anchor_context(*, record: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
+    fallback_manager = str(record.get("owner_name") or "").strip()
+    artifact_path = str(record.get("artifact_path") or "").strip()
+    if not artifact_path:
+        return {
+            "manager_name": fallback_manager,
+            "call_id": "",
+            "timestamp": "",
+            "duration_seconds": 0,
+            "source": "owner_fallback_no_artifact",
+        }
+    path = Path(artifact_path)
+    if not path.exists():
+        return {
+            "manager_name": fallback_manager,
+            "call_id": "",
+            "timestamp": "",
+            "duration_seconds": 0,
+            "source": "owner_fallback_artifact_missing",
+        }
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {
+            "manager_name": fallback_manager,
+            "call_id": "",
+            "timestamp": "",
+            "duration_seconds": 0,
+            "source": "owner_fallback_artifact_parse_failed",
+        }
+    snapshot = payload.get("snapshot", {}) if isinstance(payload, dict) and isinstance(payload.get("snapshot"), dict) else {}
+    call_evidence = snapshot.get("call_evidence", {}) if isinstance(snapshot, dict) and isinstance(snapshot.get("call_evidence"), dict) else {}
+    calls = [x for x in (call_evidence.get("items", []) if isinstance(call_evidence.get("items"), list) else []) if isinstance(x, dict)]
+    selected_ids = _selected_call_ids_for_call_review(candidate=candidate, record=record)
+    anchor_call = _select_anchor_call_for_call_review(calls=calls, selected_call_ids=selected_ids)
+    if not isinstance(anchor_call, dict):
+        return {
+            "manager_name": fallback_manager,
+            "call_id": "",
+            "timestamp": "",
+            "duration_seconds": 0,
+            "source": "owner_fallback_no_anchor_call",
+        }
+    manager_name = (
+        str(anchor_call.get("manager_name") or "").strip()
+        or str(anchor_call.get("responsible_user_name") or "").strip()
+        or str(anchor_call.get("user_name") or "").strip()
+        or fallback_manager
+    )
+    return {
+        "manager_name": manager_name,
+        "call_id": str(anchor_call.get("call_id") or "").strip(),
+        "timestamp": str(anchor_call.get("timestamp") or "").strip(),
+        "duration_seconds": int(anchor_call.get("duration_seconds", 0) or 0),
+        "source": "anchor_call_author",
+    }
+
+
+def _selected_call_ids_for_call_review(*, candidate: dict[str, Any], record: dict[str, Any]) -> set[str]:
+    out: set[str] = set()
+    for source in (candidate.get("selected_call_ids"), record.get("selected_call_ids")):
+        if not isinstance(source, list):
+            continue
+        for raw in source:
+            call_id = str(raw or "").strip()
+            if call_id:
+                out.add(call_id)
+    return out
+
+
+def _select_anchor_call_for_call_review(*, calls: list[dict[str, Any]], selected_call_ids: set[str]) -> dict[str, Any] | None:
+    ranked: list[tuple[int, datetime | None, dict[str, Any]]] = []
+    for call in calls:
+        if not isinstance(call, dict):
+            continue
+        call_id = str(call.get("call_id") or "").strip()
+        if selected_call_ids and call_id and call_id not in selected_call_ids:
+            continue
+        duration = int(call.get("duration_seconds", 0) or 0)
+        ts = _parse_utc_ts(call.get("timestamp"))
+        score = max(0, duration)
+        if str(call.get("recording_url") or "").strip():
+            score += 120
+        if not (_is_no_answer_like_call(call) or _is_autoanswer_like_call(call) or duration <= 20):
+            score += 80
+        ranked.append((score, ts, call))
+    if not ranked:
+        return None
+    ranked.sort(
+        key=lambda x: (
+            -int(x[0]),
+            str((x[1] or datetime(1970, 1, 1, tzinfo=timezone.utc)).isoformat()),
+            str((x[2] or {}).get("call_id") or ""),
+        )
+    )
+    return ranked[0][2]
+
+
 def _prepare_call_review_llm_fields(
     *,
     cfg: DealAnalyzerConfig,
@@ -2768,13 +2876,20 @@ def _prepare_call_review_llm_fields(
         if step_artifacts_root is not None:
             row_artifacts_dir = step_artifacts_root / _safe_slug(f"deal_{did}_{case_mode}")[:120]
 
-        role_display = _manager_role_label(str(record.get("owner_name") or ""), cfg=cfg)
+        anchor_ctx = _resolve_call_review_anchor_context(record=record, candidate=candidate)
+        manager_name_for_case = str(anchor_ctx.get("manager_name") or "").strip() or str(record.get("owner_name") or "").strip()
+        role_display = _manager_role_label(manager_name_for_case, cfg=cfg)
+        record["call_review_anchor_call_author"] = manager_name_for_case
+        record["call_review_anchor_call_id"] = str(anchor_ctx.get("call_id") or "")
+        record["call_review_anchor_call_timestamp"] = str(anchor_ctx.get("timestamp") or "")
+        record["call_review_anchor_call_duration_seconds"] = int(anchor_ctx.get("duration_seconds", 0) or 0)
+        record["call_review_anchor_resolution_source"] = str(anchor_ctx.get("source") or "")
         base_mix = build_base_mix_text_priority([record])
         factual_payload = {
             "deal_id": did,
             "deal_name": str(record.get("deal_name") or ""),
             "company_name": str(record.get("company_name") or ""),
-            "manager_name": str(record.get("owner_name") or ""),
+            "manager_name": manager_name_for_case,
             "role": role_display,
             "case_mode": case_mode,
             "product_focus": str(record.get("product_hypothesis") or ""),
@@ -2794,6 +2909,11 @@ def _prepare_call_review_llm_fields(
             "crm_consistency_summary": str(record.get("crm_consistency_summary") or ""),
             "analysis_confidence": str(record.get("analysis_confidence") or ""),
             "selected_call_count": int(candidate.get("selected_call_count", 0) or record.get("selected_call_count", 0) or 0),
+            "anchor_call_id": str(anchor_ctx.get("call_id") or ""),
+            "anchor_call_timestamp": str(anchor_ctx.get("timestamp") or ""),
+            "anchor_call_duration_seconds": int(anchor_ctx.get("duration_seconds", 0) or 0),
+            "anchor_call_manager_name": manager_name_for_case,
+            "anchor_resolution_source": str(anchor_ctx.get("source") or ""),
         }
         reference_stack = build_daily_reference_stack(cfg=cfg, factual_payload=factual_payload, logger=logger)
         factual_payload["reference_block"] = build_reference_prompt_section(reference_stack)
@@ -4894,6 +5014,11 @@ def _build_analysis_shortlist_payload(
                 "pool_priority_score": int(item.get("pool_priority_score", 0) or 0),
                 "selected_for_transcription": bool(item.get("selected_for_transcription")),
                 "selected_call_count": int(item.get("selected_call_count", 0) or 0),
+                "selected_call_ids": (
+                    [str(x).strip() for x in item.get("selected_call_ids", []) if str(x).strip()]
+                    if isinstance(item.get("selected_call_ids"), list)
+                    else []
+                ),
             }
         )
     ranked.sort(
@@ -4923,6 +5048,7 @@ def _build_analysis_shortlist_payload(
                 "pool_priority_score": 0,
                 "selected_for_transcription": False,
                 "selected_call_count": 0,
+                "selected_call_ids": [],
             }
             for did in fallback_ids
             if did
@@ -5033,6 +5159,8 @@ def _select_call_ids_for_transcription(calls: list[dict[str, Any]]) -> tuple[lis
             score += 14
         elif duration >= 21:
             score += 8
+        # Prefer longer meaningful conversations inside the same duration bucket.
+        score += min(18, max(0, duration) // 15)
         if str(raw.get("recording_url") or "").strip():
             score += 8
         direction = str(raw.get("direction") or "").strip().lower()
@@ -10263,12 +10391,9 @@ def _maybe_write_call_review_sheet(
     if not start_cell:
         start_cell = payload_start_cell
 
-    columns = (
-        call_review_payload.get("columns", [])
-        if isinstance(call_review_payload.get("columns"), list)
-        else list(CALL_REVIEW_DEFAULT_COLUMNS)
-    )
-    values_rows = rows_to_sheet_matrix(rows=rows_dict, columns=columns)
+    # Active path is schema-driven by ordered contract, not by header text lookup.
+    columns = list(CALL_REVIEW_V3_COLUMNS)
+    values_rows = rows_to_sheet_matrix_v3(rows=rows_dict, columns=columns)
 
     if bool(getattr(cfg, "deal_analyzer_write_enabled", False)):
         try:
@@ -10282,13 +10407,16 @@ def _maybe_write_call_review_sheet(
                         spreadsheet_id=spreadsheet_id,
                         sheet_name=target_sheet_name,
                         start_cell=start_cell,
+                        max_cols=max(120, len(columns)),
+                        schema_columns=columns,
                     )
+                    columns_for_dropdown = header_columns_local if header_columns_local else columns
                     dropdown_values_local = _read_sheet_dropdown_values_for_data_row(
                         client=client,
                         spreadsheet_id=spreadsheet_id,
                         sheet_name=target_sheet_name,
                         start_cell=start_cell,
-                        columns=header_columns_local,
+                        columns=columns_for_dropdown,
                     )
                     return header_columns_local, dropdown_values_local
 
@@ -10325,8 +10453,17 @@ def _maybe_write_call_review_sheet(
                         "write_end_row": 0,
                         "error": "header_read_empty",
                     }
-                columns = header_columns
-                values_rows = rows_to_sheet_matrix(rows=rows_dict, columns=columns)
+
+                # Ordered writer contract by index. Do not remap by duplicate header names.
+                if len(header_columns) < len(columns):
+                    logger.warning(
+                        "call review writer schema truncated to sheet width: schema_cols=%s sheet_cols=%s",
+                        len(columns),
+                        len(header_columns),
+                    )
+                    columns = columns[: len(header_columns)]
+                    values_rows = rows_to_sheet_matrix_v3(rows=rows_dict, columns=columns)
+
                 values_rows = _normalize_rows_by_dropdown_values(
                     rows=values_rows,
                     columns=columns,
@@ -10908,16 +11045,38 @@ def _read_sheet_header_columns(
     sheet_name: str,
     start_cell: str,
     max_cols: int = 80,
+    schema_columns: list[str] | None = None,
 ) -> list[str]:
     start_col, start_row = _parse_a1_cell(start_cell)
     start_col_n = _column_letters_to_number(start_col)
     end_col = _number_to_column_letters(start_col_n + max(1, int(max_cols)) - 1)
-    header_suffix = f"{start_col}{start_row}:{end_col}{start_row}"
-    tabbed = client.build_tab_a1_range(tab_title=sheet_name, range_suffix=header_suffix)
-    matrix = client.get_values(spreadsheet_id=spreadsheet_id, range_a1=tabbed)
-    row = matrix[0] if matrix and isinstance(matrix[0], list) else []
-    columns = [str(x).strip() for x in row if str(x).strip()]
-    return columns
+    schema_norm = {
+        " ".join(str(col or "").strip().lower().split())
+        for col in (schema_columns if isinstance(schema_columns, list) else [])
+        if str(col or "").strip()
+    }
+
+    def _read_row(row_num: int) -> list[str]:
+        suffix = f"{start_col}{row_num}:{end_col}{row_num}"
+        tabbed = client.build_tab_a1_range(tab_title=sheet_name, range_suffix=suffix)
+        matrix = client.get_values(spreadsheet_id=spreadsheet_id, range_a1=tabbed)
+        row = matrix[0] if matrix and isinstance(matrix[0], list) else []
+        return [str(x).strip() for x in row if str(x).strip()]
+
+    def _header_score(columns_local: list[str]) -> tuple[int, int]:
+        norm = {" ".join(str(x or "").strip().lower().split()) for x in columns_local}
+        overlap = len(norm & schema_norm)
+        return overlap, len(columns_local)
+
+    # In some sheets row1 contains grouped labels while row2 contains real column headers.
+    candidates: list[list[str]] = []
+    if start_row > 1:
+        candidates.append(_read_row(start_row - 1))
+    candidates.append(_read_row(start_row))
+    if not candidates:
+        return []
+    candidates.sort(key=_header_score, reverse=True)
+    return candidates[0]
 
 
 def _read_sheet_dropdown_values_for_data_row(

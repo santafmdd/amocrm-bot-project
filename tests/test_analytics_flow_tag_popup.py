@@ -146,6 +146,9 @@ class _FakeFlow:
     def _is_filter_apply_confirmed(self, page, panel, url_before, target_value):
         return True
 
+    def _open_filter_panel(self, _page):
+        return None
+
 
 class _FakePanel:
     def __init__(self, page):
@@ -274,3 +277,239 @@ def test_tag_handler_verify_accepts_url_marker_after_apply():
 
     handler = tag_filter.TagFilterHandler()
     assert handler.verify(flow, page, "analytics_tag_single_example", ["????????"]) is True
+
+
+def test_duplicate_candidates_use_direct_click_not_arrowdown(monkeypatch):
+    flow = _FakeFlow()
+    page = _FakePage()
+    panel = _FakePanel(page)
+    fake_input = _FakeInput()
+    clicked = {"called": False, "candidate": None}
+
+    monkeypatch.setattr(
+        tag_filter,
+        "_resolve_tag_input_strict",
+        lambda **kwargs: (fake_input, "strict_popup_only", _FakePopup(), "ms-1", ""),
+    )
+    monkeypatch.setattr(
+        tag_filter,
+        "_wait_until_tag_value_reflected",
+        lambda **kwargs: (True, {"mode": "input_value", "attempts": 1}),
+    )
+    monkeypatch.setattr(
+        tag_filter,
+        "_collect_visible_tag_suggestion_candidates",
+        lambda **kwargs: [
+            {"text": "Инглегмаш-2026", "id": "100", "index": 0, "selector": "li.multisuggest__list-item"},
+            {"text": "Инглегмаш-2026", "id": "200", "index": 1, "selector": "li.multisuggest__list-item"},
+        ],
+    )
+    monkeypatch.setattr(tag_filter, "_poll_chip_detect", lambda *args, **kwargs: (True, ["Инглегмаш-2026"]))
+    monkeypatch.setattr(
+        tag_filter,
+        "_click_suggestion_candidate",
+        lambda _panel, _popup, candidate: clicked.update({"called": True, "candidate": candidate}) or True,
+    )
+
+    ok, info = tag_filter._apply_single_tag_value_with_candidate(
+        flow=flow,
+        page=page,
+        panel=panel,
+        holder=_FakeHolder(),
+        holder_id="ms-1",
+        report_id="rid",
+        value="Инглегмаш-2026",
+    )
+    assert ok is True
+    assert clicked["called"] is True
+    assert info["selected_candidate_id"] == "100"
+    assert "ArrowDown" not in page.keyboard.pressed
+    assert "Enter" not in page.keyboard.pressed
+
+
+def test_duplicate_retry_switches_to_second_candidate(monkeypatch):
+    flow = _FakeFlow()
+    page = _FakePage()
+    panel = _FakePanel(page)
+
+    calls = {"count": 0, "forced": []}
+
+    def fake_apply_once(**kwargs):
+        calls["count"] += 1
+        forced = kwargs.get("forced_candidate")
+        calls["forced"].append(forced)
+        if calls["count"] == 1:
+            return True, {
+                "duplicate_candidates": [
+                    {"text": "Инглегмаш-2026", "id": "100", "index": 0, "selector": "li"},
+                    {"text": "Инглегмаш-2026", "id": "200", "index": 1, "selector": "li"},
+                ],
+                "selected_candidate_id": "100",
+                "selected_candidate_index": 0,
+                "apply_confirmed_but_parse_suspicious": True,
+            }
+        return True, {
+            "duplicate_candidates": [],
+            "selected_candidate_id": "200",
+            "selected_candidate_index": 1,
+            "apply_confirmed_but_parse_suspicious": False,
+        }
+
+    monkeypatch.setattr(tag_filter, "_apply_single_tag_value_with_candidate", fake_apply_once)
+    monkeypatch.setattr(tag_filter, "_clear_tag_holder_selection", lambda *args, **kwargs: True)
+
+    ok = tag_filter.apply_tag_values_via_holder_popup(
+        flow=flow,
+        page=page,
+        panel=panel,
+        report_id="rid",
+        values=["Инглегмаш-2026"],
+    )
+    assert ok is True
+    assert calls["count"] == 2
+    assert calls["forced"][0] is None
+    assert isinstance(calls["forced"][1], dict)
+    assert calls["forced"][1]["id"] == "200"
+
+
+def test_duplicate_retry_exhausted_returns_controlled_failure(monkeypatch):
+    flow = _FakeFlow()
+    page = _FakePage()
+    panel = _FakePanel(page)
+
+    calls = {"count": 0}
+
+    def fake_apply_once(**kwargs):
+        calls["count"] += 1
+        forced = kwargs.get("forced_candidate")
+        selected_id = "100" if forced is None else str(forced.get("id", "200"))
+        return True, {
+            "duplicate_candidates": [
+                {"text": "Инглегмаш-2026", "id": "100", "index": 0, "selector": "li"},
+                {"text": "Инглегмаш-2026", "id": "200", "index": 1, "selector": "li"},
+            ],
+            "selected_candidate_id": selected_id,
+            "selected_candidate_index": 0 if forced is None else 1,
+            "apply_confirmed_but_parse_suspicious": True,
+        }
+
+    monkeypatch.setattr(tag_filter, "_apply_single_tag_value_with_candidate", fake_apply_once)
+    monkeypatch.setattr(tag_filter, "_clear_tag_holder_selection", lambda *args, **kwargs: True)
+
+    ok = tag_filter.apply_tag_values_via_holder_popup(
+        flow=flow,
+        page=page,
+        panel=panel,
+        report_id="rid",
+        values=["Инглегмаш-2026"],
+    )
+    assert ok is False
+    assert calls["count"] == 2
+
+
+def test_multi_tag_chip_regression_fails_before_apply(monkeypatch):
+    flow = _FakeFlow()
+    page = _FakePage()
+    panel = _FakePanel(page)
+    fake_input = _FakeInput()
+    apply_calls = {"count": 0}
+
+    monkeypatch.setattr(
+        tag_filter,
+        "_resolve_tag_input_strict",
+        lambda **kwargs: (fake_input, "strict_popup_only", _FakePopup(), "ms-1", ""),
+    )
+    monkeypatch.setattr(
+        tag_filter,
+        "_wait_until_tag_value_reflected",
+        lambda **kwargs: (True, {"mode": "input_value", "attempts": 1}),
+    )
+    monkeypatch.setattr(
+        tag_filter,
+        "_collect_visible_tag_suggestion_candidates",
+        lambda **kwargs: [
+            {"text": "tag-a", "id": "100", "index": 0, "selector": "li.multisuggest__list-item"},
+            {"text": "tag-b", "id": "200", "index": 1, "selector": "li.multisuggest__list-item"},
+        ],
+    )
+    monkeypatch.setattr(tag_filter, "_click_suggestion_candidate", lambda *_args, **_kwargs: True)
+
+    state = {"calls": 0}
+
+    def fake_poll(*args, **kwargs):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            return True, ["tag-a"]
+        return True, ["tag-b"]  # regression: previous chip disappeared
+
+    monkeypatch.setattr(tag_filter, "_poll_chip_detect", fake_poll)
+    monkeypatch.setattr(flow, "_collect_tag_chip_texts", lambda panel, holder=None: ["tag-b"], raising=False)
+    monkeypatch.setattr(
+        flow,
+        "_click_apply_in_panel",
+        lambda *args, **kwargs: apply_calls.update({"count": apply_calls["count"] + 1}) or True,
+    )
+
+    ok = tag_filter.apply_tag_values_via_holder_popup(
+        flow=flow,
+        page=page,
+        panel=panel,
+        report_id="rid",
+        values=["tag-a", "tag-b"],
+    )
+    assert ok is False
+    assert apply_calls["count"] == 0
+
+
+def test_multi_tag_final_apply_guard_blocks_partial_set(monkeypatch):
+    flow = _FakeFlow()
+    page = _FakePage()
+    panel = _FakePanel(page)
+    fake_input = _FakeInput()
+    apply_calls = {"count": 0}
+
+    monkeypatch.setattr(
+        tag_filter,
+        "_resolve_tag_input_strict",
+        lambda **kwargs: (fake_input, "strict_popup_only", _FakePopup(), "ms-1", ""),
+    )
+    monkeypatch.setattr(
+        tag_filter,
+        "_wait_until_tag_value_reflected",
+        lambda **kwargs: (True, {"mode": "input_value", "attempts": 1}),
+    )
+    monkeypatch.setattr(
+        tag_filter,
+        "_collect_visible_tag_suggestion_candidates",
+        lambda **kwargs: [
+            {"text": "tag-a", "id": "100", "index": 0, "selector": "li.multisuggest__list-item"},
+            {"text": "tag-b", "id": "200", "index": 1, "selector": "li.multisuggest__list-item"},
+        ],
+    )
+    monkeypatch.setattr(tag_filter, "_click_suggestion_candidate", lambda *_args, **_kwargs: True)
+
+    state = {"calls": 0}
+
+    def fake_poll(*args, **kwargs):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            return True, ["tag-a"]
+        return True, ["tag-a", "tag-b"]
+
+    monkeypatch.setattr(tag_filter, "_poll_chip_detect", fake_poll)
+    monkeypatch.setattr(flow, "_collect_tag_chip_texts", lambda panel, holder=None: ["tag-a"], raising=False)  # missing tag-b before apply
+    monkeypatch.setattr(
+        flow,
+        "_click_apply_in_panel",
+        lambda *args, **kwargs: apply_calls.update({"count": apply_calls["count"] + 1}) or True,
+    )
+
+    ok = tag_filter.apply_tag_values_via_holder_popup(
+        flow=flow,
+        page=page,
+        panel=panel,
+        report_id="rid",
+        values=["tag-a", "tag-b"],
+    )
+    assert ok is False
+    assert apply_calls["count"] == 0

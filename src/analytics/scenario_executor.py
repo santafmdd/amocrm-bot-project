@@ -47,6 +47,7 @@ class ScenarioExecutionResult:
     snapshots: list[AnalyticsSnapshot]
     total_count: int
     non_empty_stage_rows: int
+    apply_confirmed_but_parse_suspicious: bool = False
 
 
 @dataclass(frozen=True)
@@ -162,6 +163,7 @@ class ScenarioExecutor:
             self.flow.reader.open_analytics_page(page)
             self.flow._open_filter_panel(page)
             self.flow._apply_already_confirmed = False
+            self.flow._last_post_apply_parse_signal = {}
 
             self._apply_non_primary_filters(page, scenario, source_kind)
 
@@ -205,6 +207,11 @@ class ScenarioExecutor:
                 snapshots=snapshots,
                 total_count=total,
                 non_empty_stage_rows=non_empty,
+                apply_confirmed_but_parse_suspicious=bool(
+                    (getattr(self.flow, "_last_post_apply_parse_signal", {}) or {}).get(
+                        "apply_confirmed_but_parse_suspicious"
+                    )
+                ),
             )
         except Exception as exc:
             error = str(exc)
@@ -228,6 +235,7 @@ class ScenarioExecutor:
                 snapshots=[],
                 total_count=0,
                 non_empty_stage_rows=0,
+                apply_confirmed_but_parse_suspicious=False,
             )
 
     def _capture_tabs_from_current_view(self, page: Page, source_kind: SourceKind, scenario_index: int) -> list[AnalyticsSnapshot]:

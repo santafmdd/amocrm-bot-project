@@ -2642,6 +2642,77 @@ class AnalyticsFlow:
         # Fallback state-change confirmation when URL markers are delayed.
         return chip_present and dropdown_closed and (not panel_visible)
 
+    def _get_post_apply_parse_signal(self, page: Page, report_id: str, target_value: str) -> dict[str, object]:
+        """Soft signal for duplicate tag retries when apply URL is confirmed but parse looks stale."""
+        expected_min = int(getattr(self, "_runtime_min_expected_stage_count", 0) or 0)
+        if expected_min <= 0:
+            expected_min = max(self.TAB_READY_MIN_VALID_STAGE_NAMES + 1, 6)
+        stable_required = 2
+        stage_counts: list[int] = []
+        known_counts: list[int] = []
+        stable_hits = 0
+        previous_count: int | None = None
+        check_attempts = 3
+
+        for _ in range(check_attempts):
+            try:
+                snapshot = self.reader.read_current_view(
+                    page=page,
+                    source_kind="tag",
+                    filter_id=report_id,
+                    tab_mode="all",
+                )
+            except Exception as exc:
+                self.logger.info("post_apply_parse_signal_read_failed=true reason=%s", exc)
+                page.wait_for_timeout(260)
+                continue
+            count = len(snapshot.stages)
+            stage_counts.append(count)
+            known_stage_count = sum(
+                1
+                for stage in snapshot.stages
+                if any(stage.stage_name.strip().lower() == name.lower() for name in self.TAB_READY_STAGE_NAMES)
+            )
+            known_counts.append(known_stage_count)
+            if previous_count is not None and previous_count == count:
+                stable_hits += 1
+            previous_count = count
+            page.wait_for_timeout(260)
+
+        parse_stable = (
+            (stable_hits >= (stable_required - 1) and len(stage_counts) >= stable_required)
+            or (len(stage_counts) >= stable_required and len(set(stage_counts)) == 1)
+        )
+        max_stage_count = max(stage_counts) if stage_counts else 0
+        max_known_count = max(known_counts) if known_counts else 0
+        suspicious = bool(
+            parse_stable
+            and (
+                max_stage_count < expected_min
+                or max_known_count < self.TAB_READY_MIN_STRUCTURED_KNOWN_STAGE_NAMES
+            )
+        )
+        reason_parts: list[str] = []
+        if parse_stable and max_stage_count < expected_min:
+            reason_parts.append(f"stage_count<{expected_min}")
+        if parse_stable and max_known_count < self.TAB_READY_MIN_STRUCTURED_KNOWN_STAGE_NAMES:
+            reason_parts.append(
+                f"known_stage_count<{self.TAB_READY_MIN_STRUCTURED_KNOWN_STAGE_NAMES}"
+            )
+        payload = {
+            "apply_confirmed_but_parse_suspicious": suspicious,
+            "parse_stable": parse_stable,
+            "stable_hits": stable_hits,
+            "stage_counts": stage_counts,
+            "known_stage_counts": known_counts,
+            "expected_min_stage_count": expected_min,
+            "reason": ";".join(reason_parts) if reason_parts else "none",
+            "target_value": target_value,
+        }
+        self._last_post_apply_parse_signal = payload
+        self.logger.info("post_apply_parse_signal=%s", payload)
+        return payload
+
     def _build_external_agent_handoff_context(
         self,
         page: Page,

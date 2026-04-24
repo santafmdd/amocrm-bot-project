@@ -1,4 +1,38 @@
-﻿## Update (2026-04-12): OAuth Behavior and Safe Startup
+﻿## Known Failure Classes
+
+- `duplicate visible tags with different backend ids`:
+  check `duplicate_tag_candidates_found`, `duplicate_tag_candidates`, `selected_tag_candidate_id`, `final_selected_tag_candidate_id`.
+- `wrong route launch vs batch DSL launch`:
+  check `execution_mode`, `parsed_sheet_tasks_count`, `source_of_filter_value`.
+- `stale parse false negative after successful apply`:
+  check `tag_verify_success=url_marker_after_apply` + `apply_confirmed_but_parse_suspicious=true`.
+- `write planned but not persisted`:
+  check `planned_writes`, `attempted_writes`, `validated_writes`, `validation_failed_cells`.
+
+## Golden Commands
+
+- Dry-run batch DSL:
+  `python -m src.run_profile_analytics --report-id analytics_tag_layout_example --browser-backend openclaw_cdp --tag-selection-mode script --writer-layout-api-batch-from-sheet-dsl --writer-layout-api-batch-from-sheet-dsl-dry-run`
+- Live-run batch DSL:
+  `python -m src.run_profile_analytics --report-id analytics_tag_layout_example --browser-backend openclaw_cdp --tag-selection-mode script --writer-layout-api-batch-from-sheet-dsl`
+- Narrow duplicate-tag investigation:
+  `python -m src.run_profile_analytics --report-id analytics_tag_layout_example --browser-backend openclaw_cdp --tag-selection-mode script --writer-layout-api-target-dsl-cell A29 --writer-layout-api-batch-from-sheet-dsl`
+
+## Stop-Loss Rules
+
+- If logs show mass `goto_cell`/cell scan, wrong writer mode, or wrong final route:
+  stop current run and fix route/mode first.
+- Do not continue duplicate-tag debugging until route is confirmed as batch DSL + expected writer path.
+
+## Debug Artifacts to Save Before Any Risky Fix
+
+- last command
+- `git status`
+- current branch
+- related log file
+- latest `layout_api_write_summary_*`
+- latest related `exports/debug/*right_section*` and filter artifacts
+## Update (2026-04-12): OAuth Behavior and Safe Startup
 
 Google Sheets API auth is separate from amoCRM UI automation:
 - OpenClaw CDP is used for amoCRM browser automation only.
@@ -458,3 +492,4 @@ This does not replace analytics layout writer; it complements it for refusal-spe
 - Generic `tag_block_aliases` are used only when `layout.allow_generic_tag_alias_fallback=true`.
 - Recommended production setting for stable per-profile targeting:
   - `allow_generic_tag_alias_fallback: false`
+
