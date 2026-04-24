@@ -79,12 +79,15 @@ class DealAnalyzerConfig:
     deal_analyzer_sheet_name: str = ""
     deal_analyzer_start_cell: str = ""
     deal_analyzer_write_enabled: bool = False
+    deal_analyzer_call_review_sheet_name: str = "Разбор звонков"
+    deal_analyzer_call_review_start_cell: str = "A2"
     deal_analyzer_daily_sheet_name: str = ""
     deal_analyzer_daily_start_cell: str = "A2"
     deal_analyzer_weekly_sheet_name: str = ""
     deal_analyzer_weekly_start_cell: str = "A2"
     deal_analyzer_overwrite_mode: bool = False
     daily_manager_allowlist: tuple[str, ...] = ("Илья", "Рустам")
+    manager_role_registry: dict[str, str] | None = None
     product_reference_urls: dict[str, str] | None = None
     sales_module_references: tuple[str, ...] = ()
     external_retrieval_enabled: bool = False
@@ -277,6 +280,8 @@ def load_deal_analyzer_config(config_path: str | None = None) -> DealAnalyzerCon
     deal_analyzer_sheet_name = str(raw.get("deal_analyzer_sheet_name", "")).strip()
     deal_analyzer_start_cell = str(raw.get("deal_analyzer_start_cell", "")).strip()
     deal_analyzer_write_enabled = bool(raw.get("deal_analyzer_write_enabled", False))
+    deal_analyzer_call_review_sheet_name = str(raw.get("deal_analyzer_call_review_sheet_name", "")).strip() or "Разбор звонков"
+    deal_analyzer_call_review_start_cell = str(raw.get("deal_analyzer_call_review_start_cell", "A2")).strip() or "A2"
     deal_analyzer_daily_sheet_name = str(raw.get("deal_analyzer_daily_sheet_name", "")).strip()
     deal_analyzer_daily_start_cell = str(raw.get("deal_analyzer_daily_start_cell", "A2")).strip() or "A2"
     deal_analyzer_weekly_sheet_name = str(raw.get("deal_analyzer_weekly_sheet_name", "")).strip()
@@ -285,12 +290,16 @@ def load_deal_analyzer_config(config_path: str | None = None) -> DealAnalyzerCon
     daily_manager_allowlist = tuple(
         _parse_str_list(raw.get("daily_manager_allowlist", ["Илья", "Рустам"]))
     ) or ("Илья", "Рустам")
+    manager_role_registry = _parse_manager_role_registry(raw.get("manager_role_registry"))
     product_reference_urls_raw = raw.get("product_reference_urls")
     product_reference_urls: dict[str, str] = {}
     if isinstance(product_reference_urls_raw, dict):
         for key, value in product_reference_urls_raw.items():
             key_norm = str(key or "").strip().lower()
-            val_norm = str(value or "").strip()
+            if isinstance(value, list):
+                val_norm = "; ".join(_parse_str_list(value)).strip()
+            else:
+                val_norm = str(value or "").strip()
             if key_norm and val_norm:
                 product_reference_urls[key_norm] = val_norm
     sales_module_references = tuple(_parse_str_list(raw.get("sales_module_references", [])))
@@ -390,12 +399,15 @@ def load_deal_analyzer_config(config_path: str | None = None) -> DealAnalyzerCon
         deal_analyzer_sheet_name=deal_analyzer_sheet_name,
         deal_analyzer_start_cell=deal_analyzer_start_cell,
         deal_analyzer_write_enabled=deal_analyzer_write_enabled,
+        deal_analyzer_call_review_sheet_name=deal_analyzer_call_review_sheet_name,
+        deal_analyzer_call_review_start_cell=deal_analyzer_call_review_start_cell,
         deal_analyzer_daily_sheet_name=deal_analyzer_daily_sheet_name,
         deal_analyzer_daily_start_cell=deal_analyzer_daily_start_cell,
         deal_analyzer_weekly_sheet_name=deal_analyzer_weekly_sheet_name,
         deal_analyzer_weekly_start_cell=deal_analyzer_weekly_start_cell,
         deal_analyzer_overwrite_mode=deal_analyzer_overwrite_mode,
         daily_manager_allowlist=daily_manager_allowlist,
+        manager_role_registry=manager_role_registry,
         product_reference_urls=product_reference_urls or None,
         sales_module_references=sales_module_references,
         external_retrieval_enabled=external_retrieval_enabled,
@@ -500,6 +512,22 @@ def _parse_str_list(raw: Any) -> list[str]:
         if text:
             items.append(text)
     return items
+
+
+def _parse_manager_role_registry(raw: Any) -> dict[str, str]:
+    out: dict[str, str] = {}
+    if isinstance(raw, dict):
+        for key, value in raw.items():
+            name = str(key or "").strip()
+            role = str(value or "").strip().lower()
+            if not name:
+                continue
+            if role not in {"telemarketer", "sales_manager"}:
+                continue
+            out[name] = role
+    if not out:
+        out = {"Рустам": "telemarketer", "Илья": "sales_manager"}
+    return out
 
 def _parse_non_negative_int(value: Any, *, field: str) -> int:
     try:

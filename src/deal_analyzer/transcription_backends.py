@@ -130,6 +130,7 @@ class FasterWhisperTranscriptionBackend:
         self.device = device
         self.compute_type = compute_type
         self.language = language
+        self._model: Any | None = None
 
     def transcribe(self, *, call: dict[str, Any], cache_key: str) -> TranscriptArtifact:
         audio_path = _resolve_call_audio_path(call)
@@ -165,12 +166,14 @@ class FasterWhisperTranscriptionBackend:
                 transcript_error=f"faster_whisper_import_failed:{exc}",
             )
 
-        model = WhisperModel(
-            self.model_name,
-            device=self.device,
-            compute_type=self.compute_type,
-        )
-        segments_iter, info = model.transcribe(
+        if self._model is None:
+            self._model = WhisperModel(
+                self.model_name,
+                device=self.device,
+                compute_type=self.compute_type,
+            )
+
+        segments_iter, info = self._model.transcribe(
             str(audio_path),
             language=self.language or None,
             vad_filter=True,

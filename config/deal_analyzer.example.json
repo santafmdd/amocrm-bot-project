@@ -65,7 +65,7 @@
   "roks_source_url": "",
   "roks_sheet_name": "",
   "roks_sheet_candidates": [
-    "???? 2026"
+    "РОКС 2026"
   ],
   "transcription_backend": "faster_whisper",
   "transcription_base_url": "",
@@ -83,10 +83,17 @@
   "call_collection_mode": "api_first",
   "call_backend": "amocrm_api",
   "period_live_refresh_enabled": true,
-  "daily_manager_allowlist": ["Илья", "Рустам"],
+  "daily_manager_allowlist": [
+    "Илья",
+    "Рустам"
+  ],
+  "manager_role_registry": {
+    "Рустам": "telemarketer",
+    "Илья": "sales_manager"
+  },
   "product_reference_urls": {
-    "info": "",
-    "link": "",
+    "info": "https://istock.info/",
+    "link": "https://istock.link/",
     "both": ""
   },
   "sales_module_references": [],
@@ -103,6 +110,8 @@
   "deal_analyzer_spreadsheet_id": "1snOH42aIRUtxS3AU9PJPHSrk1vDyFQdiIJNJRhasxX0",
   "deal_analyzer_write_enabled": false,
   "deal_analyzer_overwrite_mode": false,
+  "deal_analyzer_call_review_sheet_name": "Разбор звонков",
+  "deal_analyzer_call_review_start_cell": "A2",
   "deal_analyzer_daily_sheet_name": "Дневной контроль",
   "deal_analyzer_daily_start_cell": "A2",
   "deal_analyzer_weekly_sheet_name": "Недельный свод менеджеров",

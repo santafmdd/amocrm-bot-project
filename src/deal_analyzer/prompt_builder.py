@@ -29,6 +29,21 @@ DAILY_RERANK_JSON_INSTRUCTION = (
     "\"call_analysis_viability\":\"high|medium|low\",\"call_analysis_viability_reason\":\"...\"}]}"
 )
 
+CALL_REVIEW_CASE_JSON_INSTRUCTION = (
+    "Верни только валидный JSON-объект без markdown/комментариев/пояснений. "
+    "Ключи: key_takeaway, strong_sides, growth_zones, why_important, reinforce, fix_action, coaching_list, "
+    "expected_quantity, expected_quality, evidence_quote, "
+    "stage_secretary_comment, stage_lpr_comment, stage_need_comment, stage_presentation_comment, "
+    "stage_closing_comment, stage_objections_comment, stage_speech_comment, stage_crm_comment, "
+    "stage_discipline_comment, stage_demo_comment, "
+    "stage_demo_intro_comment, stage_demo_context_comment, stage_demo_relevant_comment, "
+    "stage_demo_process_comment, stage_demo_objections_comment, stage_demo_next_step_comment, "
+    "stage_test_launch_comment, stage_test_criteria_comment, stage_test_owners_comment, "
+    "stage_test_support_comment, stage_test_feedback_comment, stage_test_objections_comment, stage_test_comment, "
+    "stage_dozhim_recontact_comment, stage_dozhim_doubts_comment, stage_dozhim_terms_comment, "
+    "stage_dozhim_decision_comment, stage_dozhim_flow_comment, stage_dozhim_comment."
+)
+
 
 def build_manager_message_draft(analysis: DealAnalysis) -> str:
     deal_label = analysis.deal_name or f"Сделка {analysis.deal_id}"
@@ -91,6 +106,180 @@ def append_daily_rerank_json_repair_instruction(messages: list[dict[str, str]]) 
     out = list(messages)
     out.append({"role": "user", "content": DAILY_RERANK_JSON_INSTRUCTION})
     return out
+
+
+def append_call_review_case_json_repair_instruction(messages: list[dict[str, str]]) -> list[dict[str, str]]:
+    out = list(messages)
+    out.append({"role": "user", "content": CALL_REVIEW_CASE_JSON_INSTRUCTION})
+    return out
+
+
+def build_call_review_case_messages(
+    *,
+    factual_payload: dict[str, Any],
+    style_source_excerpt: str,
+    style_mode: str = "mild",
+) -> list[dict[str, str]]:
+    case_mode = str(factual_payload.get("case_mode") or "").strip()
+    role = str(factual_payload.get("role") or "").strip()
+    reference_block = str(factual_payload.get("reference_block") or "").strip()
+    style_line = (
+        "Тон рабочий, допускается умеренно жесткий язык без оскорблений личности."
+        if str(style_mode or "mild").strip().lower() == "work_rude"
+        else "Тон живой и рабочий, без канцелярита."
+    )
+    system_prompt = (
+        "Ты делаешь разбор звонкового кейса для листа \"Разбор звонков\". "
+        "Основа - факты разговора и транскрипта; CRM вторично. "
+        "Не выдумывай этапы, которых в кейсе нет. Если доказательств мало, оставляй поле пустым. "
+        f"{style_line} "
+        "Запрещено использовать технические enum-значения или служебные коды. "
+        "Верни только JSON."
+    )
+    free_analysis_text = str(factual_payload.get("free_analysis_text") or "").strip()
+    effect_layer_text = str(factual_payload.get("effect_layer_text") or "").strip()
+    user_prompt = (
+        "Factual payload:\n"
+        f"{json.dumps(factual_payload, ensure_ascii=False, indent=2)}\n\n"
+        "Собери JSON с ключами:\n"
+        "- key_takeaway\n"
+        "- strong_sides\n"
+        "- growth_zones\n"
+        "- why_important\n"
+        "- reinforce\n"
+        "- fix_action\n"
+        "- coaching_list\n"
+        "- expected_quantity\n"
+        "- expected_quality\n"
+        "- evidence_quote\n"
+        "- stage_secretary_comment\n"
+        "- stage_lpr_comment\n"
+        "- stage_need_comment\n"
+        "- stage_presentation_comment\n"
+        "- stage_closing_comment\n"
+        "- stage_objections_comment\n"
+        "- stage_speech_comment\n"
+        "- stage_crm_comment\n"
+        "- stage_discipline_comment\n"
+        "- stage_demo_comment\n"
+        "- stage_demo_intro_comment\n"
+        "- stage_demo_context_comment\n"
+        "- stage_demo_relevant_comment\n"
+        "- stage_demo_process_comment\n"
+        "- stage_demo_objections_comment\n"
+        "- stage_demo_next_step_comment\n"
+        "- stage_test_launch_comment\n"
+        "- stage_test_criteria_comment\n"
+        "- stage_test_owners_comment\n"
+        "- stage_test_support_comment\n"
+        "- stage_test_feedback_comment\n"
+        "- stage_test_objections_comment\n"
+        "- stage_test_comment\n"
+        "- stage_dozhim_recontact_comment\n"
+        "- stage_dozhim_doubts_comment\n"
+        "- stage_dozhim_terms_comment\n"
+        "- stage_dozhim_decision_comment\n"
+        "- stage_dozhim_flow_comment\n"
+        "- stage_dozhim_comment\n\n"
+        "Правила:\n"
+        "1) Заполняй этаповые комментарии только при явном evidence.\n"
+        "2) Если evidence нет - пустая строка, без фантазий.\n"
+        "3) coaching_list строго форматом:\n1) ...\n2) ...\n3) ...\n"
+        "4) expected_quantity только в штуках за неделю, без процентов.\n"
+        "5) В secretary-case не пиши про демо/бриф/тест без прямого сигнала.\n"
+        "6) В weak/noisy кейсах не маскируй пробелы формальными фразами.\n\n"
+        f"case_mode={case_mode}; role={role}\n"
+        f"Free-form analysis layer:\n{free_analysis_text or '(not provided)'}\n\n"
+        f"Effect/motivation layer:\n{effect_layer_text or '(not provided)'}\n\n"
+        f"Reference stack:\n{reference_block or '(no references)'}\n\n"
+        f"Style source:\n{style_source_excerpt or '(style source unavailable)'}"
+    )
+    return [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
+
+
+def build_call_review_free_form_messages(
+    *,
+    factual_payload: dict[str, Any],
+    style_source_excerpt: str,
+    style_mode: str = "mild",
+) -> list[dict[str, str]]:
+    style_line = (
+        "Тон рабочий, можно чуть жестче, но без личных оскорблений."
+        if str(style_mode or "mild").strip().lower() == "work_rude"
+        else "Тон живой рабочий, без бюрократии."
+    )
+    system_prompt = (
+        "Ты старший руководитель продаж и разбираешь звонок по фактам. "
+        "Главный источник смысла - звонок и переговорные этапы, CRM вторично. "
+        "Не выдумывай факты и не подменяй разбор морализаторством про CRM. "
+        f"{style_line}"
+    )
+    user_prompt = (
+        "Сделай подробный свободный разбор кейса на русском (без JSON):\n"
+        "1) что реально произошло в разговоре,\n"
+        "2) по каким этапам менеджер был хорош,\n"
+        "3) где конкретно недожал,\n"
+        "4) какие модули/приемы дать сотруднику,\n"
+        "5) 2-4 точные цитаты, на которые опираешься.\n\n"
+        f"Factual payload:\n{json.dumps(factual_payload, ensure_ascii=False, indent=2)}\n\n"
+        f"Style source:\n{style_source_excerpt or '(style source unavailable)'}"
+    )
+    return [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
+
+
+def build_call_review_effect_messages(
+    *,
+    factual_payload: dict[str, Any],
+    free_form_text: str,
+    style_mode: str = "mild",
+) -> list[dict[str, str]]:
+    style_line = (
+        "Тон рабочий и предметный."
+        if str(style_mode or "mild").strip().lower() == "work_rude"
+        else "Тон короткий и предметный."
+    )
+    system_prompt = (
+        "Ты добавляешь второй управленческий слой к уже готовому разбору. "
+        "Не пересобирай разговор заново, дострой мотивацию и эффект. "
+        "Эффект количества давай только в штуках за неделю, без процентов. "
+        f"{style_line}"
+    )
+    user_prompt = (
+        "Добавь второй слой (без JSON):\n"
+        "- почему сотруднику важно закрыть зоны роста,\n"
+        "- эффект количества в штуках за неделю,\n"
+        "- эффект качества по этапам как осторожная гипотеза,\n"
+        "- как это ударит в проблемный этап и ниже по воронке.\n\n"
+        f"Factual payload:\n{json.dumps(factual_payload, ensure_ascii=False, indent=2)}\n\n"
+        f"Free-form analysis:\n{free_form_text or '(empty)'}"
+    )
+    return [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
+
+
+def build_call_review_style_json_messages(
+    *,
+    structured_json_payload: dict[str, Any],
+    style_source_excerpt: str,
+    style_mode: str = "mild",
+) -> list[dict[str, str]]:
+    style_line = (
+        "Можно умеренно жесткий рабочий язык, без личных оскорблений."
+        if str(style_mode or "mild").strip().lower() == "work_rude"
+        else "Пиши живым рабочим языком."
+    )
+    system_prompt = (
+        "Ты style-layer для готового JSON разбора кейса. "
+        "Не меняй факты и структуру JSON, только перефразируй текстовые поля. "
+        "Не добавляй новые сущности и не сдвигай смысл. "
+        f"{style_line} "
+        "Верни только JSON."
+    )
+    user_prompt = (
+        "Перепиши стиль, сохрани те же ключи JSON.\n\n"
+        f"Input JSON:\n{json.dumps(structured_json_payload, ensure_ascii=False, indent=2)}\n\n"
+        f"Style source:\n{style_source_excerpt or '(style source unavailable)'}"
+    )
+    return [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
 
 
 def build_hybrid_short_messages(*, normalized_deal: dict[str, Any], config: DealAnalyzerConfig) -> list[dict[str, str]]:

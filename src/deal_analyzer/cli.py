@@ -23,6 +23,11 @@ from src.safety import ensure_inside_root
 
 from .call_downloader import CallDownloader
 from .call_evidence import build_call_summary, call_evidence_to_dicts
+from .call_review_sheet import (
+    CALL_REVIEW_DEFAULT_COLUMNS,
+    build_call_review_payload,
+    rows_to_sheet_matrix,
+)
 from .base_mix import (
     build_base_mix_text as build_base_mix_text_priority,
     collect_raw_tag_values,
@@ -51,8 +56,13 @@ from .llm_client import OllamaClient
 from .llm_runtime import resolve_ollama_runtime
 from .models import AnalysisRunMetadata
 from .prompt_builder import (
+    append_call_review_case_json_repair_instruction,
     append_daily_rerank_json_repair_instruction,
     append_daily_table_json_repair_instruction,
+    build_call_review_case_messages,
+    build_call_review_effect_messages,
+    build_call_review_free_form_messages,
+    build_call_review_style_json_messages,
     build_daily_rerank_messages,
     build_daily_table_messages,
 )
@@ -62,6 +72,8 @@ from .rules import analyze_deal
 from .snapshot_builder import build_deal_snapshot, build_period_snapshots
 from .transcript_signals import build_call_signal_aggregates, derive_transcript_signals
 from .transcription import transcribe_call_evidence
+
+MSK_TZ = timezone(timedelta(hours=3))
 
 DAILY_CONTROL_COLUMNS = [
     "Неделя с",
@@ -916,6 +928,18 @@ def _run_analyze_period(
         conversation_pool_payload=conversation_pool_payload,
         discipline_pool_payload=discipline_pool_payload,
     )
+    shortlist_items_raw = (
+        transcription_shortlist_payload.get("items", [])
+        if isinstance(transcription_shortlist_payload.get("items"), list)
+        else []
+    )
+    shortlist_items_annotated, dropped_open_window_items = _annotate_shortlist_business_windows(
+        shortlist_items=[x for x in shortlist_items_raw if isinstance(x, dict)],
+        run_started_at_utc=run_started_at,
+    )
+    transcription_shortlist_payload["items"] = shortlist_items_annotated
+    transcription_shortlist_payload["business_window_open_date"] = _open_business_window_date(run_started_at).isoformat()
+    transcription_shortlist_payload["business_window_items_open_bucket"] = int(dropped_open_window_items)
     _write_json_path(run_dir / "transcription_shortlist.json", transcription_shortlist_payload)
     (run_dir / "transcription_shortlist.md").write_text(
         _build_transcription_shortlist_markdown(transcription_shortlist_payload=transcription_shortlist_payload),
@@ -931,16 +955,27 @@ def _run_analyze_period(
         call_pool_debug.get("deals_with_autoanswer_pattern", 0),
         call_pool_debug.get("deals_with_redial_pattern", 0),
     )
-    shortlist_items = (
-        transcription_shortlist_payload.get("items", [])
-        if isinstance(transcription_shortlist_payload.get("items"), list)
-        else []
-    )
+    shortlist_items = shortlist_items_annotated
     analysis_shortlist_payload = _build_analysis_shortlist_payload(
         shortlist_items=[x for x in shortlist_items if isinstance(x, dict)],
         normalized_rows_ranked=normalized_rows_ranked,
         limit=limit,
     )
+    selected_items_raw = (
+        analysis_shortlist_payload.get("selected_items", [])
+        if isinstance(analysis_shortlist_payload.get("selected_items"), list)
+        else []
+    )
+    selected_items_filtered, selected_dropped_by_window = _filter_selected_by_business_window(
+        selected_items=[x for x in selected_items_raw if isinstance(x, dict)]
+    )
+    analysis_shortlist_payload["selected_items"] = selected_items_filtered
+    analysis_shortlist_payload["business_window_filter"] = {
+        "open_window_date": _open_business_window_date(run_started_at).isoformat(),
+        "selected_items_before_filter": len(selected_items_raw),
+        "selected_items_after_filter": len(selected_items_filtered),
+        "selected_items_dropped_open_bucket": int(selected_dropped_by_window),
+    }
     _write_json_path(run_dir / "analysis_shortlist.json", analysis_shortlist_payload)
     (run_dir / "analysis_shortlist.md").write_text(
         _build_analysis_shortlist_markdown(payload=analysis_shortlist_payload),
@@ -1142,6 +1177,16 @@ def _run_analyze_period(
                 snapshot if isinstance(snapshot, dict) else {},
                 status_name=str(crm.get("status_name") or ""),
             )
+            anchor_call_timestamp = str(shortlist_meta.get("anchor_call_timestamp") or "").strip()
+            if not anchor_call_timestamp:
+                anchor_call_timestamp = _extract_anchor_call_timestamp(
+                    snapshot=snapshot if isinstance(snapshot, dict) else {},
+                    selected_call_ids=list(
+                        shortlist_meta.get("selected_call_ids", [])
+                        if isinstance(shortlist_meta.get("selected_call_ids"), list)
+                        else []
+                    ),
+                )
             period_deal_records.append(
                 {
                     "deal_id": analysis.get("deal_id") or crm.get("deal_id"),
@@ -1334,6 +1379,11 @@ def _run_analyze_period(
                     if isinstance(shortlist_meta.get("selected_call_ids"), list)
                     else [],
                     "selected_call_count": int(shortlist_meta.get("selected_call_count", 0) or 0),
+                    "anchor_call_id": str(shortlist_meta.get("anchor_call_id") or ""),
+                    "business_window_date": str(shortlist_meta.get("business_window_date") or ""),
+                    "business_window_closed": bool(shortlist_meta.get("business_window_closed")),
+                    "call_anchor_timestamp": anchor_call_timestamp,
+                    "call_anchor_date": _date_only_from_iso(anchor_call_timestamp),
                     "analysis_shortlist_rank_group": int(analysis_meta.get("rank_group", 0) or 0),
                     "analysis_shortlist_reason": str(analysis_meta.get("shortlist_reason") or ""),
                     "analysis_shortlist_forced_fallback": bool(analysis_meta.get("forced_fallback")),
@@ -1525,6 +1575,18 @@ def _run_analyze_period(
             "analysis_shortlist_total": int(analysis_shortlist_payload.get("total_selected", 0) or 0),
             "analysis_shortlist_candidates_total": int(analysis_shortlist_payload.get("total_candidates", 0) or 0),
             "analysis_shortlist_limit_applied": analysis_shortlist_payload.get("limit_applied_to_shortlist"),
+            "business_window_open_date": str(transcription_shortlist_payload.get("business_window_open_date") or ""),
+            "business_window_items_open_bucket": int(
+                transcription_shortlist_payload.get("business_window_items_open_bucket", 0) or 0
+            ),
+            "analysis_shortlist_selected_dropped_open_bucket": int(
+                (
+                    analysis_shortlist_payload.get("business_window_filter", {})
+                    if isinstance(analysis_shortlist_payload.get("business_window_filter"), dict)
+                    else {}
+                ).get("selected_items_dropped_open_bucket", 0)
+                or 0
+            ),
             "analysis_shortlist_forced_fallback_total": sum(
                 1
                 for x in (
@@ -1544,6 +1606,20 @@ def _run_analyze_period(
     summary_payload["period_start"] = resolved.period_start.isoformat()
     summary_payload["period_end"] = resolved.period_end.isoformat()
     summary_payload["as_of_date"] = resolved.as_of_date.isoformat()
+    summary_payload["call_business_windows"] = {
+        "timezone": "+03:00",
+        "cutoff_local_time": "15:00",
+        "open_window_date": str(transcription_shortlist_payload.get("business_window_open_date") or ""),
+        "shortlist_items_open_bucket": int(transcription_shortlist_payload.get("business_window_items_open_bucket", 0) or 0),
+        "selected_items_dropped_open_bucket": int(
+            (
+                analysis_shortlist_payload.get("business_window_filter", {})
+                if isinstance(analysis_shortlist_payload.get("business_window_filter"), dict)
+                else {}
+            ).get("selected_items_dropped_open_bucket", 0)
+            or 0
+        ),
+    }
     summary_payload["live_refresh"] = refresh_diag
     summary_payload["company_tag_propagation_dry_run"] = {
         "artifact_json": str(company_tag_propagation_plan_path),
@@ -1650,198 +1726,126 @@ def _run_analyze_period(
         "main_model": str((analysis_llm_runtime.get("main") or {}).get("model") or ""),
         "fallback_model": str((analysis_llm_runtime.get("fallback") or {}).get("model") or ""),
     }
-    daily_step_artifacts_dir = run_dir / "daily_step_artifacts"
-    daily_control_payload = _build_daily_control_sheet_payload(
-        summary=summary_payload,
-        period_deal_records=period_deal_records,
-        amo_base_domain=_resolve_amo_base_domain_for_links(cfg=cfg),
-        manager_allowlist=list(getattr(cfg, "daily_manager_allowlist", ()) or ()),
-        cfg=analysis_cfg,
-        logger=logger,
-        backend_effective=effective_backend,
-        style_source_excerpt=style_source_excerpt,
-        llm_runtime=daily_llm_runtime,
-        daily_step_artifacts_dir=daily_step_artifacts_dir,
-    )
-    daily_rows = daily_control_payload.get("rows", []) if isinstance(daily_control_payload.get("rows"), list) else []
-    summary_payload["daily_rows_total"] = len(daily_rows)
-    summary_payload["daily_rows_llm_ready"] = sum(1 for r in daily_rows if isinstance(r, dict) and bool(r.get("llm_text_ready")))
-    summary_payload["daily_rows_skipped_weak_input"] = sum(
-        1
-        for r in daily_rows
-        if isinstance(r, dict)
-        and str(r.get("daily_package_quality_label") or "") in {"weak", "thin"}
-        and int(r.get("negotiation_signal_presence_score", 0) or 0) <= 20
-    )
-    selection_debug_summary = (
-        daily_control_payload.get("selection_debug_summary", {})
-        if isinstance(daily_control_payload.get("selection_debug_summary"), dict)
-        else {}
-    )
-    summary_payload["daily_rows_from_conversation_pool"] = int(
-        selection_debug_summary.get("daily_rows_from_conversation_pool", 0) or 0
-    )
-    summary_payload["daily_rows_from_discipline_pool"] = int(
-        selection_debug_summary.get("daily_rows_from_discipline_pool", 0) or 0
-    )
-    summary_payload["daily_rows_skipped_crm_only"] = int(
-        selection_debug_summary.get("daily_rows_skipped_crm_only", 0) or 0
-    )
-    summary_payload["daily_rows_with_real_transcript"] = int(
-        selection_debug_summary.get("daily_rows_with_real_transcript", 0) or 0
-    )
-    summary_payload["daily_rows_with_only_discipline_signals"] = int(
-        selection_debug_summary.get("daily_rows_with_only_discipline_signals", 0) or 0
-    )
+    daily_control_payload = {
+        "mode": "legacy_daily_disabled_for_call_review_v2",
+        "sheet_name": str(getattr(cfg, "deal_analyzer_daily_sheet_name", "") or ""),
+        "start_cell": str(getattr(cfg, "deal_analyzer_daily_start_cell", "A2") or "A2"),
+        "columns": list(DAILY_CONTROL_COLUMNS),
+        "rows": [],
+        "selection_debug_summary": {
+            "reason": "active_path_uses_call_review_writer_only",
+            "daily_rows_from_conversation_pool": 0,
+            "daily_rows_from_discipline_pool": 0,
+            "daily_rows_skipped_crm_only": 0,
+            "daily_rows_with_real_transcript": 0,
+            "daily_rows_with_only_discipline_signals": 0,
+        },
+    }
     daily_control_payload_path = run_dir / "daily_control_sheet_payload.json"
     _write_json_path(daily_control_payload_path, daily_control_payload)
     daily_selection_debug_path = run_dir / "daily_selection_debug.json"
     _write_json_path(
         daily_selection_debug_path,
         {
-            "summary": selection_debug_summary,
-            "rows": [
-                {
-                    "control_day": str(r.get("Дата контроля") or ""),
-                    "manager": str(r.get("Менеджер") or ""),
-                    "deals_analyzed": int(r.get("Проанализировано сделок", 0) or 0),
-                    "base_mix_selected_source": str(r.get("base_mix_selected_source") or ""),
-                    "base_mix_selected_value": str(r.get("base_mix_selected_value") or ""),
-                    "base_mix_fallback_used": bool(r.get("base_mix_fallback_used")),
-                    "base_mix_raw_tags_deal": r.get("base_mix_raw_tags_deal") if isinstance(r.get("base_mix_raw_tags_deal"), list) else [],
-                    "base_mix_raw_tags_company": r.get("base_mix_raw_tags_company") if isinstance(r.get("base_mix_raw_tags_company"), list) else [],
-                    "base_mix_deal_tag_entries": r.get("base_mix_deal_tag_entries") if isinstance(r.get("base_mix_deal_tag_entries"), list) else [],
-                    "base_mix_company_tag_entries": r.get("base_mix_company_tag_entries") if isinstance(r.get("base_mix_company_tag_entries"), list) else [],
-                    "daily_primary_source": str(r.get("daily_primary_source") or ""),
-                    "daily_case_type": str(r.get("daily_case_type") or ""),
-                    "daily_selection_reason_v2": str(r.get("daily_selection_reason_v2") or ""),
-                    "excluded_crm_only_cases_count": int(r.get("excluded_crm_only_cases_count", 0) or 0),
-                    "daily_analysis_mode": str(r.get("daily_analysis_mode") or ""),
-                    "llm_text_ready": bool(r.get("llm_text_ready")),
-                }
-                for r in daily_rows
-                if isinstance(r, dict)
-            ],
+            "summary": daily_control_payload.get("selection_debug_summary", {}),
+            "rows": [],
         },
     )
     reference_stack_debug_path = run_dir / "daily_reference_stack_debug.json"
-    reference_rows = [
-        {
-            "control_day": str(r.get("Дата контроля") or ""),
-            "manager": str(r.get("Менеджер") or ""),
-            "reference_sources_count": int(r.get("reference_sources_count", 0) or 0),
-            "reference_required_layers": (
-                r.get("reference_required_layers", {})
-                if isinstance(r.get("reference_required_layers"), dict)
-                else {}
-            ),
-            "external_retrieval_used": bool(r.get("external_retrieval_used")),
-            "external_retrieval_snippets_count": int(r.get("external_retrieval_snippets_count", 0) or 0),
-            "reference_sources_used": str(r.get("reference_sources_used") or ""),
-            "reference_stack_diagnostics": r.get("reference_stack_diagnostics", {}),
-        }
-        for r in daily_rows
-        if isinstance(r, dict)
-    ]
     _write_json_path(
         reference_stack_debug_path,
         {
-            "rows_total": len(reference_rows),
-            "external_retrieval_rows": sum(1 for x in reference_rows if bool(x.get("external_retrieval_used"))),
-            "rows_with_internal_required_ok": sum(
-                1
-                for x in reference_rows
-                if bool(
-                    (
-                        (x.get("reference_required_layers", {}) if isinstance(x.get("reference_required_layers"), dict) else {})
-                        .get("internal_references", {})
-                        .get("ok")
-                    )
-                )
-            ),
-            "rows_with_role_required_ok": sum(
-                1
-                for x in reference_rows
-                if bool(
-                    (
-                        (x.get("reference_required_layers", {}) if isinstance(x.get("reference_required_layers"), dict) else {})
-                        .get("role_context", {})
-                        .get("ok")
-                    )
-                )
-            ),
-            "rows_with_product_required_ok": sum(
-                1
-                for x in reference_rows
-                if bool(
-                    (
-                        (x.get("reference_required_layers", {}) if isinstance(x.get("reference_required_layers"), dict) else {})
-                        .get("product_reference_urls", {})
-                        .get("ok")
-                    )
-                )
-            ),
-            "rows": reference_rows,
+            "rows_total": 0,
+            "external_retrieval_rows": 0,
+            "rows_with_internal_required_ok": 0,
+            "rows_with_role_required_ok": 0,
+            "rows_with_product_required_ok": 0,
+            "rows": [],
+            "reason": "legacy_daily_reference_stack_disabled_in_call_review_v2",
         },
     )
+    summary_payload["daily_rows_total"] = 0
+    summary_payload["daily_rows_llm_ready"] = 0
+    summary_payload["daily_rows_skipped_weak_input"] = 0
+    summary_payload["daily_rows_from_conversation_pool"] = 0
+    summary_payload["daily_rows_from_discipline_pool"] = 0
+    summary_payload["daily_rows_skipped_crm_only"] = 0
+    summary_payload["daily_rows_with_real_transcript"] = 0
+    summary_payload["daily_rows_with_only_discipline_signals"] = 0
     summary_payload["daily_reference_stack"] = {
-        "rows_total": len(reference_rows),
-        "rows_with_references": sum(1 for x in reference_rows if int(x.get("reference_sources_count", 0) or 0) > 0),
-        "external_retrieval_rows": sum(1 for x in reference_rows if bool(x.get("external_retrieval_used"))),
-        "rows_with_internal_required_ok": sum(
-            1
-            for x in reference_rows
-            if bool(
-                (
-                    (x.get("reference_required_layers", {}) if isinstance(x.get("reference_required_layers"), dict) else {})
-                    .get("internal_references", {})
-                    .get("ok")
-                )
-            )
-        ),
-        "rows_with_role_required_ok": sum(
-            1
-            for x in reference_rows
-            if bool(
-                (
-                    (x.get("reference_required_layers", {}) if isinstance(x.get("reference_required_layers"), dict) else {})
-                    .get("role_context", {})
-                    .get("ok")
-                )
-            )
-        ),
-        "rows_with_product_required_ok": sum(
-            1
-            for x in reference_rows
-            if bool(
-                (
-                    (x.get("reference_required_layers", {}) if isinstance(x.get("reference_required_layers"), dict) else {})
-                    .get("product_reference_urls", {})
-                    .get("ok")
-                )
-            )
-        ),
+        "rows_total": 0,
+        "rows_with_references": 0,
+        "external_retrieval_rows": 0,
+        "rows_with_internal_required_ok": 0,
+        "rows_with_role_required_ok": 0,
+        "rows_with_product_required_ok": 0,
         "diagnostics_path": str(reference_stack_debug_path),
+        "reason": "legacy_daily_reference_stack_disabled_in_call_review_v2",
     }
-    if isinstance(daily_control_payload.get("daily_multistep_pipeline"), dict):
-        summary_payload["daily_multistep_pipeline"] = daily_control_payload.get("daily_multistep_pipeline")
+    summary_payload["daily_multistep_pipeline"] = {
+        "mode": "disabled_in_call_review_v2",
+        "reason": "active_path_uses_call_review_multistep_only",
+    }
+    call_review_llm_generation = _prepare_call_review_llm_fields(
+        cfg=analysis_cfg,
+        logger=logger,
+        llm_runtime=daily_llm_runtime,
+        style_source_excerpt=style_source_excerpt,
+        period_deal_records=period_deal_records,
+        analysis_shortlist_payload=analysis_shortlist_payload,
+        step_artifacts_root=run_dir / "call_review_step_artifacts",
+    )
+    summary_payload["call_review_llm_generation"] = call_review_llm_generation
+    call_review_payload = build_call_review_payload(
+        summary=summary_payload,
+        period_deal_records=period_deal_records,
+        analysis_shortlist_payload=analysis_shortlist_payload,
+        base_domain=_resolve_amo_base_domain_for_links(cfg=cfg),
+        manager_allowlist=list(getattr(cfg, "daily_manager_allowlist", ()) or ()),
+        manager_role_registry=dict(getattr(cfg, "manager_role_registry", {}) or {}),
+    )
+    call_review_payload_path = run_dir / "call_review_sheet_payload.json"
+    _write_json_path(call_review_payload_path, call_review_payload)
+    summary_payload["call_review_rows_total"] = int(call_review_payload.get("rows_count", 0) or 0)
+    summary_payload["call_review_selection_debug"] = (
+        call_review_payload.get("selection_debug", {})
+        if isinstance(call_review_payload.get("selection_debug"), dict)
+        else {}
+    )
     write_cfg = analysis_cfg
     if not bool(daily_llm_runtime.get("selected") in {"main", "fallback"}):
         write_cfg = replace(analysis_cfg, deal_analyzer_write_enabled=False)
         logger.warning(
-            "daily writer forced to dry_run: reason=no_live_llm_runtime selected=%s runtime_reason=%s",
+            "call review writer forced to dry_run: reason=no_live_llm_runtime selected=%s runtime_reason=%s",
             str(daily_llm_runtime.get("selected") or "none"),
             str(daily_llm_runtime.get("reason") or ""),
         )
-    meeting_queue_writer_status = _maybe_write_daily_control_sheet(
+    call_review_writer_status = _maybe_write_call_review_sheet(
         cfg=write_cfg,
         logger=logger,
-        daily_payload=daily_control_payload,
+        call_review_payload=call_review_payload,
     )
     if analysis_cfg.deal_analyzer_write_enabled and not write_cfg.deal_analyzer_write_enabled:
-        meeting_queue_writer_status["error"] = "write_forced_dry_run_no_live_llm"
-    summary_payload["daily_control_writer"] = meeting_queue_writer_status
-    summary_payload["meeting_queue_writer"] = meeting_queue_writer_status
+        call_review_writer_status["error"] = "write_forced_dry_run_no_live_llm"
+    summary_payload["call_review_writer"] = call_review_writer_status
+    summary_payload["daily_control_writer"] = {
+        "enabled": False,
+        "mode": "inactive_for_analyze_period",
+        "sheet_name": "",
+        "start_cell": "",
+        "rows_prepared": 0,
+        "rows_written": 0,
+        "error": "",
+    }
+    summary_payload["meeting_queue_writer"] = {
+        "enabled": False,
+        "mode": "inactive_for_analyze_period",
+        "sheet_name": "",
+        "start_cell": "",
+        "rows_prepared": 0,
+        "rows_written": 0,
+        "error": "",
+    }
     _write_json_path(summary_path, summary_payload)
     summary_md_path.write_text(
         _build_period_summary_markdown(
@@ -1859,7 +1863,7 @@ def _run_analyze_period(
     )
 
     logger.info(
-        "analyze-period success: backend=%s deals_seen=%s deals_analyzed=%s deals_failed=%s llm_success=%s llm_success_repaired=%s llm_fallback=%s llm_error=%s effective=%s json=%s md=%s csv=%s run_summary=%s run_md=%s top_risks=%s manager_brief=%s meeting_queue_json=%s meeting_queue_md=%s transcription_impact_md=%s queue_sheets_dry_run=%s daily_sheet_payload=%s",
+        "analyze-period success: backend=%s deals_seen=%s deals_analyzed=%s deals_failed=%s llm_success=%s llm_success_repaired=%s llm_fallback=%s llm_error=%s effective=%s json=%s md=%s csv=%s run_summary=%s run_md=%s top_risks=%s manager_brief=%s meeting_queue_json=%s meeting_queue_md=%s transcription_impact_md=%s queue_sheets_dry_run=%s daily_sheet_payload=%s call_review_sheet_payload=%s",
         cfg.analyzer_backend,
         len(normalized_rows_all),
         len(analyses),
@@ -1881,6 +1885,7 @@ def _run_analyze_period(
         transcription_impact_md_path,
         sheets_dry_run_payload_path,
         daily_control_payload_path,
+        call_review_payload_path,
     )
 
 
@@ -2298,6 +2303,677 @@ def _llm_chat_text_with_runtime(
             if logger is not None:
                 logger.warning("%s failed on source=%s attempt=%s error=%s", log_prefix, source, idx + 1, exc)
     return None, last_error
+
+
+def _date_only_from_iso(value: str) -> str:
+    text = " ".join(str(value or "").split()).strip()
+    if not text:
+        return ""
+    if "T" in text:
+        text = text.split("T", 1)[0]
+    elif " " in text:
+        text = text.split(" ", 1)[0]
+    try:
+        datetime.fromisoformat(text)
+        return text
+    except Exception:
+        return ""
+
+
+def _extract_anchor_call_timestamp(*, snapshot: dict[str, Any], selected_call_ids: list[str]) -> str:
+    call_evidence = snapshot.get("call_evidence", {}) if isinstance(snapshot.get("call_evidence"), dict) else {}
+    calls = call_evidence.get("items", []) if isinstance(call_evidence.get("items"), list) else []
+    selected = {str(x).strip() for x in (selected_call_ids or []) if str(x).strip()}
+    if selected:
+        for call in calls:
+            if not isinstance(call, dict):
+                continue
+            call_id = str(call.get("call_id") or "").strip()
+            if call_id in selected:
+                ts = str(call.get("timestamp") or "").strip()
+                if ts:
+                    return ts
+    for call in calls:
+        if not isinstance(call, dict):
+            continue
+        ts = str(call.get("timestamp") or "").strip()
+        if ts:
+            return ts
+    return ""
+
+
+def _parse_utc_ts(value: Any) -> datetime | None:
+    text = " ".join(str(value or "").split()).strip()
+    if not text:
+        return None
+    if text.isdigit():
+        try:
+            return datetime.fromtimestamp(float(text), tz=timezone.utc)
+        except Exception:
+            return None
+    try:
+        raw = text[:-1] + "+00:00" if text.endswith("Z") else text
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _next_workday(day: datetime.date) -> datetime.date:
+    cur = day + timedelta(days=1)
+    while cur.weekday() >= 5:
+        cur = cur + timedelta(days=1)
+    return cur
+
+
+def _business_window_date_for_call(ts_utc: datetime) -> datetime.date:
+    local = ts_utc.astimezone(MSK_TZ)
+    if (local.hour, local.minute, local.second) < (15, 0, 0):
+        return local.date()
+    return _next_workday(local.date())
+
+
+def _open_business_window_date(run_started_at_utc: datetime) -> datetime.date:
+    local = run_started_at_utc.astimezone(MSK_TZ)
+    if (local.hour, local.minute, local.second) < (15, 0, 0):
+        return local.date()
+    return _next_workday(local.date())
+
+
+def _candidate_anchor_call(candidate: dict[str, Any]) -> dict[str, Any] | None:
+    calls = candidate.get("call_items", []) if isinstance(candidate.get("call_items"), list) else []
+    selected_ids = {
+        str(x).strip()
+        for x in (candidate.get("selected_call_ids", []) if isinstance(candidate.get("selected_call_ids"), list) else [])
+        if str(x).strip()
+    }
+    scored: list[tuple[int, dict[str, Any]]] = []
+    for call in calls:
+        if not isinstance(call, dict):
+            continue
+        call_id = str(call.get("call_id") or "").strip()
+        if selected_ids and call_id and call_id not in selected_ids:
+            continue
+        duration = int(call.get("duration_seconds", 0) or 0)
+        score = duration
+        if str(call.get("recording_url") or "").strip():
+            score += 120
+        if str(call.get("direction") or "").strip().lower() == "outbound":
+            score += 20
+        ts = _parse_utc_ts(call.get("timestamp"))
+        if ts is not None:
+            score += 10
+        scored.append((score, call))
+    if not scored:
+        return None
+    scored.sort(
+        key=lambda x: (
+            -x[0],
+            str((x[1] or {}).get("timestamp") or ""),
+            str((x[1] or {}).get("call_id") or ""),
+        )
+    )
+    return scored[0][1]
+
+
+def _annotate_shortlist_business_windows(
+    *,
+    shortlist_items: list[dict[str, Any]],
+    run_started_at_utc: datetime,
+) -> tuple[list[dict[str, Any]], int]:
+    open_window_date = _open_business_window_date(run_started_at_utc)
+    out: list[dict[str, Any]] = []
+    dropped_open_bucket = 0
+    for item in shortlist_items:
+        candidate = dict(item)
+        anchor = _candidate_anchor_call(candidate)
+        anchor_ts = _parse_utc_ts(anchor.get("timestamp") if isinstance(anchor, dict) else "")
+        if anchor is None:
+            anchor_ts = _parse_utc_ts(candidate.get("updated_at") or candidate.get("created_at"))
+        business_date = _business_window_date_for_call(anchor_ts) if anchor_ts is not None else None
+        candidate["anchor_call_id"] = str(anchor.get("call_id") or "") if isinstance(anchor, dict) else ""
+        candidate["anchor_call_timestamp"] = anchor_ts.isoformat() if anchor_ts is not None else ""
+        candidate["business_window_date"] = business_date.isoformat() if business_date is not None else ""
+        candidate["business_window_open_date"] = open_window_date.isoformat()
+        # Backward-safe behavior: if we cannot resolve anchor datetime, do not drop the deal.
+        window_closed = True if business_date is None else bool(business_date < open_window_date)
+        candidate["business_window_closed"] = window_closed
+        if not window_closed and candidate.get("business_window_date"):
+            dropped_open_bucket += 1
+        out.append(candidate)
+    return out, dropped_open_bucket
+
+
+def _filter_selected_by_business_window(
+    *,
+    selected_items: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    out: list[dict[str, Any]] = []
+    dropped = 0
+    for item in selected_items:
+        if not isinstance(item, dict):
+            continue
+        if "business_window_closed" not in item:
+            out.append(item)
+            continue
+        if bool(item.get("business_window_closed")):
+            out.append(item)
+            continue
+        dropped += 1
+    return out, dropped
+
+
+def _normalize_call_review_case_mode(*, candidate: dict[str, Any], record: dict[str, Any]) -> str:
+    raw = str(candidate.get("call_case_type") or "").strip().lower()
+    if raw == "lpr_conversation":
+        return "negotiation_lpr_analysis"
+    if raw == "secretary_case":
+        return "secretary_analysis"
+    if raw in {"supplier_inbound", "supplier_case"}:
+        return "supplier_inbound_analysis"
+    if raw in {"warm_inbound", "warm_case"}:
+        return "warm_inbound_analysis"
+    if raw in {"presentation", "demo"}:
+        return "presentation_analysis"
+    if raw in {"test", "pilot"}:
+        return "test_analysis"
+    if raw in {"dozhim", "closing"}:
+        return "dozhim_analysis"
+    if raw in {"redial_discipline", "autoanswer_noise"}:
+        return "redial_discipline_analysis"
+    role_signal = str(record.get("call_role_signal") or "").strip().lower()
+    if role_signal == "secretary":
+        return "secretary_analysis"
+    if role_signal == "supplier":
+        return "supplier_inbound_analysis"
+    if bool(record.get("call_signal_decision_maker_reached")):
+        return "negotiation_lpr_analysis"
+    combined = " ".join(
+        str(record.get(k) or "").lower()
+        for k in ("call_signal_summary_short", "transcript_text_excerpt", "manager_summary")
+    )
+    if any(token in combined for token in ("презентац", "демо", "показ")):
+        return "presentation_analysis"
+    if any(token in combined for token in ("тест", "пилот", "критер")):
+        return "test_analysis"
+    if any(token in combined for token in ("дожим", "кп", "коммерческ", "договор", "счет")):
+        return "dozhim_analysis"
+    return "skip_no_meaningful_case"
+
+
+def _call_review_case_has_meaningful_conversation(*, case_mode: str, candidate: dict[str, Any], record: dict[str, Any]) -> bool:
+    if case_mode not in {
+        "negotiation_lpr_analysis",
+        "secretary_analysis",
+        "supplier_inbound_analysis",
+        "warm_inbound_analysis",
+        "presentation_analysis",
+        "test_analysis",
+        "dozhim_analysis",
+    }:
+        return False
+    if str(candidate.get("pool_type") or "").strip().lower() != "conversation_pool":
+        return False
+    if not bool(candidate.get("selected_for_transcription")):
+        return False
+    label = str(candidate.get("transcript_usability_label") or record.get("transcript_usability_label") or "").strip().lower()
+    score = int(
+        candidate.get("transcript_usability_score_final", 0)
+        or record.get("transcript_usability_score_final", 0)
+        or 0
+    )
+    if label in {"empty", "noisy"} and score < 2:
+        return False
+    call_summary = " ".join(str(record.get("call_signal_summary_short") or "").split()).strip()
+    excerpt = " ".join(str(record.get("transcript_text_excerpt") or "").split()).strip()
+    has_text = len(call_summary) >= 20 or len(excerpt) >= 40
+    if not has_text and score < 2:
+        return False
+    if case_mode == "secretary_analysis":
+        return score >= 1 or bool(call_summary)
+    has_next_step = bool(record.get("call_signal_next_step_present"))
+    has_lpr = bool(record.get("call_signal_decision_maker_reached"))
+    return bool(score >= 2 or has_next_step or has_lpr or has_text)
+
+
+def _sanitize_call_review_llm_fields(payload: dict[str, Any]) -> dict[str, str]:
+    def _to_text(value: Any) -> str:
+        if isinstance(value, (list, tuple)):
+            parts = [" ".join(str(x or "").split()).strip() for x in value]
+            return "; ".join([p for p in parts if p]).strip()
+        if isinstance(value, dict):
+            parts = []
+            for key, item in value.items():
+                k = " ".join(str(key or "").split()).strip()
+                v = " ".join(str(item or "").split()).strip()
+                if k and v:
+                    parts.append(f"{k}: {v}")
+                elif v:
+                    parts.append(v)
+            return "; ".join(parts).strip()
+        return " ".join(str(value or "").split()).strip()
+
+    def _s(key: str, limit: int = 900) -> str:
+        text = _to_text(payload.get(key))
+        return text[:limit]
+
+    def _coaching_text(value: Any, limit: int = 900) -> str:
+        if isinstance(value, (list, tuple)):
+            items = [" ".join(str(x or "").split()).strip() for x in value]
+            non_empty = [x for x in items if x]
+            if non_empty:
+                lines = [f"{idx + 1}) {item}" for idx, item in enumerate(non_empty)]
+                return "\n".join(lines)[:limit]
+        text = _to_text(value)
+        return text[:limit]
+
+    out = {
+        "key_takeaway": _s("key_takeaway", 420),
+        "strong_sides": _s("strong_sides", 420),
+        "growth_zones": _s("growth_zones", 420),
+        "why_important": _s("why_important", 420),
+        "reinforce": _s("reinforce", 320),
+        "fix_action": _s("fix_action", 320),
+        "coaching_list": _coaching_text(payload.get("coaching_list"), 900),
+        "expected_quantity": _s("expected_quantity", 220),
+        "expected_quality": _s("expected_quality", 320),
+        "evidence_quote": _s("evidence_quote", 450),
+        "stage_secretary_comment": _s("stage_secretary_comment", 320),
+        "stage_lpr_comment": _s("stage_lpr_comment", 320),
+        "stage_need_comment": _s("stage_need_comment", 320),
+        "stage_presentation_comment": _s("stage_presentation_comment", 320),
+        "stage_closing_comment": _s("stage_closing_comment", 320),
+        "stage_objections_comment": _s("stage_objections_comment", 320),
+        "stage_speech_comment": _s("stage_speech_comment", 320),
+        "stage_crm_comment": _s("stage_crm_comment", 320),
+        "stage_discipline_comment": _s("stage_discipline_comment", 320),
+        "stage_demo_comment": _s("stage_demo_comment", 320),
+        "stage_demo_intro_comment": _s("stage_demo_intro_comment", 320),
+        "stage_demo_context_comment": _s("stage_demo_context_comment", 320),
+        "stage_demo_relevant_comment": _s("stage_demo_relevant_comment", 320),
+        "stage_demo_process_comment": _s("stage_demo_process_comment", 320),
+        "stage_demo_objections_comment": _s("stage_demo_objections_comment", 320),
+        "stage_demo_next_step_comment": _s("stage_demo_next_step_comment", 320),
+        "stage_test_launch_comment": _s("stage_test_launch_comment", 320),
+        "stage_test_criteria_comment": _s("stage_test_criteria_comment", 320),
+        "stage_test_owners_comment": _s("stage_test_owners_comment", 320),
+        "stage_test_support_comment": _s("stage_test_support_comment", 320),
+        "stage_test_feedback_comment": _s("stage_test_feedback_comment", 320),
+        "stage_test_objections_comment": _s("stage_test_objections_comment", 320),
+        "stage_test_comment": _s("stage_test_comment", 320),
+        "stage_dozhim_recontact_comment": _s("stage_dozhim_recontact_comment", 320),
+        "stage_dozhim_doubts_comment": _s("stage_dozhim_doubts_comment", 320),
+        "stage_dozhim_terms_comment": _s("stage_dozhim_terms_comment", 320),
+        "stage_dozhim_decision_comment": _s("stage_dozhim_decision_comment", 320),
+        "stage_dozhim_flow_comment": _s("stage_dozhim_flow_comment", 320),
+        "stage_dozhim_comment": _s("stage_dozhim_comment", 320),
+    }
+    if not out["fix_action"] and out["growth_zones"]:
+        out["fix_action"] = out["growth_zones"][:320]
+    if not out["reinforce"] and out["strong_sides"]:
+        out["reinforce"] = out["strong_sides"][:320]
+    if not out["coaching_list"] and out["fix_action"]:
+        out["coaching_list"] = f"1) {out['fix_action']}"[:900]
+    return out
+
+
+def _call_review_llm_fields_ready(*, fields: dict[str, str], case_mode: str) -> tuple[bool, str]:
+    required_core = (
+        "key_takeaway",
+        "strong_sides",
+        "growth_zones",
+        "fix_action",
+        "why_important",
+        "coaching_list",
+        "expected_quantity",
+        "expected_quality",
+    )
+    for key in required_core:
+        if not str(fields.get(key) or "").strip():
+            return False, f"llm_missing_{key}"
+
+    secretary_stage = str(fields.get("stage_secretary_comment") or "").strip()
+    lpr_stage = str(fields.get("stage_lpr_comment") or "").strip()
+    need_stage = str(fields.get("stage_need_comment") or "").strip()
+    presentation_stage = str(fields.get("stage_presentation_comment") or "").strip()
+    closing_stage = str(fields.get("stage_closing_comment") or "").strip()
+    objections_stage = str(fields.get("stage_objections_comment") or "").strip()
+    speech_stage = str(fields.get("stage_speech_comment") or "").strip()
+
+    if case_mode == "secretary_analysis":
+        if not secretary_stage:
+            return False, "llm_missing_stage_secretary_comment"
+        if not need_stage:
+            return False, "llm_missing_stage_need_comment"
+        return True, ""
+
+    if case_mode == "presentation_analysis":
+        if not (
+            str(fields.get("stage_demo_intro_comment") or "").strip()
+            or str(fields.get("stage_demo_context_comment") or "").strip()
+            or str(fields.get("stage_demo_relevant_comment") or "").strip()
+            or str(fields.get("stage_demo_comment") or "").strip()
+        ):
+            return False, "llm_missing_stage_demo_comment"
+        return True, ""
+
+    if case_mode == "test_analysis":
+        if not (
+            str(fields.get("stage_test_launch_comment") or "").strip()
+            or str(fields.get("stage_test_criteria_comment") or "").strip()
+            or str(fields.get("stage_test_comment") or "").strip()
+        ):
+            return False, "llm_missing_stage_test_comment"
+        return True, ""
+
+    if case_mode == "dozhim_analysis":
+        if not (
+            str(fields.get("stage_dozhim_recontact_comment") or "").strip()
+            or str(fields.get("stage_dozhim_terms_comment") or "").strip()
+            or str(fields.get("stage_dozhim_comment") or "").strip()
+        ):
+            return False, "llm_missing_stage_dozhim_comment"
+        return True, ""
+
+    conversation_stage_count = sum(
+        1
+        for value in (
+            lpr_stage,
+            need_stage,
+            presentation_stage,
+            closing_stage,
+            objections_stage,
+            speech_stage,
+        )
+        if value
+    )
+    if conversation_stage_count < 1:
+        return False, "llm_missing_stage_comment_coverage"
+    return True, ""
+
+
+def _prepare_call_review_llm_fields(
+    *,
+    cfg: DealAnalyzerConfig,
+    logger: Any,
+    llm_runtime: dict[str, Any] | None,
+    style_source_excerpt: str,
+    period_deal_records: list[dict[str, Any]],
+    analysis_shortlist_payload: dict[str, Any],
+    step_artifacts_root: Path | None = None,
+) -> dict[str, Any]:
+    runtime = llm_runtime or {}
+    selected_runtime = str(runtime.get("selected") or "none")
+    selected_items = (
+        analysis_shortlist_payload.get("selected_items", [])
+        if isinstance(analysis_shortlist_payload.get("selected_items"), list)
+        else []
+    )
+    by_deal: dict[str, dict[str, Any]] = {}
+    for item in selected_items:
+        if not isinstance(item, dict):
+            continue
+        did = str(item.get("deal_id") or "").strip()
+        if did:
+            by_deal[did] = item
+
+    generated = 0
+    failed = 0
+    skipped = 0
+    skipped_reasons: Counter[str] = Counter()
+    llm_sources: Counter[str] = Counter()
+    failed_steps: Counter[str] = Counter()
+    step_artifacts_written = 0
+
+    if step_artifacts_root is not None:
+        try:
+            step_artifacts_root.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            step_artifacts_root = None
+
+    for record in period_deal_records:
+        if not isinstance(record, dict):
+            continue
+        did = str(record.get("deal_id") or "").strip()
+        if not did:
+            continue
+        candidate = by_deal.get(did, {})
+        case_mode = _normalize_call_review_case_mode(candidate=candidate, record=record)
+        record["call_review_case_mode"] = case_mode
+        if not _call_review_case_has_meaningful_conversation(case_mode=case_mode, candidate=candidate, record=record):
+            reason = "not_meaningful_conversation_case"
+            if case_mode == "redial_discipline_analysis":
+                reason = "discipline_case_disabled"
+            elif case_mode == "skip_no_meaningful_case":
+                reason = "skip_no_meaningful_case"
+            record["call_review_llm_ready"] = False
+            record["call_review_llm_error"] = reason
+            skipped += 1
+            skipped_reasons[reason] += 1
+            continue
+
+        if selected_runtime not in {"main", "fallback"}:
+            reason = "no_live_llm_runtime"
+            record["call_review_llm_ready"] = False
+            record["call_review_llm_error"] = reason
+            skipped += 1
+            skipped_reasons[reason] += 1
+            continue
+
+        artifacts: dict[str, str] = {}
+        source_by_step: dict[str, str] = {}
+        row_artifacts_dir = None
+        if step_artifacts_root is not None:
+            row_artifacts_dir = step_artifacts_root / _safe_slug(f"deal_{did}_{case_mode}")[:120]
+
+        role_display = _manager_role_label(str(record.get("owner_name") or ""), cfg=cfg)
+        base_mix = build_base_mix_text_priority([record])
+        factual_payload = {
+            "deal_id": did,
+            "deal_name": str(record.get("deal_name") or ""),
+            "company_name": str(record.get("company_name") or ""),
+            "manager_name": str(record.get("owner_name") or ""),
+            "role": role_display,
+            "case_mode": case_mode,
+            "product_focus": str(record.get("product_hypothesis") or ""),
+            "base_mix": str(base_mix or ""),
+            "status": str(record.get("status_name") or ""),
+            "pipeline": str(record.get("pipeline_name") or ""),
+            "call_summary": str(record.get("call_signal_summary_short") or ""),
+            "transcript_excerpt": str(record.get("transcript_text_excerpt") or ""),
+            "transcript_label": str(record.get("transcript_usability_label") or ""),
+            "transcript_score": int(record.get("transcript_usability_score_final", 0) or 0),
+            "call_signal_next_step_present": bool(record.get("call_signal_next_step_present")),
+            "call_signal_decision_maker_reached": bool(record.get("call_signal_decision_maker_reached")),
+            "call_signal_demo_discussed": bool(record.get("call_signal_demo_discussed")),
+            "call_signal_objection_price": bool(record.get("call_signal_objection_price")),
+            "call_signal_objection_no_need": bool(record.get("call_signal_objection_no_need")),
+            "call_signal_objection_not_target": bool(record.get("call_signal_objection_not_target")),
+            "crm_consistency_summary": str(record.get("crm_consistency_summary") or ""),
+            "analysis_confidence": str(record.get("analysis_confidence") or ""),
+            "selected_call_count": int(candidate.get("selected_call_count", 0) or record.get("selected_call_count", 0) or 0),
+        }
+        reference_stack = build_daily_reference_stack(cfg=cfg, factual_payload=factual_payload, logger=logger)
+        factual_payload["reference_block"] = build_reference_prompt_section(reference_stack)
+
+        if row_artifacts_dir is not None:
+            artifacts["01_factual_payload"] = _write_step_artifact(row_artifacts_dir / "01_factual_payload.json", factual_payload)
+            step_artifacts_written += 1
+
+        free_messages = build_call_review_free_form_messages(
+            factual_payload=factual_payload,
+            style_source_excerpt=style_source_excerpt,
+            style_mode=str(getattr(cfg, "daily_style_mode", "mild") or "mild"),
+        )
+        free_text, free_source = _llm_chat_text_with_runtime(
+            runtime=runtime,
+            messages=free_messages,
+            logger=logger,
+            log_prefix=f"call review step_free deal={did}",
+        )
+        if not free_text:
+            record["call_review_llm_ready"] = False
+            record["call_review_llm_error"] = "free_form_generation_failed"
+            if row_artifacts_dir is not None:
+                artifacts["02_free_form_error"] = _write_step_artifact(
+                    row_artifacts_dir / "02_free_form_error.json",
+                    {"error": free_source or "free_form_generation_failed"},
+                )
+                step_artifacts_written += 1
+            failed += 1
+            failed_steps["free_form"] += 1
+            skipped_reasons["free_form_generation_failed"] += 1
+            continue
+        source_by_step["free_form"] = str(free_source or "")
+        if row_artifacts_dir is not None:
+            artifacts["02_free_form"] = _write_step_artifact(row_artifacts_dir / "02_free_form.md", free_text)
+            step_artifacts_written += 1
+
+        effect_messages = build_call_review_effect_messages(
+            factual_payload=factual_payload,
+            free_form_text=str(free_text),
+            style_mode=str(getattr(cfg, "daily_style_mode", "mild") or "mild"),
+        )
+        effect_text, effect_source = _llm_chat_text_with_runtime(
+            runtime=runtime,
+            messages=effect_messages,
+            logger=logger,
+            log_prefix=f"call review step_effect deal={did}",
+        )
+        if not effect_text:
+            record["call_review_llm_ready"] = False
+            record["call_review_llm_error"] = "effect_layer_generation_failed"
+            if row_artifacts_dir is not None:
+                artifacts["03_effect_error"] = _write_step_artifact(
+                    row_artifacts_dir / "03_effect_error.json",
+                    {"error": effect_source or "effect_layer_generation_failed"},
+                )
+                step_artifacts_written += 1
+            failed += 1
+            failed_steps["effect_layer"] += 1
+            skipped_reasons["effect_layer_generation_failed"] += 1
+            continue
+        source_by_step["effect_layer"] = str(effect_source or "")
+        if row_artifacts_dir is not None:
+            artifacts["03_effect_layer"] = _write_step_artifact(row_artifacts_dir / "03_effect_layer.md", effect_text)
+            step_artifacts_written += 1
+
+        factual_payload_structured = dict(factual_payload)
+        factual_payload_structured["free_analysis_text"] = str(free_text)
+        factual_payload_structured["effect_layer_text"] = str(effect_text)
+        messages = build_call_review_case_messages(
+            factual_payload=factual_payload_structured,
+            style_source_excerpt=style_source_excerpt,
+            style_mode=str(getattr(cfg, "daily_style_mode", "mild") or "mild"),
+        )
+        repaired = append_call_review_case_json_repair_instruction(messages)
+        payload, source = _llm_chat_json_with_runtime(
+            runtime=runtime,
+            messages=messages,
+            repair_messages=repaired,
+            logger=logger,
+            log_prefix=f"call review step_structured deal={did}",
+        )
+        if not isinstance(payload, dict):
+            record["call_review_llm_ready"] = False
+            record["call_review_llm_error"] = "structured_generation_failed"
+            if row_artifacts_dir is not None:
+                artifacts["04_structured_error"] = _write_step_artifact(
+                    row_artifacts_dir / "04_structured_error.json",
+                    {"error": source or "structured_generation_failed"},
+                )
+                step_artifacts_written += 1
+            failed += 1
+            failed_steps["structured_json"] += 1
+            skipped_reasons["structured_generation_failed"] += 1
+            continue
+        source_by_step["structured_json"] = str(source or "")
+        fields = _sanitize_call_review_llm_fields(payload)
+        if row_artifacts_dir is not None:
+            artifacts["04_structured_json"] = _write_step_artifact(row_artifacts_dir / "04_structured_json.json", fields)
+            step_artifacts_written += 1
+
+        style_messages = build_call_review_style_json_messages(
+            structured_json_payload=fields,
+            style_source_excerpt=style_source_excerpt,
+            style_mode=str(getattr(cfg, "daily_style_mode", "mild") or "mild"),
+        )
+        styled_payload, styled_source = _llm_chat_json_with_runtime(
+            runtime=runtime,
+            messages=style_messages,
+            repair_messages=append_call_review_case_json_repair_instruction(style_messages),
+            logger=logger,
+            log_prefix=f"call review step_style deal={did}",
+        )
+        styled_fields = fields
+        if isinstance(styled_payload, dict):
+            styled_fields = _sanitize_call_review_llm_fields(styled_payload)
+            source_by_step["style_rewrite"] = str(styled_source or "")
+            if row_artifacts_dir is not None:
+                artifacts["05_style_json"] = _write_step_artifact(row_artifacts_dir / "05_style_json.json", styled_fields)
+                step_artifacts_written += 1
+
+        ready, reason = _call_review_llm_fields_ready(fields=styled_fields, case_mode=case_mode)
+        if not ready:
+            record["call_review_llm_ready"] = False
+            record["call_review_llm_error"] = reason or "llm_fields_incomplete"
+            if row_artifacts_dir is not None:
+                artifacts["06_validation_error"] = _write_step_artifact(
+                    row_artifacts_dir / "06_validation_error.json",
+                    {"error": reason or "llm_fields_incomplete", "fields": styled_fields},
+                )
+                step_artifacts_written += 1
+            failed += 1
+            failed_steps["validation"] += 1
+            skipped_reasons[reason or "llm_fields_incomplete"] += 1
+            continue
+
+        if row_artifacts_dir is not None:
+            artifacts["06_final_assemble"] = _write_step_artifact(
+                row_artifacts_dir / "06_final_assemble.json",
+                {"source_of_truth": "styled_blocks", "assembler_only": True, "fields": styled_fields},
+            )
+            step_artifacts_written += 1
+
+        record["call_review_llm_ready"] = True
+        record["call_review_llm_source"] = str(source_by_step.get("style_rewrite") or source_by_step.get("structured_json") or source or "")
+        record["call_review_llm_error"] = ""
+        record["call_review_llm_fields"] = styled_fields
+        record["call_review_llm_provenance"] = {
+            "source": str(source or ""),
+            "source_by_step": source_by_step,
+            "step_artifacts": artifacts,
+            "source_of_truth": "styled_blocks",
+            "assembler_only": True,
+            "style_layer_applied": True,
+            "reference_sources_count": int(reference_stack.get("prompt_snippets_count", 0) or 0),
+            "reference_required_layers": (
+                reference_stack.get("required_layers", {})
+                if isinstance(reference_stack.get("required_layers"), dict)
+                else {}
+            ),
+            "reference_sources_used": [
+                str(x.get("source") or "")
+                for x in (reference_stack.get("prompt_snippets", []) if isinstance(reference_stack.get("prompt_snippets"), list) else [])
+                if isinstance(x, dict) and str(x.get("source") or "").strip()
+            ],
+        }
+        generated += 1
+        llm_sources[str(source_by_step.get("style_rewrite") or source_by_step.get("structured_json") or source or "unknown")] += 1
+
+    return {
+        "selected_runtime": selected_runtime,
+        "generated_rows": generated,
+        "failed_rows": failed,
+        "skipped_rows": skipped,
+        "skip_reasons": dict(skipped_reasons),
+        "llm_sources": dict(llm_sources),
+        "failed_steps": dict(failed_steps),
+        "step_artifacts_written": int(step_artifacts_written),
+        "step_artifacts_root": str(step_artifacts_root) if step_artifacts_root is not None else "",
+    }
 
 
 def _analyze_period_rows(
@@ -3199,13 +3875,12 @@ def _build_dial_discipline_signals(snapshot: dict[str, Any], *, status_name: str
     autoanswer_attempt_count = 0
     no_answer_attempt_count = 0
     short_drop_attempt_count = 0
+    unknown_phone_attempts_count = 0
     for raw in items:
         if not isinstance(raw, dict):
             continue
         phone_raw = raw.get("phone") or raw.get("phone_number") or raw.get("contact_phone") or ""
         phone7 = _normalize_phone_last7(phone_raw)
-        if not phone7:
-            continue
         status_low = str(raw.get("status") or raw.get("result") or raw.get("disposition") or "").strip().lower()
         if not _is_attempt_like_status(status_low):
             duration = int(raw.get("duration_seconds", 0) or 0)
@@ -3213,10 +3888,19 @@ def _build_dial_discipline_signals(snapshot: dict[str, Any], *, status_name: str
                 status_low = "short_drop"
             else:
                 continue
+        duration_seconds = int(raw.get("duration_seconds", 0) or 0)
+        if any(x in status_low for x in ("autoanswer", "auto_answer", "auto", "автоответ", "voicemail")):
+            autoanswer_attempt_count += 1
+        if any(x in status_low for x in ("no_answer", "busy", "недозвон", "ring")):
+            no_answer_attempt_count += 1
+        if duration_seconds <= 2 or any(x in status_low for x in ("short_drop", "drop", "hang")):
+            short_drop_attempt_count += 1
+        if not phone7:
+            unknown_phone_attempts_count += 1
+            continue
         direction = str(raw.get("direction") or "").strip().lower()
         ts = str(raw.get("timestamp") or raw.get("created_at") or "").strip()
         hhmm, day = _extract_hhmm_and_day(ts)
-        duration_seconds = int(raw.get("duration_seconds", 0) or 0)
         entry = {
             "status": status_low,
             "direction": direction,
@@ -3228,12 +3912,6 @@ def _build_dial_discipline_signals(snapshot: dict[str, Any], *, status_name: str
         known_phones.add(phone7)
         if "секрет" in status_low or "secretary" in status_low:
             secretary_touch_count += 1
-        if any(x in status_low for x in ("autoanswer", "auto_answer", "auto", "автоответ", "voicemail")):
-            autoanswer_attempt_count += 1
-        if any(x in status_low for x in ("no_answer", "busy", "недозвон", "ring")):
-            no_answer_attempt_count += 1
-        if duration_seconds <= 2 or any(x in status_low for x in ("short_drop", "drop", "hang")):
-            short_drop_attempt_count += 1
         if hhmm:
             same_time_counter[f"{phone7}:{hhmm}"] += 1
             times_by_phone.setdefault(phone7, set()).add(hhmm)
@@ -3275,12 +3953,13 @@ def _build_dial_discipline_signals(snapshot: dict[str, Any], *, status_name: str
     known_unique_phones = len(known_phones)
     attempted_phones = sorted(attempts_by_phone.keys())
     not_attempted_phones = sorted([x for x in known_phones if x not in attempts_by_phone])
-    if known_unique_phones > 0:
+    if known_unique_phones > 0 and unique_phones > 0:
         numbers_not_fully_covered_flag = len(not_attempted_phones) > 0
     else:
         numbers_not_fully_covered_flag = False
+    numbers_coverage_unknown_flag = bool(known_unique_phones > 0 and unique_phones == 0)
     if is_closed and known_unique_phones == 0:
-        numbers_not_fully_covered_flag = unique_phones == 0
+        numbers_not_fully_covered_flag = unique_phones == 0 and unknown_phone_attempts_count == 0
 
     emptyish_attempts_total = autoanswer_attempt_count + no_answer_attempt_count + short_drop_attempt_count
     attempts_by_day: Counter[str] = Counter()
@@ -3307,6 +3986,7 @@ def _build_dial_discipline_signals(snapshot: dict[str, Any], *, status_name: str
         "dial_unique_phones_count": unique_phones,
         "dial_known_unique_phones_count": known_unique_phones,
         "dial_attempts_total": sum(len(v) for v in attempts_by_phone.values()),
+        "dial_unknown_phone_attempts_count": int(unknown_phone_attempts_count),
         "dial_attempted_phones": attempted_phones,
         "dial_not_attempted_phones": not_attempted_phones,
         "dial_attempts_per_phone": attempts_per_phone,
@@ -3324,6 +4004,7 @@ def _build_dial_discipline_signals(snapshot: dict[str, Any], *, status_name: str
         "massive_empty_attempts_day_count": int(massive_empty_attempts_day_count),
         "massive_empty_attempts_day_flag": bool(massive_empty_attempts_day_flag),
         "numbers_not_fully_covered_flag": bool(numbers_not_fully_covered_flag),
+        "numbers_coverage_unknown_flag": bool(numbers_coverage_unknown_flag),
         "dial_redial_suspicion_flag": bool(over_limit_numbers > 0 or repeated_dead_redial_count > 0 or same_time_redial_pattern_flag),
         "active_low_attempts_guard": bool(active_low_attempts_guard),
         "dial_discipline_pattern_label": "red_flag" if red_flag else ("normal" if unique_phones > 0 else "none"),
@@ -3600,11 +4281,13 @@ def _collect_call_pool_debug(
             "autoanswer_attempts_count": int(dial.get("dial_autoanswer_attempts_count", 0) or 0),
             "no_answer_attempts_count": int(dial.get("dial_no_answer_attempts_count", 0) or 0),
             "short_drop_attempts_count": int(dial.get("dial_short_drop_attempts_count", 0) or 0),
+            "unknown_phone_attempts_count": int(dial.get("dial_unknown_phone_attempts_count", 0) or 0),
             "massive_empty_attempts_day_count": int(dial.get("massive_empty_attempts_day_count", 0) or 0),
             "massive_empty_attempts_day_flag": bool(dial.get("massive_empty_attempts_day_flag")),
             "dial_redial_suspicion_flag": bool(dial.get("dial_redial_suspicion_flag")),
             "active_low_attempts_guard": bool(dial.get("active_low_attempts_guard")),
             "numbers_not_fully_covered_flag": bool(dial.get("numbers_not_fully_covered_flag")),
+            "numbers_coverage_unknown_flag": bool(dial.get("numbers_coverage_unknown_flag")),
             "call_source_used": str(result.source_used if result is not None else "none"),
             "warnings": list(result.warnings) if result is not None else [],
             "_text_hints": _call_pool_text_hints(row),
@@ -3688,23 +4371,59 @@ def _classify_call_case_type(item: dict[str, Any]) -> str:
     not_covered = bool(item.get("numbers_not_fully_covered_flag"))
     massive_empty_day = bool(item.get("massive_empty_attempts_day_flag"))
     text_hints = str(item.get("_text_hints") or "").lower()
+    call_items = item.get("call_items", []) if isinstance(item.get("call_items"), list) else []
+    call_blob_parts: list[str] = []
+    for call in call_items:
+        if not isinstance(call, dict):
+            continue
+        call_blob_parts.extend(
+            [
+                str(call.get("status") or ""),
+                str(call.get("result") or ""),
+                str(call.get("disposition") or ""),
+            ]
+        )
+    call_blob = " ".join(call_blob_parts).lower()
+    has_secretary_touch = any(token in call_blob for token in ("секрет", "secretary", "ресепш", "switchboard"))
+    has_lpr_touch = any(token in call_blob for token in ("липр", "лпр", "decision_maker", "директор", "собственник"))
+    has_supplier_touch = any(token in call_blob for token in ("поставщик", "supplier", "закуп", "тендер", "etp"))
+    has_nontrivial_conversation = (long_calls + medium_calls) > 0
+    is_mostly_short_noise = calls_total > 0 and short_calls >= calls_total and (no_answer_like + autoanswer_like) >= max(1, calls_total - 1)
 
     if calls_total <= 0:
         return "unknown"
-    if repeated_dead_redial > 0 or same_time_repeat or not_covered or massive_empty_day:
+    if is_mostly_short_noise:
+        return "autoanswer_noise" if autoanswer_like > 0 else "redial_discipline"
+    strong_discipline_pattern = (
+        repeated_dead_redial > 0
+        or same_time_repeat
+        or massive_empty_day
+        or (not_covered and short_calls == calls_total and calls_total >= 3)
+    )
+    if strong_discipline_pattern:
         return "redial_discipline"
+    if has_secretary_touch and not has_lpr_touch:
+        return "secretary_case"
+    if has_supplier_touch and has_nontrivial_conversation:
+        return "supplier_inbound"
+    if has_lpr_touch and has_nontrivial_conversation:
+        return "lpr_conversation"
     if autoanswer_like > 0 and long_calls == 0 and medium_calls == 0:
         return "autoanswer_noise"
-    if any(token in text_hints for token in ("секрет", "ресепш", "соедините", "переадрес", "почт")):
+    if any(token in text_hints for token in ("секрет", "ресепш", "соедините", "переадрес", "почт")) and (has_nontrivial_conversation or int(item.get("recording_url_count", 0) or 0) > 0):
         return "secretary_case"
-    if any(token in text_hints for token in ("поставщик", "supplier", "закуп", "тендер", "etp", "площадк", "регистрац")):
+    if any(token in text_hints for token in ("поставщик", "supplier", "закуп", "тендер", "etp", "площадк", "регистрац")) and has_nontrivial_conversation:
         return "supplier_inbound"
-    if any(token in text_hints for token in ("демо", "демонстрац", "презентац", "тест", "бриф", "встреч")):
+    if any(token in text_hints for token in ("демо", "демонстрац", "презентац", "тест", "бриф", "встреч")) and has_nontrivial_conversation:
         return "warm_inbound"
-    if (long_calls > 0 or medium_calls > 0) and no_answer_like < calls_total:
+    if has_nontrivial_conversation and no_answer_like < calls_total:
         return "lpr_conversation"
     if short_calls == calls_total:
         return "autoanswer_noise" if autoanswer_like > 0 else "redial_discipline"
+    if not_covered and (long_calls > 0 or medium_calls > 0):
+        return "lpr_conversation"
+    if not_covered:
+        return "redial_discipline"
     return "unknown"
 
 
@@ -3738,14 +4457,19 @@ def _assign_pool_for_item(*, item: dict[str, Any], call_case_type: str) -> tuple
     massive_empty_day = bool(item.get("massive_empty_attempts_day_flag"))
     active_low_attempts_guard = bool(item.get("active_low_attempts_guard"))
     freshness = _freshness_score_for_item(item)
+    has_nontrivial_conversation = (long_calls + medium_calls) > 0
+    mostly_short_noise = calls_total > 0 and short_calls >= calls_total and (no_answer_like + autoanswer_like) >= max(1, calls_total - 1)
+    conversation_viable = has_nontrivial_conversation and not mostly_short_noise
 
     conversation_quality = 0
     if call_case_type == "lpr_conversation":
-        conversation_quality = 50
+        conversation_quality = 55
     elif call_case_type == "secretary_case":
-        conversation_quality = 40
-    elif call_case_type in {"supplier_inbound", "warm_inbound"}:
-        conversation_quality = 38
+        conversation_quality = 48
+    elif call_case_type == "supplier_inbound":
+        conversation_quality = 45
+    elif call_case_type == "warm_inbound":
+        conversation_quality = 43
     elif long_calls > 0 or medium_calls > 0:
         conversation_quality = 30
     recording_bonus = 12 if recording_count > 0 else 0
@@ -3763,11 +4487,11 @@ def _assign_pool_for_item(*, item: dict[str, Any], call_case_type: str) -> tuple
 
     discipline_quality = 0
     if call_case_type == "redial_discipline":
-        discipline_quality = 45
+        discipline_quality = 40
     elif call_case_type == "autoanswer_noise":
-        discipline_quality = 35
+        discipline_quality = 24
     elif short_calls > 0 and (no_answer_like + autoanswer_like) >= max(1, short_calls):
-        discipline_quality = 30
+        discipline_quality = 26
     discipline_bonus = min(15, repeated_dead_redial * 5)
     discipline_bonus += 6 if same_time_repeat else 0
     discipline_bonus += 5 if not_covered else 0
@@ -3776,13 +4500,20 @@ def _assign_pool_for_item(*, item: dict[str, Any], call_case_type: str) -> tuple
         discipline_bonus += 4
     discipline_score = discipline_quality + discipline_bonus + freshness
 
-    if active_low_attempts_guard and conversation_score >= max(35, discipline_score + 1):
+    if active_low_attempts_guard and conversation_viable and conversation_score >= max(35, discipline_score + 1):
         reason = f"{call_case_type}; active_low_attempts_guard"
         return "conversation_pool", reason, int(conversation_score)
-    if conversation_score >= max(40, discipline_score + 3):
+    if (
+        call_case_type in {"lpr_conversation", "secretary_case", "supplier_inbound", "warm_inbound"}
+        and conversation_viable
+        and conversation_score >= max(35, discipline_score)
+    ):
+        reason = f"{call_case_type}; conversation_case_priority rec={recording_count}; dur={max_duration}s"
+        return "conversation_pool", reason, int(conversation_score)
+    if conversation_viable and conversation_score >= max(42, discipline_score + 4):
         reason = f"{call_case_type}; rec={recording_count}; dur={max_duration}s"
         return "conversation_pool", reason, int(conversation_score)
-    if discipline_score >= 30:
+    if discipline_score >= 36:
         reason = (
             f"{call_case_type}; short={short_calls}; no_answer={no_answer_like}; auto={autoanswer_like}; "
             f"redial={repeated_dead_redial}; massive_empty={int(massive_empty_day)}"
@@ -4172,17 +4903,16 @@ def _build_analysis_shortlist_payload(
             str(x.get("deal_id") or ""),
         )
     )
-    selected = ranked[:target] if target is not None else list(ranked)
-    if not selected:
-        # Controlled forced fallback: use ranked period rows, but mark explicitly.
+    meaningful = [x for x in ranked if not bool(x.get("forced_fallback"))]
+    selected_base = meaningful if meaningful else list(ranked)
+    if not selected_base:
+        # Controlled compatibility fallback for analysis-only path when call pool is empty.
         fallback_ids = [
             str(row.get("deal_id") or row.get("amo_lead_id") or "").strip()
             for row in normalized_rows_ranked
             if isinstance(row, dict)
         ]
-        if target is not None:
-            fallback_ids = fallback_ids[:target]
-        selected = [
+        selected_base = [
             {
                 "deal_id": did,
                 "rank_group": 4,
@@ -4197,10 +4927,23 @@ def _build_analysis_shortlist_payload(
             for did in fallback_ids
             if did
         ]
+    selected = selected_base[:target] if target is not None else list(selected_base)
+    forced_candidates_total = max(0, len(ranked) - len(meaningful))
+    if not ranked:
+        forced_candidates_total = len(selected_base)
     return {
         "total_candidates": len(ranked),
+        "total_meaningful_candidates": len(meaningful),
+        "total_forced_fallback_candidates": forced_candidates_total,
         "total_selected": len(selected),
         "limit_applied_to_shortlist": target,
+        "raw_pool_total_before_shortlist": len(
+            [
+                row
+                for row in normalized_rows_ranked
+                if isinstance(row, dict) and str(row.get("deal_id") or row.get("amo_lead_id") or "").strip()
+            ]
+        ),
         "selected_items": selected,
     }
 
@@ -4214,12 +4957,14 @@ def _analysis_shortlist_rank_meta(item: dict[str, Any]) -> tuple[int, str, bool]
     autoanswer_like = int(item.get("autoanswer_like_count", 0) or 0)
     if pool == "conversation_pool" and selected_for_stt and case_type in {"lpr_conversation", "warm_inbound", "supplier_inbound"}:
         return 1, f"priority_1_meaningful_conversation:{case_type}", False
-    if pool == "conversation_pool" and case_type in {"secretary_case", "lpr_conversation"}:
+    if pool == "conversation_pool" and selected_for_stt and case_type in {"secretary_case", "lpr_conversation"}:
         return 2, f"priority_2_secretary_or_lpr_potential:{case_type}", False
+    if pool == "conversation_pool" and selected_for_stt and case_type in {"supplier_inbound", "warm_inbound"}:
+        return 2, f"priority_2_meaningful_inbound:{case_type}", False
     if pool == "discipline_pool" and case_type == "redial_discipline":
         return 3, "priority_3_redial_discipline_pattern", False
     if calls_total > 0 and short_calls == calls_total and autoanswer_like > 0:
-        return 4, "priority_4_autoanswer_noise_forced_fallback_only", True
+        return 5, "priority_5_autoanswer_noise_forced_fallback_only", True
     return 4, "priority_4_forced_fallback_other", True
 
 
@@ -4228,8 +4973,16 @@ def _build_analysis_shortlist_markdown(*, payload: dict[str, Any]) -> str:
     lines.append("# Analysis Shortlist")
     lines.append("")
     lines.append(f"- total_candidates: {int(payload.get('total_candidates', 0) or 0)}")
+    lines.append(f"- total_meaningful_candidates: {int(payload.get('total_meaningful_candidates', 0) or 0)}")
+    lines.append(f"- total_forced_fallback_candidates: {int(payload.get('total_forced_fallback_candidates', 0) or 0)}")
     lines.append(f"- total_selected: {int(payload.get('total_selected', 0) or 0)}")
     lines.append(f"- limit_applied_to_shortlist: {payload.get('limit_applied_to_shortlist')}")
+    lines.append(f"- raw_pool_total_before_shortlist: {int(payload.get('raw_pool_total_before_shortlist', 0) or 0)}")
+    bw = payload.get("business_window_filter", {}) if isinstance(payload.get("business_window_filter"), dict) else {}
+    lines.append(f"- business_window_open_date: {str(bw.get('open_window_date') or '')}")
+    lines.append(f"- selected_items_before_window_filter: {int(bw.get('selected_items_before_filter', 0) or 0)}")
+    lines.append(f"- selected_items_after_window_filter: {int(bw.get('selected_items_after_filter', 0) or 0)}")
+    lines.append(f"- selected_items_dropped_open_bucket: {int(bw.get('selected_items_dropped_open_bucket', 0) or 0)}")
     lines.append("")
     lines.append("## Selected Deals")
     items = payload.get("selected_items", []) if isinstance(payload.get("selected_items"), list) else []
@@ -4240,7 +4993,7 @@ def _build_analysis_shortlist_markdown(*, payload: dict[str, Any]) -> str:
             if not isinstance(item, dict):
                 continue
             lines.append(
-                "- deal={deal} group={group} pool={pool} case={case_type} score={score} stt={stt} calls_for_stt={stt_calls} forced={forced} reason={reason}".format(
+                "- deal={deal} group={group} pool={pool} case={case_type} score={score} stt={stt} calls_for_stt={stt_calls} forced={forced} window={window} closed={closed} reason={reason}".format(
                     deal=str(item.get("deal_id") or ""),
                     group=int(item.get("rank_group", 0) or 0),
                     pool=str(item.get("pool_type") or ""),
@@ -4249,6 +5002,8 @@ def _build_analysis_shortlist_markdown(*, payload: dict[str, Any]) -> str:
                     stt=bool(item.get("selected_for_transcription")),
                     stt_calls=int(item.get("selected_call_count", 0) or 0),
                     forced=bool(item.get("forced_fallback")),
+                    window=str(item.get("business_window_date") or ""),
+                    closed=bool(item.get("business_window_closed")),
                     reason=str(item.get("shortlist_reason") or ""),
                 )
             )
@@ -4259,7 +5014,7 @@ def _build_analysis_shortlist_markdown(*, payload: dict[str, Any]) -> str:
 def _select_call_ids_for_transcription(calls: list[dict[str, Any]]) -> tuple[list[str], str, int]:
     if not calls:
         return [], "no_calls", 0
-    scored: list[tuple[int, dict[str, Any]]] = []
+    scored: list[tuple[int, datetime | None, dict[str, Any]]] = []
     filtered_noise = 0
     for raw in calls:
         if not isinstance(raw, dict):
@@ -4285,38 +5040,50 @@ def _select_call_ids_for_transcription(calls: list[dict[str, Any]]) -> tuple[lis
             score += 3
         if direction == "inbound":
             score += 2
-        ts = str(raw.get("timestamp") or "").strip()
-        if ts:
+        ts = _parse_utc_ts(raw.get("timestamp"))
+        if ts is not None:
             score += 2
-        scored.append((score, raw))
+        scored.append((score, ts, raw))
 
     if not scored:
         return [], "no_meaningful_calls_after_noise_filter", filtered_noise
-    scored.sort(key=lambda x: (-x[0], str(x[1].get("timestamp") or ""), str(x[1].get("call_id") or "")))
-    primary = scored[0][1]
+    scored.sort(
+        key=lambda x: (
+            -x[0],
+            str((x[1] or datetime(1970, 1, 1, tzinfo=timezone.utc)).isoformat()),
+            str((x[2] or {}).get("call_id") or ""),
+        )
+    )
+    primary = scored[0][2]
     selected = [str(primary.get("call_id") or "").strip()]
-    primary_ts = str(primary.get("timestamp") or "").strip()
+    primary_ts = _parse_utc_ts(primary.get("timestamp"))
     extra_added = 0
-    for _, call in scored[1:]:
+    for _, ts, call in scored[1:]:
         if extra_added >= 2:
             break
         cid = str(call.get("call_id") or "").strip()
         if not cid or cid in selected:
             continue
-        # keep follow-up continuity: same direction or close timestamp chunk
+        # Keep only previous related calls (no future leakage across next bucket/day).
+        if primary_ts is not None and ts is not None and ts > primary_ts:
+            continue
         same_direction = str(call.get("direction") or "").strip().lower() == str(primary.get("direction") or "").strip().lower()
-        ts = str(call.get("timestamp") or "").strip()
-        close_in_text_timeline = bool(primary_ts and ts and primary_ts[:10] == ts[:10])
-        if same_direction or close_in_text_timeline:
+        close_in_time = bool(primary_ts is not None and ts is not None and (primary_ts - ts) <= timedelta(days=3))
+        same_day = bool(primary_ts is not None and ts is not None and primary_ts.date() == ts.date())
+        if same_direction or close_in_time or same_day:
             selected.append(cid)
             extra_added += 1
-    return selected, "conversation_shortlist_primary_plus_followups", filtered_noise
+    return selected, "anchor_plus_previous_related_calls_only", filtered_noise
 
 
 def _build_transcription_shortlist_markdown(*, transcription_shortlist_payload: dict[str, Any]) -> str:
     lines: list[str] = []
     lines.append("# Transcription Shortlist")
     lines.append("")
+    lines.append(f"- business_window_open_date: {str(transcription_shortlist_payload.get('business_window_open_date') or '')}")
+    lines.append(
+        f"- business_window_items_open_bucket: {int(transcription_shortlist_payload.get('business_window_items_open_bucket', 0) or 0)}"
+    )
     lines.append(f"- conversation_pool_total: {int(transcription_shortlist_payload.get('conversation_pool_total', 0) or 0)}")
     lines.append(f"- discipline_pool_total: {int(transcription_shortlist_payload.get('discipline_pool_total', 0) or 0)}")
     lines.append(
@@ -4639,13 +5406,13 @@ def _build_period_summary_markdown(*, summary: dict[str, Any], period_deal_recor
         )
         if str(live_refresh.get("error") or "").strip():
             lines.append(f"- Live refresh fallback reason: {live_refresh.get('error')}")
-    mq_writer = summary.get("meeting_queue_writer", {}) if isinstance(summary.get("meeting_queue_writer"), dict) else {}
+    cr_writer = summary.get("call_review_writer", {}) if isinstance(summary.get("call_review_writer"), dict) else {}
     lines.append(
-        "- Meeting queue writer: mode={mode} rows={rows} target={sheet}:{cell}".format(
-            mode=mq_writer.get("mode", "dry_run"),
-            rows=mq_writer.get("rows_written", 0),
-            sheet=mq_writer.get("sheet_name", "") or "-",
-            cell=mq_writer.get("start_cell", "") or "-",
+        "- Call review writer: mode={mode} rows={rows} target={sheet}:{cell}".format(
+            mode=cr_writer.get("mode", "dry_run"),
+            rows=cr_writer.get("rows_written", 0),
+            sheet=cr_writer.get("sheet_name", "") or "-",
+            cell=cr_writer.get("start_cell", "") or "-",
         )
     )
     lines.append("")
@@ -6269,7 +7036,7 @@ def _build_daily_control_sheet_payload(
     used_deal_ids_by_manager: dict[str, set[str]] = {m: set() for m in grouped}
     for control_day in control_days:
         for manager, manager_records in sorted(grouped.items(), key=lambda x: _manager_sort_key(x[0], allowlist=allowlist)):
-            role = _manager_role_label(manager)
+            role = _manager_role_label(manager, cfg=cfg)
             used_deal_ids = used_deal_ids_by_manager.setdefault(manager, set())
             dynamic_target = _daily_package_target(
                 manager_records=manager_records,
@@ -8077,12 +8844,29 @@ def _resolve_base_mix(records: list[dict[str, Any]]) -> dict[str, Any]:
     return resolve_base_mix_priority(records)
 
 
-def _manager_role_label(manager_name: str) -> str:
-    text = str(manager_name or "").lower()
-    if "рустам" in text:
+def _manager_role_label(manager_name: str, *, cfg: DealAnalyzerConfig | None = None) -> str:
+    name = " ".join(str(manager_name or "").split()).strip()
+    low = name.lower()
+    registry = (
+        dict(getattr(cfg, "manager_role_registry", {}) or {})
+        if cfg is not None and isinstance(getattr(cfg, "manager_role_registry", None), dict)
+        else {"Рустам": "telemarketer", "Илья": "sales_manager"}
+    )
+    role_code = ""
+    for manager_key, code in registry.items():
+        key_low = " ".join(str(manager_key or "").split()).strip().lower()
+        if key_low and key_low in low:
+            role_code = str(code or "").strip().lower()
+            break
+    if not role_code:
+        if "рустам" in low:
+            role_code = "telemarketer"
+        elif "илья" in low:
+            role_code = "sales_manager"
+        else:
+            role_code = "sales_manager"
+    if role_code == "telemarketer":
         return "телемаркетолог"
-    if "илья" in text:
-        return "менеджер по продажам"
     return "менеджер по продажам"
 
 
@@ -9460,6 +10244,120 @@ def _build_meeting_queue_sheets_dry_run_payload(*, queue_items: list[dict[str, A
     }
 
 
+def _maybe_write_call_review_sheet(
+    *,
+    cfg: DealAnalyzerConfig,
+    logger,
+    call_review_payload: dict[str, Any],
+) -> dict[str, Any]:
+    rows = call_review_payload.get("rows", []) if isinstance(call_review_payload.get("rows"), list) else []
+    rows_dict = [x for x in rows if isinstance(x, dict)]
+    payload_sheet_name = str(call_review_payload.get("sheet_name") or "").strip() or "Разбор звонков"
+    payload_start_cell = str(call_review_payload.get("start_cell") or "").strip() or "A2"
+
+    sheet_name = str(getattr(cfg, "deal_analyzer_call_review_sheet_name", "") or "").strip()
+    if not sheet_name:
+        sheet_name = payload_sheet_name
+
+    start_cell = str(getattr(cfg, "deal_analyzer_call_review_start_cell", "") or "").strip()
+    if not start_cell:
+        start_cell = payload_start_cell
+
+    columns = (
+        call_review_payload.get("columns", [])
+        if isinstance(call_review_payload.get("columns"), list)
+        else list(CALL_REVIEW_DEFAULT_COLUMNS)
+    )
+    values_rows = rows_to_sheet_matrix(rows=rows_dict, columns=columns)
+
+    if bool(getattr(cfg, "deal_analyzer_write_enabled", False)):
+        try:
+            spreadsheet_id = _resolve_spreadsheet_id_from_config(cfg=cfg)
+            if spreadsheet_id and sheet_name and start_cell:
+                app_cfg = load_config()
+                client = GoogleSheetsApiClient(project_root=app_cfg.project_root, logger=logger)
+                def _load_sheet_contract(target_sheet_name: str) -> tuple[list[str], dict[int, list[str]]]:
+                    header_columns_local = _read_sheet_header_columns(
+                        client=client,
+                        spreadsheet_id=spreadsheet_id,
+                        sheet_name=target_sheet_name,
+                        start_cell=start_cell,
+                    )
+                    dropdown_values_local = _read_sheet_dropdown_values_for_data_row(
+                        client=client,
+                        spreadsheet_id=spreadsheet_id,
+                        sheet_name=target_sheet_name,
+                        start_cell=start_cell,
+                        columns=header_columns_local,
+                    )
+                    return header_columns_local, dropdown_values_local
+
+                try:
+                    header_columns, dropdown_values_by_col = _load_sheet_contract(sheet_name)
+                except Exception:
+                    # Fallback for broken config tab names: use payload default tab.
+                    if sheet_name != payload_sheet_name:
+                        logger.warning(
+                            "call review writer tab fallback: from=%s to=%s",
+                            sheet_name,
+                            payload_sheet_name,
+                        )
+                        sheet_name = payload_sheet_name
+                        header_columns, dropdown_values_by_col = _load_sheet_contract(sheet_name)
+                    else:
+                        raise
+
+                if not header_columns:
+                    logger.warning(
+                        "call review writer blocked: reason=header_read_empty sheet_name=%s start_cell=%s",
+                        sheet_name,
+                        start_cell,
+                    )
+                    return {
+                        "enabled": True,
+                        "mode": "dry_run",
+                        "write_mode": "append",
+                        "sheet_name": sheet_name,
+                        "start_cell": start_cell,
+                        "rows_prepared": len(rows_dict),
+                        "rows_written": 0,
+                        "write_start_row": 0,
+                        "write_end_row": 0,
+                        "error": "header_read_empty",
+                    }
+                columns = header_columns
+                values_rows = rows_to_sheet_matrix(rows=rows_dict, columns=columns)
+                values_rows = _normalize_rows_by_dropdown_values(
+                    rows=values_rows,
+                    columns=columns,
+                    dropdown_values_by_col=dropdown_values_by_col,
+                )
+        except Exception as exc:
+            logger.warning("call review writer blocked: reason=header_fetch_failed error=%s", exc)
+            return {
+                "enabled": True,
+                "mode": "dry_run",
+                "write_mode": "append",
+                "sheet_name": sheet_name,
+                "start_cell": start_cell,
+                "rows_prepared": len(rows_dict),
+                "rows_written": 0,
+                "write_start_row": 0,
+                "write_end_row": 0,
+                "error": f"header_fetch_failed:{exc}",
+            }
+
+    return _maybe_write_rows_to_sheet(
+        cfg=cfg,
+        logger=logger,
+        values_rows=values_rows,
+        sheet_name=sheet_name,
+        start_cell=start_cell,
+        writer_tag="call_review_writer",
+        append_mode=not bool(getattr(cfg, "deal_analyzer_overwrite_mode", False)),
+    )
+
+
 def _maybe_write_daily_control_sheet(
     *,
     cfg: DealAnalyzerConfig,
@@ -10020,6 +10918,115 @@ def _read_sheet_header_columns(
     row = matrix[0] if matrix and isinstance(matrix[0], list) else []
     columns = [str(x).strip() for x in row if str(x).strip()]
     return columns
+
+
+def _read_sheet_dropdown_values_for_data_row(
+    *,
+    client: GoogleSheetsApiClient,
+    spreadsheet_id: str,
+    sheet_name: str,
+    start_cell: str,
+    columns: list[str],
+) -> dict[int, list[str]]:
+    if not columns:
+        return {}
+    try:
+        start_col, start_row = _parse_a1_cell(start_cell)
+        start_col_n = _column_letters_to_number(start_col)
+        end_col = _number_to_column_letters(start_col_n + max(1, len(columns)) - 1)
+        range_suffix = f"{start_col}{start_row}:{end_col}{start_row}"
+        tabbed_range = client.build_tab_a1_range(tab_title=sheet_name, range_suffix=range_suffix)
+        service = client.build_service()
+        payload = (
+            service.spreadsheets()
+            .get(
+                spreadsheetId=spreadsheet_id,
+                ranges=[tabbed_range],
+                includeGridData=True,
+                fields="sheets(data(rowData(values(dataValidation(condition(values(userEnteredValue)))))))",
+            )
+            .execute()
+        )
+        sheets = payload.get("sheets", []) if isinstance(payload, dict) else []
+        first_sheet = sheets[0] if sheets and isinstance(sheets[0], dict) else {}
+        data_blocks = first_sheet.get("data", []) if isinstance(first_sheet.get("data"), list) else []
+        first_block = data_blocks[0] if data_blocks and isinstance(data_blocks[0], dict) else {}
+        row_data = first_block.get("rowData", []) if isinstance(first_block.get("rowData"), list) else []
+        first_row = row_data[0] if row_data and isinstance(row_data[0], dict) else {}
+        cells = first_row.get("values", []) if isinstance(first_row.get("values"), list) else []
+        out: dict[int, list[str]] = {}
+        for idx, cell in enumerate(cells[: len(columns)]):
+            if not isinstance(cell, dict):
+                continue
+            dv = cell.get("dataValidation", {}) if isinstance(cell.get("dataValidation"), dict) else {}
+            cond = dv.get("condition", {}) if isinstance(dv.get("condition"), dict) else {}
+            values = cond.get("values", []) if isinstance(cond.get("values"), list) else []
+            allowed: list[str] = []
+            for raw in values:
+                if not isinstance(raw, dict):
+                    continue
+                val = " ".join(str(raw.get("userEnteredValue") or "").split()).strip()
+                if val:
+                    allowed.append(val)
+            if allowed:
+                out[idx] = allowed
+        return out
+    except Exception:
+        return {}
+
+
+def _match_dropdown_value(value: str, allowed: list[str]) -> str:
+    raw = " ".join(str(value or "").split()).strip()
+    if not raw:
+        return ""
+    allowed_clean = [" ".join(str(x or "").split()).strip() for x in allowed if " ".join(str(x or "").split()).strip()]
+    if not allowed_clean:
+        return raw
+    low_map = {x.lower(): x for x in allowed_clean}
+    if raw.lower() in low_map:
+        return low_map[raw.lower()]
+
+    synonyms = {
+        "yes": {"да", "yes", "ok", "выполнено", "сделано", "true"},
+        "no": {"нет", "no", "не выполнено", "false"},
+        "na": {"н/п", "не применимо", "na", "n/a", "-", "пусто"},
+    }
+    group = ""
+    low_raw = raw.lower()
+    for key, variants in synonyms.items():
+        if low_raw in variants:
+            group = key
+            break
+    if group:
+        for allowed_value in allowed_clean:
+            if allowed_value.lower() in synonyms[group]:
+                return allowed_value
+
+    # Last conservative fallback: if option contains raw token, keep that option.
+    for allowed_value in allowed_clean:
+        if low_raw in allowed_value.lower() or allowed_value.lower() in low_raw:
+            return allowed_value
+    return ""
+
+
+def _normalize_rows_by_dropdown_values(
+    *,
+    rows: list[list[Any]],
+    columns: list[str],
+    dropdown_values_by_col: dict[int, list[str]],
+) -> list[list[Any]]:
+    if not rows or not columns or not dropdown_values_by_col:
+        return rows
+    out: list[list[Any]] = []
+    for row in rows:
+        values = list(row)
+        for col_idx, allowed_values in dropdown_values_by_col.items():
+            if col_idx < 0 or col_idx >= len(values):
+                continue
+            normalized = _match_dropdown_value(str(values[col_idx] or ""), allowed_values)
+            values[col_idx] = normalized
+        out.append(values)
+    return out
 
 
 def _parse_a1_cell(value: str) -> tuple[str, int]:

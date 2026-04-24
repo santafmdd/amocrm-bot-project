@@ -172,8 +172,16 @@ def _collect_internal_reference_paths(*, cfg: DealAnalyzerConfig | None, project
         project_root / "docs" / "sales_context" / "scripts" / "link_base.md",
         project_root / "docs" / "sales_context" / "scripts" / "info_plm_base.md",
         project_root / "docs" / "sales_context" / "scripts" / "info_plm_light_industry.md",
+        project_root / "docs" / "мой паттерн общения.txt",
     ]
     paths.extend(defaults)
+    for folder in (
+        project_root / "docs" / "sales_context",
+        project_root / "docs" / "style_sources",
+    ):
+        if folder.exists() and folder.is_dir():
+            for suffix in ("*.md", "*.txt", "*.html"):
+                paths.extend(sorted(folder.rglob(suffix)))
     if cfg is not None:
         for raw in list(getattr(cfg, "sales_module_references", ()) or []):
             text = str(raw or "").strip()
@@ -234,18 +242,25 @@ def _collect_local_snippets(*, paths: list[Path], query: str, top_k: int, logger
 def _collect_product_reference_snippets(*, cfg: DealAnalyzerConfig | None) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     refs = dict(getattr(cfg, "product_reference_urls", {}) or {}) if cfg is not None else {}
+    if not refs:
+        refs = {
+            "link": "https://istock.link/",
+            "info": "https://istock.info/",
+        }
     for key in ("info", "link", "both"):
-        url = str(refs.get(key) or "").strip()
-        if not url:
+        raw_val = str(refs.get(key) or "").strip()
+        if not raw_val:
             continue
-        out.append(
-            {
-                "layer": "product_url",
-                "source": url,
-                "snippet": f"??????????? ???????? {key}: {url}",
-                "score": 1,
-            }
-        )
+        urls = [x.strip() for x in raw_val.split(";") if x.strip()]
+        for url in urls:
+            out.append(
+                {
+                    "layer": "product_url",
+                    "source": url,
+                    "snippet": f"Продуктовый референс {key}: {url}",
+                    "score": 1,
+                }
+            )
     return out
 
 

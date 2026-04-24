@@ -226,6 +226,7 @@ def test_analyze_period_creates_run_dir_and_summary_json():
     discipline_report_md_path = run_dirs[0] / "discipline_report.md"
     transcription_shortlist_json_path = run_dirs[0] / "transcription_shortlist.json"
     transcription_shortlist_md_path = run_dirs[0] / "transcription_shortlist.md"
+    call_review_payload_path = run_dirs[0] / "call_review_sheet_payload.json"
     daily_selection_debug_path = run_dirs[0] / "daily_selection_debug.json"
     company_tag_plan_json_path = run_dirs[0] / "company_tag_propagation_dry_run.json"
     company_tag_plan_md_path = run_dirs[0] / "company_tag_propagation_dry_run.md"
@@ -248,6 +249,7 @@ def test_analyze_period_creates_run_dir_and_summary_json():
     assert discipline_report_md_path.exists()
     assert transcription_shortlist_json_path.exists()
     assert transcription_shortlist_md_path.exists()
+    assert call_review_payload_path.exists()
     assert daily_selection_debug_path.exists()
     assert company_tag_plan_json_path.exists()
     assert company_tag_plan_md_path.exists()
@@ -261,6 +263,11 @@ def test_analyze_period_creates_run_dir_and_summary_json():
     assert "call_runtime_diagnostics" in summary
     assert "transcript_runtime_diagnostics" in summary
     assert "meeting_queue_writer" in summary
+    assert "call_review_writer" in summary
+    assert summary["call_review_writer"].get("mode") in {"dry_run", "real_write"}
+    assert summary["daily_control_writer"].get("mode") == "inactive_for_analyze_period"
+    assert summary["meeting_queue_writer"].get("mode") == "inactive_for_analyze_period"
+    assert "call_review_rows_total" in summary
     assert "deals_total_before_limit" in summary
     assert "deals_with_any_calls" in summary
     assert "deals_with_recordings" in summary
@@ -328,7 +335,7 @@ def test_analyze_period_creates_run_dir_and_summary_json():
     assert "## Qualified Loss / Market Mismatch" in md
     assert "## Top 10 Most Risky Deals" in md
     assert "## Top 10 Highest Score Deals" in md
-    assert "Meeting queue writer:" in md
+    assert "Call review writer:" in md
     top_risks = json.loads(top_risks_path.read_text(encoding="utf-8"))
     assert isinstance(top_risks, list)
     assert len(top_risks) == 2
@@ -464,6 +471,15 @@ def test_analyze_period_creates_run_dir_and_summary_json():
         assert "transcription_selection_reason" in first
         assert "selected_call_ids" in first
         assert "selected_call_count" in first
+    call_review_payload = json.loads(call_review_payload_path.read_text(encoding="utf-8"))
+    assert call_review_payload.get("mode") == "call_review_sheet"
+    assert "rows" in call_review_payload and isinstance(call_review_payload["rows"], list)
+    if call_review_payload["rows"]:
+        row = call_review_payload["rows"][0]
+        assert "Deal ID" in row
+        assert "Ссылка на сделку" in row
+        assert "Тип кейса" in row
+        assert str(row.get("Тип кейса") or "") not in {"warm_case", "supplier_inbound", "redial_discipline"}
     daily_selection_debug = json.loads(daily_selection_debug_path.read_text(encoding="utf-8"))
     assert "summary" in daily_selection_debug and "rows" in daily_selection_debug
     brief = manager_brief_path.read_text(encoding="utf-8")
@@ -1407,9 +1423,12 @@ def test_meeting_queue_writer_real_write_path_via_mock():
         "_llm_text_ready": True,
     }
 
-    with patch("src.deal_analyzer.cli.GoogleSheetsApiClient", return_value=fake_client), patch(
+    with patch("src.deal_analyzer.cli._prepare_call_review_llm_fields", side_effect=_mock_prepare_call_review_llm_fields), patch("src.deal_analyzer.cli.GoogleSheetsApiClient", return_value=fake_client), patch(
         "src.deal_analyzer.cli.load_config",
         return_value=SimpleNamespace(project_root=Path("D:/AI_Automation/amocrm_bot/project")),
+    ), patch(
+        "src.deal_analyzer.cli._read_sheet_header_columns",
+        return_value=["Дата анализа", "Дата кейса", "Менеджер", "Тип кейса", "Deal ID"],
     ), patch(
         "src.deal_analyzer.cli._resolve_daily_llm_runtime",
         return_value={"enabled": True, "selected": "main", "reason": "main_ok", "main_ok": True, "fallback_ok": False, "main": {"base_url": "http://m", "model": "m", "timeout_seconds": 10}},
@@ -1438,7 +1457,7 @@ def test_meeting_queue_writer_real_write_path_via_mock():
 
     run_dir = next((output_dir / "period_runs").iterdir())
     summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
-    writer = summary.get("meeting_queue_writer", {})
+    writer = summary.get("call_review_writer", {})
     assert writer.get("enabled") is True
     assert writer.get("mode") == "real_write"
     assert writer.get("rows_prepared", 0) >= 1
@@ -1476,7 +1495,7 @@ def test_meeting_queue_writer_safe_skip_when_target_missing():
         "_llm_text_ready": True,
     }
 
-    with patch(
+    with patch("src.deal_analyzer.cli._prepare_call_review_llm_fields", side_effect=_mock_prepare_call_review_llm_fields), patch(
         "src.deal_analyzer.cli._resolve_daily_llm_runtime",
         return_value={"enabled": True, "selected": "main", "reason": "main_ok", "main_ok": True, "fallback_ok": False, "main": {"base_url": "http://m", "model": "m", "timeout_seconds": 10}},
     ), patch(
@@ -1504,7 +1523,7 @@ def test_meeting_queue_writer_safe_skip_when_target_missing():
 
     run_dir = next((output_dir / "period_runs").iterdir())
     summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
-    writer = summary.get("meeting_queue_writer", {})
+    writer = summary.get("call_review_writer", {})
     assert writer.get("enabled") is True
     assert writer.get("mode") == "dry_run"
     assert writer.get("rows_prepared", 0) >= 1
@@ -1556,9 +1575,12 @@ def test_meeting_queue_writer_appends_below_existing_rows():
         "_llm_text_ready": True,
     }
 
-    with patch("src.deal_analyzer.cli.GoogleSheetsApiClient", return_value=fake_client), patch(
+    with patch("src.deal_analyzer.cli._prepare_call_review_llm_fields", side_effect=_mock_prepare_call_review_llm_fields), patch("src.deal_analyzer.cli.GoogleSheetsApiClient", return_value=fake_client), patch(
         "src.deal_analyzer.cli.load_config",
         return_value=SimpleNamespace(project_root=Path("D:/AI_Automation/amocrm_bot/project")),
+    ), patch(
+        "src.deal_analyzer.cli._read_sheet_header_columns",
+        return_value=["Дата анализа", "Дата кейса", "Менеджер", "Тип кейса", "Deal ID"],
     ), patch(
         "src.deal_analyzer.cli._resolve_daily_llm_runtime",
         return_value={"enabled": True, "selected": "main", "reason": "main_ok", "main_ok": True, "fallback_ok": False, "main": {"base_url": "http://m", "model": "m", "timeout_seconds": 10}},
@@ -1587,7 +1609,7 @@ def test_meeting_queue_writer_appends_below_existing_rows():
 
     run_dir = next((output_dir / "period_runs").iterdir())
     summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
-    writer = summary.get("meeting_queue_writer", {})
+    writer = summary.get("call_review_writer", {})
     assert writer.get("mode") == "real_write"
     assert writer.get("write_mode") == "append"
     assert writer.get("write_start_row", 0) >= 6
@@ -1699,9 +1721,12 @@ def test_daily_control_writer_starts_from_a2_and_does_not_write_header_row():
         "Ожидаемый эффект - качество": "Этап станет управляемее.",
         "_llm_text_ready": True,
     }
-    with patch("src.deal_analyzer.cli.GoogleSheetsApiClient", return_value=fake_client), patch(
+    with patch("src.deal_analyzer.cli._prepare_call_review_llm_fields", side_effect=_mock_prepare_call_review_llm_fields), patch("src.deal_analyzer.cli.GoogleSheetsApiClient", return_value=fake_client), patch(
         "src.deal_analyzer.cli.load_config",
         return_value=SimpleNamespace(project_root=Path("D:/AI_Automation/amocrm_bot/project")),
+    ), patch(
+        "src.deal_analyzer.cli._read_sheet_header_columns",
+        return_value=["Дата анализа", "Дата кейса", "Менеджер", "Тип кейса", "Deal ID"],
     ), patch(
         "src.deal_analyzer.cli._resolve_daily_llm_runtime",
         return_value={"enabled": True, "selected": "main", "reason": "main_ok", "main_ok": True, "fallback_ok": False, "main": {"base_url": "http://m", "model": "m", "timeout_seconds": 10}},
@@ -1778,7 +1803,7 @@ def test_daily_control_writer_uses_append_mode_by_default():
         "Ожидаемый эффект - качество": "Этап станет управляемее.",
         "_llm_text_ready": True,
     }
-    with patch("src.deal_analyzer.cli.GoogleSheetsApiClient", return_value=fake_client), patch(
+    with patch("src.deal_analyzer.cli._prepare_call_review_llm_fields", side_effect=_mock_prepare_call_review_llm_fields), patch("src.deal_analyzer.cli.GoogleSheetsApiClient", return_value=fake_client), patch(
         "src.deal_analyzer.cli.load_config",
         return_value=SimpleNamespace(project_root=Path("D:/AI_Automation/amocrm_bot/project")),
     ), patch(
@@ -1809,7 +1834,7 @@ def test_daily_control_writer_uses_append_mode_by_default():
 
     run_dir = next((output_dir / "period_runs").iterdir())
     summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
-    writer = summary.get("daily_control_writer", {})
+    writer = summary.get("call_review_writer", {})
     assert writer.get("write_mode") == "append"
     assert writer.get("rows_written", 0) >= 1
     assert writer.get("write_start_row", 0) >= 6
@@ -2880,10 +2905,11 @@ def test_no_real_write_when_daily_llm_unavailable():
 
     run_dir = next((output_dir / "period_runs").iterdir())
     summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
-    writer = summary.get("daily_control_writer", {})
+    writer = summary.get("call_review_writer", {})
     assert writer.get("mode") == "dry_run"
     assert writer.get("enabled") is False
     assert writer.get("error") == "write_forced_dry_run_no_live_llm"
+    assert summary.get("daily_control_writer", {}).get("mode") == "inactive_for_analyze_period"
     llm_runtime = summary.get("daily_llm_runtime", {})
     assert llm_runtime.get("selected") == "none"
 
@@ -3142,6 +3168,45 @@ def test_sanitize_daily_columns_role_scope_filters_fix_and_coaching_for_telemark
             "role_scope_conflict_flag": False,
         },
     )
+
+
+def _mock_prepare_call_review_llm_fields(**kwargs):
+    records = kwargs.get("period_deal_records") or []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        record["call_review_llm_ready"] = True
+        record["call_review_llm_source"] = "main"
+        record["call_review_llm_fields"] = {
+            "key_takeaway": "Есть предметный разговор и понятный следующий шаг.",
+            "strong_sides": "Удержал структуру разговора и зафиксировал следующий шаг.",
+            "growth_zones": "Добавить точнее критерии квалификации в начале звонка.",
+            "why_important": "Сотруднику проще дожимать, отдел получает меньше зависаний.",
+            "reinforce": "Модуль фиксации следующего шага.",
+            "fix_action": "В конце звонка фиксировать дату и формат следующего контакта.",
+            "coaching_list": "1) Разобрали ход разговора.\n2) Дали модуль фиксации шага.\n3) Применяет в следующем касании.",
+            "expected_quantity": "+0.2-0.4 рабочего шага в неделю.",
+            "expected_quality": "Этап станет стабильнее и прозрачнее.",
+            "evidence_quote": "Согласовали следующий шаг и время повторного контакта.",
+            "stage_secretary_comment": "",
+            "stage_lpr_comment": "Есть осмысленный контакт с нужной ролью.",
+            "stage_need_comment": "Выявил потребность через уточняющие вопросы.",
+            "stage_presentation_comment": "Показал логику следующего шага без давления.",
+            "stage_closing_comment": "Закрыл звонок в конкретный следующий шаг.",
+            "stage_objections_comment": "",
+            "stage_speech_comment": "Речь собранная и понятная.",
+            "stage_crm_comment": "CRM фиксирует факт разговора и следующий шаг.",
+            "stage_discipline_comment": "",
+            "stage_demo_comment": "",
+        }
+    return {
+        "selected_runtime": "main",
+        "generated_rows": sum(1 for x in records if isinstance(x, dict)),
+        "failed_rows": 0,
+        "skipped_rows": 0,
+        "skip_reasons": {},
+        "llm_sources": {"main": sum(1 for x in records if isinstance(x, dict))},
+    }
     low_join = " ".join(str(cols.get(k) or "") for k in ("Сильные стороны", "Зоны роста", "Что исправить", "Что донес сотруднику")).lower()
     assert "презентац" not in low_join
     assert "демонстрац" not in low_join
@@ -3480,6 +3545,43 @@ def test_analysis_shortlist_forced_fallback_is_explicit_when_no_candidates() -> 
     assert str(row.get("deal_id") or "") == "10"
     assert bool(row.get("forced_fallback")) is True
     assert str(row.get("shortlist_reason") or "") == "forced_fallback_no_call_signal"
+    assert int(payload.get("total_meaningful_candidates", 0) or 0) == 0
+    assert int(payload.get("total_forced_fallback_candidates", 0) or 0) >= 1
+
+
+def test_analysis_shortlist_drops_forced_candidates_when_meaningful_exists() -> None:
+    payload = _build_analysis_shortlist_payload(
+        shortlist_items=[
+            {
+                "deal_id": "100",
+                "pool_type": "conversation_pool",
+                "call_case_type": "lpr_conversation",
+                "pool_priority_score": 70,
+                "selected_for_transcription": True,
+                "selected_call_count": 1,
+                "calls_total": 1,
+                "short_calls_0_20_count": 0,
+                "autoanswer_like_count": 0,
+            },
+            {
+                "deal_id": "200",
+                "pool_type": "conversation_pool",
+                "call_case_type": "autoanswer_noise",
+                "pool_priority_score": 100,
+                "selected_for_transcription": False,
+                "selected_call_count": 0,
+                "calls_total": 3,
+                "short_calls_0_20_count": 3,
+                "autoanswer_like_count": 3,
+            },
+        ],
+        normalized_rows_ranked=[{"deal_id": 100}, {"deal_id": 200}],
+        limit=10,
+    )
+    selected = payload.get("selected_items", [])
+    assert isinstance(selected, list)
+    assert [str(x.get("deal_id") or "") for x in selected] == ["100"]
+    assert all(not bool(x.get("forced_fallback")) for x in selected)
 
 
 def test_daily_factual_payload_includes_reference_stack_and_disabled_external_retrieval() -> None:

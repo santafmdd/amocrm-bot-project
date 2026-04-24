@@ -788,6 +788,47 @@ Debug-поля в daily payload:
 Этот слой не использует rules-текст как содержательный fallback для J-Q в LLM-ветке.  
 Rules остаются только factual/debug основой (отбор/сигналы/guardrails).
 
+## Native Writer: "Разбор звонков"
+
+Active write-path для `analyze-period` теперь идет через нативный payload `call_review_sheet_payload.json`:
+- одна строка = один case (`deal_id`) из shortlist;
+- источник строк: `analysis_shortlist.json` + per-deal `period_deal_records`;
+- legacy daily rows не используются как source of truth для схемы `Разбор звонков`.
+
+Схема записи:
+- writer читает реальные headers листа `Разбор звонков` перед записью;
+- заполняет значения через header-aware mapper (включая дублирующиеся колонки вроде `Здоровается` и `Комментарий по этапу`);
+- внутренние enum-коды (`warm_case`, `redial_discipline` и т.д.) не пишутся в user-facing ячейки.
+
+Guardrails:
+- `skip_no_meaningful_case` не пишется в боевой лист;
+- при `daily_llm_runtime.selected=none` запись принудительно уходит в dry-run (`write_forced_dry_run_no_live_llm`);
+- negotiation и discipline кейсы разведены и маркируются отдельно (`conversation_pool` vs `discipline_pool`).
+- `--limit` режет только meaningful shortlist (`analysis_shortlist`), а не сырой period input;
+- forced fallback в сырой CRM-пул отключен: если meaningful shortlist пуст, строк в боевой лист не будет.
+
+## Call Review V2 Runtime Notes
+
+- Active write-path для `analyze-period` изолирован на `call_review_writer`.
+- `daily_control_writer` и `meeting_queue_writer` в этом режиме помечаются как `inactive_for_analyze_period`.
+- Пишем только в лист `Разбор звонков`; если имя вкладки в конфиге повреждено, writer пробует fallback на штатное имя вкладки.
+- Перед записью writer читает реальные headers и data validation текущей строки шаблона и нормализует значения к допустимым dropdown-опциям.
+
+Business windows (MSK, cut-off 15:00):
+- звонки после `15:00` относятся к следующему рабочему дню bucket;
+- bucket текущего дня до `15:00` считается открытым и в боевую запись не идет;
+- `Дата анализа` в строке берется из `business_window_date`, `Дата кейса` - из anchor-call даты.
+
+LLM gating:
+- user-facing контент строки пишется только при `call_review_llm_ready=true`;
+- если live runtime недоступен (`selected=none`) - принудительный dry-run, без боевой записи;
+- weak/noisy/empty conversation cases отсеиваются до writer.
+
+Step artifacts:
+- для call-review многошагового LLM-пайплайна артефакты пишутся в:
+  `period_runs/<run_id>/call_review_step_artifacts/`.
+- это позволяет видеть, на каком шаге выпал кейс (`free_form`, `effect_layer`, `structured_json`, `style_rewrite`, `validation`).
+
 ## CRM Consistency Layer (Parallel, not dominant)
 
 CRM-анализ вынесен в отдельный параллельный слой и не должен доминировать над разбором переговоров при наличии живого звонка.
