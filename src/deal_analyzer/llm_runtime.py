@@ -6,6 +6,14 @@ from .config import DealAnalyzerConfig
 from .llm_client import OllamaClient
 
 
+def _is_local_gemma_runtime(*, model: str, base_url: str) -> bool:
+    model_norm = str(model or "").strip().lower()
+    if not model_norm.startswith("gemma4"):
+        return False
+    base = str(base_url or "").strip().lower()
+    return ("127.0.0.1" in base) or ("localhost" in base)
+
+
 def resolve_ollama_runtime(
     *,
     cfg: DealAnalyzerConfig,
@@ -42,7 +50,15 @@ def resolve_ollama_runtime(
         model=cfg.ollama_model,
         timeout_seconds=cfg.ollama_timeout_seconds,
     )
-    main_probe_timeout = min(max(3, int(cfg.ollama_timeout_seconds)), 12)
+    main_probe_timeout = max(
+        1,
+        int(getattr(cfg, "ollama_preflight_timeout_seconds", cfg.ollama_timeout_seconds) or cfg.ollama_timeout_seconds),
+    )
+    if _is_local_gemma_runtime(model=cfg.ollama_model, base_url=cfg.ollama_base_url):
+        main_probe_timeout = max(
+            1,
+            int(getattr(cfg, "local_gemma_preflight_timeout_sec", main_probe_timeout) or main_probe_timeout),
+        )
     main_probe = main_client.preflight(probe_timeout_seconds=main_probe_timeout)
     main_soft_ok = _is_soft_preflight_ok(str(main_probe.error or ""))
     runtime["main_ok"] = bool(main_probe.ok or main_soft_ok)
@@ -81,7 +97,15 @@ def resolve_ollama_runtime(
         model=fb_model,
         timeout_seconds=fb_timeout,
     )
-    fb_probe_timeout = min(max(3, fb_timeout), 12)
+    fb_probe_timeout = max(
+        1,
+        int(getattr(cfg, "ollama_fallback_preflight_timeout_seconds", fb_timeout) or fb_timeout),
+    )
+    if _is_local_gemma_runtime(model=fb_model, base_url=fb_base):
+        fb_probe_timeout = max(
+            1,
+            int(getattr(cfg, "local_gemma_preflight_timeout_sec", fb_probe_timeout) or fb_probe_timeout),
+        )
     fb_probe = fb_client.preflight(probe_timeout_seconds=fb_probe_timeout)
     fb_soft_ok = _is_soft_preflight_ok(str(fb_probe.error or ""))
     runtime["fallback_ok"] = bool(fb_probe.ok or fb_soft_ok)

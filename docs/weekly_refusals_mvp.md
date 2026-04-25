@@ -98,6 +98,8 @@ For `add_existing_values` mode:
 - required deterministic `period_key`;
 - duplicate live apply for same period is blocked (idempotency guard);
 - repeated dry-run is safe and does not write guard state.
+- `period_key` now includes absolute date range (`YYYY-MM-DD..YYYY-MM-DD`) even for labels like `За эту неделю`, so different weeks do not collide by text label.
+- before any reapply, run dry-run preview first; `cumulative_force_reapply=true` is unsafe unless idempotent delta logic is explicitly enabled.
 
 Writer summary fields to inspect:
 - `writer_mode`

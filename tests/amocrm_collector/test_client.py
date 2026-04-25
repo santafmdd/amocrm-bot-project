@@ -373,3 +373,34 @@ class _DummyLogger:
 
     def error(self, *args, **kwargs):
         self.error_calls.append((args, kwargs))
+
+
+def test_get_leads_by_updated_period_uses_updated_at_filters():
+    captured: dict[str, object] = {}
+
+    class _CaptureClient(AmoCollectorClient):
+        def __init__(self):
+            super().__init__(base_domain="example.amocrm.ru", access_token="tok")
+
+        def _get(self, path: str, *, params: dict[str, object] | None = None):
+            captured["path"] = path
+            captured["params"] = params or {}
+            return {"_embedded": {"leads": []}}
+
+    client = _CaptureClient()
+    result = client.get_leads_by_updated_period(
+        date_from_unix=1713744000,
+        date_to_unix=1714348799,
+        page=2,
+        limit=100,
+        pipeline_ids=[123, 456],
+    )
+    assert result == []
+    assert captured.get("path") == "/api/v4/leads"
+    params = captured.get("params", {})
+    assert isinstance(params, dict)
+    assert params.get("filter[updated_at][from]") == 1713744000
+    assert params.get("filter[updated_at][to]") == 1714348799
+    assert "filter[created_at][from]" not in params
+    assert "filter[created_at][to]" not in params
+    assert params.get("filter[pipeline_id]") == [123, 456]

@@ -6,7 +6,7 @@ import argparse
 import json
 import os
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -480,6 +480,61 @@ def _resolve_weekly_period_mode(current_date: date | None = None) -> str:
     return "\u0417\u0430 \u044d\u0442\u0443 \u043d\u0435\u0434\u0435\u043b\u044e" if day.weekday() == 0 else "\u0417\u0430 \u043f\u0440\u043e\u0448\u043b\u0443\u044e \u043d\u0435\u0434\u0435\u043b\u044e"
 
 
+def _parse_iso_date(raw: str) -> date | None:
+    value = str(raw or "").strip()
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
+def _resolve_weekly_absolute_range(
+    *,
+    period_mode: str,
+    date_from: str,
+    date_to: str,
+    current_date: date | None = None,
+) -> tuple[str, str]:
+    explicit_from = _parse_iso_date(date_from)
+    explicit_to = _parse_iso_date(date_to)
+    if explicit_from and explicit_to:
+        return explicit_from.isoformat(), explicit_to.isoformat()
+    today = current_date or date.today()
+    low = str(period_mode or "").strip().lower()
+    if "\u044d\u0442\u0443" in low and "\u043d\u0435\u0434\u0435\u043b" in low:
+        start = today - timedelta(days=today.weekday())
+        end = start + timedelta(days=6)
+        return start.isoformat(), end.isoformat()
+    if "\u043f\u0440\u043e\u0448\u043b" in low and "\u043d\u0435\u0434\u0435\u043b" in low:
+        current_week_start = today - timedelta(days=today.weekday())
+        end = current_week_start - timedelta(days=1)
+        start = end - timedelta(days=6)
+        return start.isoformat(), end.isoformat()
+    if explicit_from or explicit_to:
+        return (explicit_from.isoformat() if explicit_from else ""), (explicit_to.isoformat() if explicit_to else "")
+    return "", ""
+
+
+def _build_weekly_period_key(
+    *,
+    report_id: str,
+    period_mode: str,
+    date_from: str,
+    date_to: str,
+    current_date: date | None = None,
+) -> tuple[str, str, str]:
+    eff_from, eff_to = _resolve_weekly_absolute_range(
+        period_mode=period_mode,
+        date_from=date_from,
+        date_to=date_to,
+        current_date=current_date,
+    )
+    period_key = f"{report_id}|{period_mode}|{eff_from}|{eff_to}"
+    return period_key, eff_from, eff_to
+
+
 def _build_weekly_refusals_flow_input(report, runtime_options: RuntimeOptions | None = None) -> EventsFlowInput:
     filters = dict(getattr(report, "filters", {}) or {})
     date_cfg = dict(filters.get("date", {}) or {})
@@ -644,7 +699,16 @@ def _run_weekly_refusals_profile(
     parsed_payload["date_mode"] = str(flow_input.date_mode or "")
     parsed_payload["date_from"] = str(flow_input.date_from or "")
     parsed_payload["date_to"] = str(flow_input.date_to or "")
-    parsed_payload["period_key"] = (
+    period_key, effective_period_start, effective_period_end = _build_weekly_period_key(
+        report_id=str(report.id),
+        period_mode=str(parsed_payload["period_mode"]),
+        date_from=str(parsed_payload["date_from"]),
+        date_to=str(parsed_payload["date_to"]),
+    )
+    parsed_payload["effective_period_start"] = effective_period_start
+    parsed_payload["effective_period_end"] = effective_period_end
+    parsed_payload["period_key"] = period_key
+    parsed_payload["period_key_legacy"] = (
         f"{report.id}|{parsed_payload['period_mode']}|{parsed_payload['date_from']}|{parsed_payload['date_to']}"
     )
     parsed_payload["writer_mode_semantics"] = (
@@ -654,12 +718,14 @@ def _run_weekly_refusals_profile(
     )
     compiled_path.write_text(json.dumps(parsed_payload, ensure_ascii=False, indent=2), encoding="utf-8")
     logger.info(
-        "weekly refusals artifact saved: %s mode=%s semantics=%s cumulative_strategy=%s period_mode=%s period_key=%s",
+        "weekly refusals artifact saved: %s mode=%s semantics=%s cumulative_strategy=%s period_mode=%s effective_range=%s..%s period_key=%s",
         compiled_path,
         parsed_payload["mode"],
         parsed_payload["writer_mode_semantics"],
         parsed_payload["cumulative_write_strategy"],
         flow_input.period_mode,
+        parsed_payload.get("effective_period_start", ""),
+        parsed_payload.get("effective_period_end", ""),
         parsed_payload["period_key"],
     )
 
@@ -1438,8 +1504,9 @@ def main() -> None:
     batch_from_sheet_dsl_dry_run = bool(args.writer_layout_api_batch_from_sheet_dsl_dry_run)
     if batch_from_sheet_dsl and batch_from_sheet_dsl_dry_run:
         raise RuntimeError(
-            "Use only one mode: --writer-layout-api-batch-from-sheet-dsl or "
-            "--writer-layout-api-batch-from-sheet-dsl-dry-run"
+            "Batch DSL mode conflict: both write and dry-run flags are enabled. "
+            "Use exactly one: --writer-layout-api-batch-from-sheet-dsl-dry-run (safe preview) "
+            "or --writer-layout-api-batch-from-sheet-dsl (real write)."
         )
 
     if args.writer_layout_api_write_from_latest_compiled:

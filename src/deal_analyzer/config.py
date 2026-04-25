@@ -30,12 +30,22 @@ class DealAnalyzerConfig:
     ollama_base_url: str
     ollama_model: str
     ollama_timeout_seconds: int
-    style_profile_name: str
+    ollama_preflight_timeout_seconds: int = 12
+    style_profile_name: str = "manager_ru_v1"
     daily_style_mode: str = "mild"
     ollama_fallback_enabled: bool = False
     ollama_fallback_base_url: str = ""
     ollama_fallback_model: str = ""
     ollama_fallback_timeout_seconds: int = 60
+    ollama_fallback_preflight_timeout_seconds: int = 12
+    call_review_json_repair_timeout_seconds: int = 300
+    call_review_style_json_timeout_seconds: int = 300
+    call_review_row_hard_timeout_seconds: int = 1200
+    call_review_gemma_route_max_transcript_chars: int = 12000
+    local_gemma_preflight_timeout_sec: int = 60
+    local_gemma_generation_timeout_sec: int = 240
+    local_gemma_structured_timeout_sec: int = 240
+    call_review_allow_partial_rows_on_llm_failure: bool = False
     period_mode: str = "smart_manager_default"
     custom_date_from: str | None = None
     custom_date_to: str | None = None
@@ -72,6 +82,7 @@ class DealAnalyzerConfig:
     call_collection_mode: str = "api_first"
     call_backend: str = "amocrm_api"
     period_live_refresh_enabled: bool = True
+    live_refresh_candidate_source: str = "created_or_updated"
     amocrm_auth_config_path: str = ""
     call_base_domain: str = ""
     deal_analyzer_sheet_url: str = ""
@@ -81,6 +92,8 @@ class DealAnalyzerConfig:
     deal_analyzer_write_enabled: bool = False
     deal_analyzer_call_review_sheet_name: str = "Разбор звонков"
     deal_analyzer_call_review_start_cell: str = "A2"
+    deal_analyzer_call_review_append_scan_enabled: bool = True
+    deal_analyzer_call_review_duplicate_policy: str = "skip"
     deal_analyzer_daily_sheet_name: str = ""
     deal_analyzer_daily_start_cell: str = "A2"
     deal_analyzer_weekly_sheet_name: str = ""
@@ -179,6 +192,10 @@ def load_deal_analyzer_config(config_path: str | None = None) -> DealAnalyzerCon
         ollama_timeout_seconds = max(1, int(timeout_raw))
     except (TypeError, ValueError):
         ollama_timeout_seconds = 60
+    try:
+        ollama_preflight_timeout_seconds = max(1, int(raw.get("ollama_preflight_timeout_seconds", 12)))
+    except (TypeError, ValueError):
+        ollama_preflight_timeout_seconds = 12
     ollama_fallback_enabled = bool(raw.get("ollama_fallback_enabled", False))
     ollama_fallback_base_url = str(raw.get("ollama_fallback_base_url", "")).strip() or ollama_base_url
     ollama_fallback_model = str(raw.get("ollama_fallback_model", "")).strip() or ollama_model
@@ -186,6 +203,65 @@ def load_deal_analyzer_config(config_path: str | None = None) -> DealAnalyzerCon
         ollama_fallback_timeout_seconds = max(1, int(raw.get("ollama_fallback_timeout_seconds", 60)))
     except (TypeError, ValueError):
         ollama_fallback_timeout_seconds = 60
+    try:
+        ollama_fallback_preflight_timeout_seconds = max(
+            1,
+            int(raw.get("ollama_fallback_preflight_timeout_seconds", 12)),
+        )
+    except (TypeError, ValueError):
+        ollama_fallback_preflight_timeout_seconds = 12
+    try:
+        call_review_json_repair_timeout_seconds = max(
+            1,
+            int(raw.get("call_review_json_repair_timeout_seconds", 300)),
+        )
+    except (TypeError, ValueError):
+        call_review_json_repair_timeout_seconds = 300
+    try:
+        call_review_style_json_timeout_seconds = max(
+            1,
+            int(raw.get("call_review_style_json_timeout_seconds", 300)),
+        )
+    except (TypeError, ValueError):
+        call_review_style_json_timeout_seconds = 300
+    try:
+        call_review_row_hard_timeout_seconds = max(
+            30,
+            int(raw.get("call_review_row_hard_timeout_seconds", 1200)),
+        )
+    except (TypeError, ValueError):
+        call_review_row_hard_timeout_seconds = 1200
+    try:
+        call_review_gemma_route_max_transcript_chars = max(
+            1000,
+            int(raw.get("call_review_gemma_route_max_transcript_chars", 12000)),
+        )
+    except (TypeError, ValueError):
+        call_review_gemma_route_max_transcript_chars = 12000
+    try:
+        local_gemma_preflight_timeout_sec = max(
+            1,
+            int(raw.get("local_gemma_preflight_timeout_sec", 60)),
+        )
+    except (TypeError, ValueError):
+        local_gemma_preflight_timeout_sec = 60
+    try:
+        local_gemma_generation_timeout_sec = max(
+            1,
+            int(raw.get("local_gemma_generation_timeout_sec", 240)),
+        )
+    except (TypeError, ValueError):
+        local_gemma_generation_timeout_sec = 240
+    try:
+        local_gemma_structured_timeout_sec = max(
+            1,
+            int(raw.get("local_gemma_structured_timeout_sec", 240)),
+        )
+    except (TypeError, ValueError):
+        local_gemma_structured_timeout_sec = 240
+    call_review_allow_partial_rows_on_llm_failure = bool(
+        raw.get("call_review_allow_partial_rows_on_llm_failure", False)
+    )
 
     style_profile_name = str(raw.get("style_profile_name", "manager_ru_v1")).strip() or "manager_ru_v1"
     daily_style_mode = str(raw.get("daily_style_mode", "mild")).strip().lower() or "mild"
@@ -273,6 +349,15 @@ def load_deal_analyzer_config(config_path: str | None = None) -> DealAnalyzerCon
 
     call_backend = str(raw.get("call_backend", "amocrm_api")).strip().lower() or "amocrm_api"
     period_live_refresh_enabled = bool(raw.get("period_live_refresh_enabled", True))
+    live_refresh_candidate_source = (
+        str(raw.get("live_refresh_candidate_source", "created_or_updated")).strip().lower()
+        or "created_or_updated"
+    )
+    if live_refresh_candidate_source not in {"created_at", "updated_at", "created_or_updated"}:
+        raise RuntimeError(
+            "Unsupported live_refresh_candidate_source="
+            f"{live_refresh_candidate_source!r}. Allowed values: ['created_at', 'updated_at', 'created_or_updated']"
+        )
     amocrm_auth_config_path = str(raw.get("amocrm_auth_config_path", "")).strip()
     call_base_domain = str(raw.get("call_base_domain", "")).strip()
     deal_analyzer_sheet_url = str(raw.get("deal_analyzer_sheet_url", "")).strip()
@@ -282,6 +367,15 @@ def load_deal_analyzer_config(config_path: str | None = None) -> DealAnalyzerCon
     deal_analyzer_write_enabled = bool(raw.get("deal_analyzer_write_enabled", False))
     deal_analyzer_call_review_sheet_name = str(raw.get("deal_analyzer_call_review_sheet_name", "")).strip() or "Разбор звонков"
     deal_analyzer_call_review_start_cell = str(raw.get("deal_analyzer_call_review_start_cell", "A2")).strip() or "A2"
+    deal_analyzer_call_review_append_scan_enabled = bool(raw.get("deal_analyzer_call_review_append_scan_enabled", True))
+    deal_analyzer_call_review_duplicate_policy = (
+        str(raw.get("deal_analyzer_call_review_duplicate_policy", "skip")).strip().lower() or "skip"
+    )
+    if deal_analyzer_call_review_duplicate_policy not in {"skip", "abort"}:
+        raise RuntimeError(
+            "Unsupported deal_analyzer_call_review_duplicate_policy="
+            f"{deal_analyzer_call_review_duplicate_policy!r}. Allowed values: ['skip', 'abort']"
+        )
     deal_analyzer_daily_sheet_name = str(raw.get("deal_analyzer_daily_sheet_name", "")).strip()
     deal_analyzer_daily_start_cell = str(raw.get("deal_analyzer_daily_start_cell", "A2")).strip() or "A2"
     deal_analyzer_weekly_sheet_name = str(raw.get("deal_analyzer_weekly_sheet_name", "")).strip()
@@ -350,10 +444,20 @@ def load_deal_analyzer_config(config_path: str | None = None) -> DealAnalyzerCon
         ollama_base_url=ollama_base_url,
         ollama_model=ollama_model,
         ollama_timeout_seconds=ollama_timeout_seconds,
+        ollama_preflight_timeout_seconds=ollama_preflight_timeout_seconds,
         ollama_fallback_enabled=ollama_fallback_enabled,
         ollama_fallback_base_url=ollama_fallback_base_url,
         ollama_fallback_model=ollama_fallback_model,
         ollama_fallback_timeout_seconds=ollama_fallback_timeout_seconds,
+        ollama_fallback_preflight_timeout_seconds=ollama_fallback_preflight_timeout_seconds,
+        call_review_json_repair_timeout_seconds=call_review_json_repair_timeout_seconds,
+        call_review_style_json_timeout_seconds=call_review_style_json_timeout_seconds,
+        call_review_row_hard_timeout_seconds=call_review_row_hard_timeout_seconds,
+        call_review_gemma_route_max_transcript_chars=call_review_gemma_route_max_transcript_chars,
+        local_gemma_preflight_timeout_sec=local_gemma_preflight_timeout_sec,
+        local_gemma_generation_timeout_sec=local_gemma_generation_timeout_sec,
+        local_gemma_structured_timeout_sec=local_gemma_structured_timeout_sec,
+        call_review_allow_partial_rows_on_llm_failure=call_review_allow_partial_rows_on_llm_failure,
         style_profile_name=style_profile_name,
         daily_style_mode=daily_style_mode,
         period_mode=period_mode,
@@ -392,6 +496,7 @@ def load_deal_analyzer_config(config_path: str | None = None) -> DealAnalyzerCon
         call_collection_mode=call_collection_mode,
         call_backend=call_backend,
         period_live_refresh_enabled=period_live_refresh_enabled,
+        live_refresh_candidate_source=live_refresh_candidate_source,
         amocrm_auth_config_path=amocrm_auth_config_path,
         call_base_domain=call_base_domain,
         deal_analyzer_sheet_url=deal_analyzer_sheet_url,
@@ -401,6 +506,8 @@ def load_deal_analyzer_config(config_path: str | None = None) -> DealAnalyzerCon
         deal_analyzer_write_enabled=deal_analyzer_write_enabled,
         deal_analyzer_call_review_sheet_name=deal_analyzer_call_review_sheet_name,
         deal_analyzer_call_review_start_cell=deal_analyzer_call_review_start_cell,
+        deal_analyzer_call_review_append_scan_enabled=deal_analyzer_call_review_append_scan_enabled,
+        deal_analyzer_call_review_duplicate_policy=deal_analyzer_call_review_duplicate_policy,
         deal_analyzer_daily_sheet_name=deal_analyzer_daily_sheet_name,
         deal_analyzer_daily_start_cell=deal_analyzer_daily_start_cell,
         deal_analyzer_weekly_sheet_name=deal_analyzer_weekly_sheet_name,

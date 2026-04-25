@@ -12,11 +12,13 @@
 ## Golden Commands
 
 - Dry-run batch DSL:
-  `python -m src.run_profile_analytics --report-id analytics_tag_layout_example --browser-backend openclaw_cdp --tag-selection-mode script --writer-layout-api-batch-from-sheet-dsl --writer-layout-api-batch-from-sheet-dsl-dry-run`
+  `python -m src.run_profile_analytics --report-id analytics_tag_layout_example --browser-backend openclaw_cdp --tag-selection-mode script --writer-layout-api-batch-from-sheet-dsl-dry-run`
 - Live-run batch DSL:
   `python -m src.run_profile_analytics --report-id analytics_tag_layout_example --browser-backend openclaw_cdp --tag-selection-mode script --writer-layout-api-batch-from-sheet-dsl`
 - Narrow duplicate-tag investigation:
   `python -m src.run_profile_analytics --report-id analytics_tag_layout_example --browser-backend openclaw_cdp --tag-selection-mode script --writer-layout-api-target-dsl-cell A29 --writer-layout-api-batch-from-sheet-dsl`
+
+Важно: в PowerShell вставляйте только строку команды, без заголовков разделов (`Блок отказов`, `Weekly 2 месяца` и т.д.), иначе PowerShell попытается выполнить заголовок как команду.
 
 ## Stop-Loss Rules
 

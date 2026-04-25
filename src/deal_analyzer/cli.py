@@ -3,6 +3,7 @@
 import argparse
 import json
 import re
+import time
 from collections import Counter
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -22,7 +23,7 @@ from src.ops_storage.janitor import run_janitor_clean, run_janitor_report
 from src.safety import ensure_inside_root
 
 from .call_downloader import CallDownloader
-from .call_evidence import build_call_summary, call_evidence_to_dicts
+from .call_evidence import build_call_summary, call_evidence_to_dicts, extract_calls_from_notes
 from .call_review_v3_builder import build_call_review_v3_payload
 from .call_review_v3_row_schema import CALL_REVIEW_V3_COLUMNS, rows_to_sheet_matrix_v3
 from .base_mix import (
@@ -858,12 +859,16 @@ def _run_analyze_period(
     )
     run_started_at = datetime.now(timezone.utc)
     run_dir, deals_dir = _prepare_period_run_dirs(output_dir=output_dir, run_started_at=run_started_at)
+    base_domain_for_links = _resolve_amo_base_domain_for_links(cfg=cfg)
     try:
         call_pool_debug = _collect_call_pool_debug(
             cfg=analysis_cfg,
             logger=logger,
             rows=normalized_rows_ranked,
             raw_bundles_by_deal=raw_bundles_by_deal,
+            period_start=resolved.period_start,
+            period_end=resolved.period_end,
+            base_domain=base_domain_for_links,
         )
     except Exception as exc:
         logger.warning("call pool pre-limit pass failed: error=%s", exc)
@@ -877,6 +882,10 @@ def _run_analyze_period(
             "deals_with_only_short_calls": 0,
             "deals_with_autoanswer_pattern": 0,
             "deals_with_redial_pattern": 0,
+            "call_ledger_all": [],
+            "call_ledger_audit": {},
+            "call_collection_audit": {},
+            "rows_from_call_deals": [],
             "items": [],
         }
     _write_json_path(run_dir / "call_pool_debug.json", call_pool_debug)
@@ -884,6 +893,36 @@ def _run_analyze_period(
         _build_call_pool_debug_markdown(call_pool_debug=call_pool_debug),
         encoding="utf-8",
     )
+    call_review_v3_dir = run_dir / "call_review_v3"
+    call_review_v3_dir.mkdir(parents=True, exist_ok=True)
+    _write_json_path(
+        call_review_v3_dir / "call_ledger_all.json",
+        call_pool_debug.get("call_ledger_all", [])
+        if isinstance(call_pool_debug.get("call_ledger_all"), list)
+        else [],
+    )
+    _write_json_path(
+        call_review_v3_dir / "call_ledger_audit.json",
+        call_pool_debug.get("call_ledger_audit", {})
+        if isinstance(call_pool_debug.get("call_ledger_audit"), dict)
+        else {},
+    )
+    _write_json_path(
+        call_review_v3_dir / "call_collection_audit.json",
+        call_pool_debug.get("call_collection_audit", {})
+        if isinstance(call_pool_debug.get("call_collection_audit"), dict)
+        else {},
+    )
+    deal_candidate_audit = _build_deal_candidate_audit(
+        resolved=resolved,
+        refresh_diag=refresh_diag if isinstance(refresh_diag, dict) else {},
+        call_ledger_all=(
+            call_pool_debug.get("call_ledger_all", [])
+            if isinstance(call_pool_debug.get("call_ledger_all"), list)
+            else []
+        ),
+    )
+    _write_json_path(call_review_v3_dir / "deal_candidate_audit.json", deal_candidate_audit)
     company_tag_propagation_plan = _build_company_tag_propagation_dry_run_plan(rows=normalized_rows_ranked)
     company_tag_propagation_plan_path = run_dir / "company_tag_propagation_dry_run.json"
     _write_json_path(company_tag_propagation_plan_path, company_tag_propagation_plan)
@@ -924,6 +963,11 @@ def _run_analyze_period(
     transcription_shortlist_payload = _build_transcription_shortlist_payload(
         conversation_pool_payload=conversation_pool_payload,
         discipline_pool_payload=discipline_pool_payload,
+        call_ledger_all=(
+            call_pool_debug.get("call_ledger_all", [])
+            if isinstance(call_pool_debug.get("call_ledger_all"), list)
+            else []
+        ),
     )
     shortlist_items_raw = (
         transcription_shortlist_payload.get("items", [])
@@ -957,6 +1001,11 @@ def _run_analyze_period(
         shortlist_items=[x for x in shortlist_items if isinstance(x, dict)],
         normalized_rows_ranked=normalized_rows_ranked,
         limit=limit,
+        manager_allowlist=(
+            list(getattr(cfg, "daily_manager_allowlist", ()) or [])
+            if getattr(cfg, "daily_manager_allowlist", None) is not None
+            else None
+        ),
     )
     selected_items_raw = (
         analysis_shortlist_payload.get("selected_items", [])
@@ -972,11 +1021,24 @@ def _run_analyze_period(
         "selected_items_before_filter": len(selected_items_raw),
         "selected_items_after_filter": len(selected_items_filtered),
         "selected_items_dropped_open_bucket": int(selected_dropped_by_window),
+        "selected_items_dropped_by_manager_allowlist": 0,
     }
     _write_json_path(run_dir / "analysis_shortlist.json", analysis_shortlist_payload)
     (run_dir / "analysis_shortlist.md").write_text(
         _build_analysis_shortlist_markdown(payload=analysis_shortlist_payload),
         encoding="utf-8",
+    )
+    _write_json_path(
+        call_review_v3_dir / "anchor_shortlist.json",
+        analysis_shortlist_payload.get("ranked_items", [])
+        if isinstance(analysis_shortlist_payload.get("ranked_items"), list)
+        else [],
+    )
+    _write_json_path(
+        call_review_v3_dir / "selected_anchor_cases.json",
+        analysis_shortlist_payload.get("selected_items", [])
+        if isinstance(analysis_shortlist_payload.get("selected_items"), list)
+        else [],
     )
     selected_deal_ids = [
         str(x.get("deal_id") or "").strip()
@@ -1009,6 +1071,18 @@ def _run_analyze_period(
         for row in normalized_rows_ranked
         if isinstance(row, dict)
     }
+    rows_from_call_deals = (
+        call_pool_debug.get("rows_from_call_deals", [])
+        if isinstance(call_pool_debug.get("rows_from_call_deals"), list)
+        else []
+    )
+    for row in rows_from_call_deals:
+        if not isinstance(row, dict):
+            continue
+        deal_id = str(row.get("deal_id") or row.get("amo_lead_id") or "").strip()
+        if not deal_id:
+            continue
+        row_by_id.setdefault(deal_id, row)
     normalized_rows = [row_by_id[did] for did in selected_deal_ids if did in row_by_id]
     if not normalized_rows:
         logger.warning("analysis shortlist is empty after ranking; no deals selected for analyze-period")
@@ -1155,6 +1229,30 @@ def _run_analyze_period(
                 if isinstance(snapshot.get("transcripts"), list)
                 else []
             )
+            transcript_segments_count = 0
+            transcript_longest_segment_sec = 0.0
+            for transcript_item in transcript_items:
+                if not isinstance(transcript_item, dict):
+                    continue
+                segments = transcript_item.get("segments")
+                if not isinstance(segments, list):
+                    continue
+                transcript_segments_count += len(segments)
+                for segment in segments:
+                    if not isinstance(segment, dict):
+                        continue
+                    try:
+                        start_sec = float(segment.get("start", 0) or 0.0)
+                    except Exception:
+                        start_sec = 0.0
+                    try:
+                        end_sec = float(segment.get("end", 0) or 0.0)
+                    except Exception:
+                        end_sec = 0.0
+                    transcript_longest_segment_sec = max(
+                        transcript_longest_segment_sec,
+                        max(0.0, end_sec - start_sec),
+                    )
             transcript_err_counts = _transcript_error_counters(transcript_items)
             call_history_pattern = _derive_call_history_pattern(snapshot if isinstance(snapshot, dict) else {})
             deal_tags = crm.get("tags") if isinstance(crm.get("tags"), list) else []
@@ -1238,6 +1336,8 @@ def _run_analyze_period(
                     "transcript_source": str(analysis.get("transcript_source") or ""),
                     "transcript_error": str(analysis.get("transcript_error") or ""),
                     "transcript_text_len": int(analysis.get("transcript_text_len", 0) or 0),
+                    "transcript_segments_count": int(transcript_segments_count),
+                    "transcript_longest_segment_sec": round(float(transcript_longest_segment_sec), 3),
                     "transcript_nonempty_ratio": float(analysis.get("transcript_nonempty_ratio", 0.0) or 0.0),
                     "transcript_noise_score": int(analysis.get("transcript_noise_score", 0) or 0),
                     "transcript_repeat_score": int(analysis.get("transcript_repeat_score", 0) or 0),
@@ -1572,6 +1672,32 @@ def _run_analyze_period(
             "analysis_shortlist_total": int(analysis_shortlist_payload.get("total_selected", 0) or 0),
             "analysis_shortlist_candidates_total": int(analysis_shortlist_payload.get("total_candidates", 0) or 0),
             "analysis_shortlist_limit_applied": analysis_shortlist_payload.get("limit_applied_to_shortlist"),
+            "analysis_shortlist_selected_by_manager": (
+                analysis_shortlist_payload.get("selected_by_manager", {})
+                if isinstance(analysis_shortlist_payload.get("selected_by_manager"), dict)
+                else {}
+            ),
+            "analysis_shortlist_candidates_before_manager_allowlist": int(
+                analysis_shortlist_payload.get("candidates_before_manager_allowlist", 0) or 0
+            ),
+            "analysis_shortlist_candidates_after_manager_allowlist": int(
+                analysis_shortlist_payload.get("candidates_after_manager_allowlist", 0) or 0
+            ),
+            "analysis_shortlist_dropped_by_manager_allowlist": int(
+                analysis_shortlist_payload.get("dropped_by_manager_allowlist", 0) or 0
+            ),
+            "analysis_shortlist_selected_before_limit": int(
+                analysis_shortlist_payload.get("selected_before_limit", 0) or 0
+            ),
+            "analysis_shortlist_selected_after_limit": int(
+                analysis_shortlist_payload.get("selected_after_limit", 0) or 0
+            ),
+            "analysis_shortlist_selection_shortage_reason": str(
+                analysis_shortlist_payload.get("selection_shortage_reason") or ""
+            ),
+            "analysis_shortlist_dropped_by_limit_total": int(
+                analysis_shortlist_payload.get("dropped_by_limit_total", 0) or 0
+            ),
             "business_window_open_date": str(transcription_shortlist_payload.get("business_window_open_date") or ""),
             "business_window_items_open_bucket": int(
                 transcription_shortlist_payload.get("business_window_items_open_bucket", 0) or 0
@@ -1603,6 +1729,25 @@ def _run_analyze_period(
     summary_payload["period_start"] = resolved.period_start.isoformat()
     summary_payload["period_end"] = resolved.period_end.isoformat()
     summary_payload["as_of_date"] = resolved.as_of_date.isoformat()
+    summary_payload["input_source_name"] = str(source_name or "")
+    summary_payload["effective_period_start"] = resolved.period_start.isoformat()
+    summary_payload["effective_period_end"] = resolved.period_end.isoformat()
+    input_period_start, input_period_end = _extract_period_from_source_name(source_name)
+    mismatch = bool(
+        input_period_start
+        and input_period_end
+        and (
+            input_period_start != resolved.period_start.isoformat()
+            or input_period_end != resolved.period_end.isoformat()
+        )
+    )
+    summary_payload["input_filename_period_mismatch"] = {
+        "warning": mismatch,
+        "input_period_start": input_period_start,
+        "input_period_end": input_period_end,
+        "effective_period_start": resolved.period_start.isoformat(),
+        "effective_period_end": resolved.period_end.isoformat(),
+    }
     summary_payload["call_business_windows"] = {
         "timezone": "+03:00",
         "cutoff_local_time": "15:00",
@@ -1618,6 +1763,12 @@ def _run_analyze_period(
         ),
     }
     summary_payload["live_refresh"] = refresh_diag
+    summary_payload["call_collection_audit"] = (
+        call_pool_debug.get("call_collection_audit", {})
+        if isinstance(call_pool_debug.get("call_collection_audit"), dict)
+        else {}
+    )
+    summary_payload["deal_candidate_audit"] = deal_candidate_audit
     summary_payload["company_tag_propagation_dry_run"] = {
         "artifact_json": str(company_tag_propagation_plan_path),
         "artifact_md": str(company_tag_propagation_plan_md_path),
@@ -1700,7 +1851,7 @@ def _run_analyze_period(
         sheets_dry_run_payload,
     )
     style_source_excerpt = _load_daily_style_source_excerpt(logger=logger, cfg=analysis_cfg)
-    daily_llm_runtime = _resolve_daily_llm_runtime(analysis_cfg, logger)
+    daily_llm_runtime = _resolve_daily_llm_runtime(cfg, logger)
     summary_payload["daily_llm_runtime"] = {
         "enabled": bool(daily_llm_runtime.get("enabled")),
         "selected": str(daily_llm_runtime.get("selected") or "none"),
@@ -1783,48 +1934,281 @@ def _run_analyze_period(
         "mode": "disabled_in_call_review_v2",
         "reason": "active_path_uses_call_review_multistep_only",
     }
-    call_review_llm_generation = _prepare_call_review_llm_fields(
-        cfg=analysis_cfg,
-        logger=logger,
-        llm_runtime=daily_llm_runtime,
-        style_source_excerpt=style_source_excerpt,
-        period_deal_records=period_deal_records,
-        analysis_shortlist_payload=analysis_shortlist_payload,
-        step_artifacts_root=run_dir / "call_review_step_artifacts",
-    )
+    call_review_abort_stage = ""
+    call_review_abort_error = ""
+    try:
+        call_review_llm_generation = _prepare_call_review_llm_fields(
+            cfg=analysis_cfg,
+            logger=logger,
+            llm_runtime=daily_llm_runtime,
+            style_source_excerpt=style_source_excerpt,
+            period_deal_records=period_deal_records,
+            analysis_shortlist_payload=analysis_shortlist_payload,
+            step_artifacts_root=run_dir / "call_review_step_artifacts",
+        )
+    except Exception as exc:
+        call_review_abort_stage = "llm_generation"
+        call_review_abort_error = str(exc)
+        logger.warning("call review llm pipeline aborted: stage=%s error=%s", call_review_abort_stage, call_review_abort_error)
+        for record in period_deal_records:
+            if not isinstance(record, dict):
+                continue
+            record["call_review_llm_ready"] = False
+            record["call_review_llm_error"] = f"llm_pipeline_aborted:{call_review_abort_error}"
+            if not isinstance(record.get("call_review_llm_fields"), dict):
+                record["call_review_llm_fields"] = {}
+        call_review_llm_generation = {
+            "selected_runtime": str(daily_llm_runtime.get("selected") or "none"),
+            "generated_rows": 0,
+            "failed_rows": 0,
+            "skipped_rows": len([x for x in period_deal_records if isinstance(x, dict)]),
+            "skip_reasons": {"llm_pipeline_aborted": len([x for x in period_deal_records if isinstance(x, dict)])},
+            "llm_sources": {},
+            "failed_steps": {"llm_generation": 1},
+            "step_artifacts_written": 0,
+            "step_artifacts_root": str(run_dir / "call_review_step_artifacts"),
+            "fatal_error": call_review_abort_error,
+        }
     summary_payload["call_review_llm_generation"] = call_review_llm_generation
-    call_review_payload = build_call_review_v3_payload(
-        summary=summary_payload,
-        period_deal_records=period_deal_records,
-        analysis_shortlist_payload=analysis_shortlist_payload,
-        base_domain=_resolve_amo_base_domain_for_links(cfg=cfg),
-        manager_allowlist=list(getattr(cfg, "daily_manager_allowlist", ()) or ()),
-        manager_role_registry=dict(getattr(cfg, "manager_role_registry", {}) or {}),
-        run_dir=run_dir,
-    )
+    try:
+        call_review_payload = build_call_review_v3_payload(
+            summary=summary_payload,
+            period_deal_records=period_deal_records,
+            analysis_shortlist_payload=analysis_shortlist_payload,
+            base_domain=base_domain_for_links,
+            manager_allowlist=list(getattr(cfg, "daily_manager_allowlist", ()) or ()),
+            manager_role_registry=dict(getattr(cfg, "manager_role_registry", {}) or {}),
+            run_dir=run_dir,
+            call_ledger_all=(
+                call_pool_debug.get("call_ledger_all", [])
+                if isinstance(call_pool_debug.get("call_ledger_all"), list)
+                else []
+            ),
+            call_ledger_audit=(
+                call_pool_debug.get("call_ledger_audit", {})
+                if isinstance(call_pool_debug.get("call_ledger_audit"), dict)
+                else {}
+            ),
+            anchor_shortlist=(
+                analysis_shortlist_payload.get("ranked_items", [])
+                if isinstance(analysis_shortlist_payload.get("ranked_items"), list)
+                else []
+            ),
+            selected_anchor_cases=(
+                analysis_shortlist_payload.get("selected_items", [])
+                if isinstance(analysis_shortlist_payload.get("selected_items"), list)
+                else []
+            ),
+            abort_stage=call_review_abort_stage,
+            abort_error=call_review_abort_error,
+            artifacts_written=[
+                str(call_review_v3_dir / "call_ledger_all.json"),
+                str(call_review_v3_dir / "call_ledger_audit.json"),
+                str(call_review_v3_dir / "call_collection_audit.json"),
+                str(call_review_v3_dir / "deal_candidate_audit.json"),
+                str(call_review_v3_dir / "anchor_shortlist.json"),
+                str(call_review_v3_dir / "selected_anchor_cases.json"),
+            ],
+        )
+    except Exception as exc:
+        if not call_review_abort_stage:
+            call_review_abort_stage = "call_review_payload_build"
+        if not call_review_abort_error:
+            call_review_abort_error = str(exc)
+        logger.warning("call review payload build aborted: stage=%s error=%s", call_review_abort_stage, call_review_abort_error)
+        _write_json_path(
+            call_review_v3_dir / "pipeline_summary.json",
+            {
+                "ledger_total_all": len(
+                    call_pool_debug.get("call_ledger_all", [])
+                    if isinstance(call_pool_debug.get("call_ledger_all"), list)
+                    else []
+                ),
+                "anchor_candidates_total": len(
+                    analysis_shortlist_payload.get("ranked_items", [])
+                    if isinstance(analysis_shortlist_payload.get("ranked_items"), list)
+                    else []
+                ),
+                "selected_anchor_cases_total": len(
+                    analysis_shortlist_payload.get("selected_items", [])
+                    if isinstance(analysis_shortlist_payload.get("selected_items"), list)
+                    else []
+                ),
+                "rows_written": 0,
+                "abort_stage": call_review_abort_stage,
+                "abort_error": call_review_abort_error,
+                "artifacts_written": [
+                    str(call_review_v3_dir / "call_ledger_all.json"),
+                    str(call_review_v3_dir / "call_ledger_audit.json"),
+                    str(call_review_v3_dir / "call_collection_audit.json"),
+                    str(call_review_v3_dir / "deal_candidate_audit.json"),
+                    str(call_review_v3_dir / "anchor_shortlist.json"),
+                    str(call_review_v3_dir / "selected_anchor_cases.json"),
+                ],
+                "call_ledger_all_total": len(
+                    call_pool_debug.get("call_ledger_all", [])
+                    if isinstance(call_pool_debug.get("call_ledger_all"), list)
+                    else []
+                ),
+            },
+        )
+        call_review_payload = {
+            "mode": "call_review_sheet",
+            "schema_version": "v3",
+            "sheet_name": "Разбор звонков",
+            "start_cell": "A2",
+            "columns": list(CALL_REVIEW_V3_COLUMNS),
+            "rows": [],
+            "rows_count": 0,
+            "selection_debug": {
+                "rows_total": 0,
+                "rows_skipped": 0,
+                "skip_reasons": {"payload_build_failed": 1},
+                "details": [],
+            },
+            "v3_debug_artifacts": {
+                "root": str(call_review_v3_dir),
+                "pipeline_summary_json": str(call_review_v3_dir / "pipeline_summary.json"),
+            },
+        }
+    call_review_debug_payload: dict[str, Any] = {
+        "selection_debug": (
+            call_review_payload.get("selection_debug", {})
+            if isinstance(call_review_payload.get("selection_debug"), dict)
+            else {}
+        ),
+        "semantic_preflight": (
+            call_review_payload.get("semantic_preflight", {})
+            if isinstance(call_review_payload.get("semantic_preflight"), dict)
+            else {}
+        ),
+        "v3_debug_artifacts": (
+            call_review_payload.get("v3_debug_artifacts", {})
+            if isinstance(call_review_payload.get("v3_debug_artifacts"), dict)
+            else {}
+        ),
+    }
+    if int(call_review_payload.get("rows_count", 0) or 0) == 0 and not bool(daily_llm_runtime.get("selected") in {"main", "fallback"}):
+        call_review_debug_payload["rows_zero_reason"] = "llm_not_ready"
+        selection_debug = (
+            call_review_debug_payload.get("selection_debug", {})
+            if isinstance(call_review_debug_payload.get("selection_debug"), dict)
+            else {}
+        )
+        skip_reasons = selection_debug.get("skip_reasons", {}) if isinstance(selection_debug.get("skip_reasons"), dict) else {}
+        if int(skip_reasons.get("llm_not_ready", 0) or 0) <= 0:
+            skip_reasons["llm_not_ready"] = max(1, int(selection_debug.get("rows_total", 0) or 0))
+        selection_debug["skip_reasons"] = skip_reasons
+        call_review_debug_payload["selection_debug"] = selection_debug
+
+    call_review_payload_for_writer = {
+        "mode": str(call_review_payload.get("mode") or "call_review_sheet"),
+        "schema_version": str(call_review_payload.get("schema_version") or "v3"),
+        "sheet_name": str(call_review_payload.get("sheet_name") or "Разбор звонков"),
+        "start_cell": str(call_review_payload.get("start_cell") or "A2"),
+        "columns": (
+            call_review_payload.get("columns", [])
+            if isinstance(call_review_payload.get("columns"), list)
+            else list(CALL_REVIEW_V3_COLUMNS)
+        ),
+        "rows": (
+            call_review_payload.get("rows", [])
+            if isinstance(call_review_payload.get("rows"), list)
+            else []
+        ),
+        "rows_count": int(call_review_payload.get("rows_count", 0) or 0),
+    }
     call_review_payload_path = run_dir / "call_review_sheet_payload.json"
-    _write_json_path(call_review_payload_path, call_review_payload)
-    summary_payload["call_review_rows_total"] = int(call_review_payload.get("rows_count", 0) or 0)
-    summary_payload["call_review_selection_debug"] = (
-        call_review_payload.get("selection_debug", {})
-        if isinstance(call_review_payload.get("selection_debug"), dict)
+    call_review_debug_payload_path = run_dir / "call_review_debug_payload.json"
+    semantic_preflight_path = run_dir / "semantic_preflight.json"
+    semantic_preflight_payload = (
+        call_review_payload.get("semantic_preflight", {})
+        if isinstance(call_review_payload.get("semantic_preflight"), dict)
         else {}
     )
+    semantic_preflight_passed = bool(semantic_preflight_payload.get("passed", True))
+    _write_json_path(
+        semantic_preflight_path,
+        semantic_preflight_payload
+        if isinstance(semantic_preflight_payload, dict)
+        else {"passed": True, "failed_rules": []},
+    )
+    _write_json_path(call_review_payload_path, call_review_payload_for_writer)
+    _write_json_path(call_review_debug_payload_path, call_review_debug_payload)
+    summary_payload["call_review_rows_total"] = int(call_review_payload_for_writer.get("rows_count", 0) or 0)
+    summary_payload["semantic_preflight_path"] = str(semantic_preflight_path)
+    summary_payload["semantic_preflight"] = semantic_preflight_payload
+    summary_payload["call_review_selection_debug"] = (
+        call_review_debug_payload.get("selection_debug", {})
+        if isinstance(call_review_debug_payload.get("selection_debug"), dict)
+        else {}
+    )
+    selected_anchor_cases_total = len(
+        analysis_shortlist_payload.get("selected_items", [])
+        if isinstance(analysis_shortlist_payload.get("selected_items"), list)
+        else []
+    )
+    summary_payload["call_review_selected_anchor_cases_total"] = int(selected_anchor_cases_total)
+    summary_payload["call_review_debug_payload"] = str(call_review_debug_payload_path)
     write_cfg = analysis_cfg
+    force_dry_run_reason = ""
     if not bool(daily_llm_runtime.get("selected") in {"main", "fallback"}):
+        force_dry_run_reason = "no_live_llm_runtime"
         write_cfg = replace(analysis_cfg, deal_analyzer_write_enabled=False)
         logger.warning(
             "call review writer forced to dry_run: reason=no_live_llm_runtime selected=%s runtime_reason=%s",
             str(daily_llm_runtime.get("selected") or "none"),
             str(daily_llm_runtime.get("reason") or ""),
         )
+    if not semantic_preflight_passed:
+        force_dry_run_reason = "semantic_preflight_failed"
+        write_cfg = replace(analysis_cfg, deal_analyzer_write_enabled=False)
+        logger.warning(
+            "call review writer forced to dry_run: reason=semantic_preflight_failed failed_rules=%s",
+            (
+                semantic_preflight_payload.get("failed_rules", [])
+                if isinstance(semantic_preflight_payload, dict)
+                else []
+            ),
+        )
+    selection_debug_for_gate = (
+        summary_payload.get("call_review_selection_debug", {})
+        if isinstance(summary_payload.get("call_review_selection_debug"), dict)
+        else {}
+    )
+    skip_reasons_for_gate = (
+        selection_debug_for_gate.get("skip_reasons", {})
+        if isinstance(selection_debug_for_gate.get("skip_reasons"), dict)
+        else {}
+    )
+    llm_timeout_skips = int(skip_reasons_for_gate.get("llm_timeout", 0) or 0)
+    if (
+        not force_dry_run_reason
+        and analysis_cfg.deal_analyzer_write_enabled
+        and not bool(getattr(analysis_cfg, "call_review_allow_partial_rows_on_llm_failure", False))
+        and int(call_review_payload_for_writer.get("rows_count", 0) or 0) < int(selected_anchor_cases_total or 0)
+        and llm_timeout_skips > 0
+    ):
+        force_dry_run_reason = "llm_timeout_rows_dropped"
+        write_cfg = replace(analysis_cfg, deal_analyzer_write_enabled=False)
+        logger.warning(
+            "call review writer forced to dry_run: reason=llm_timeout_rows_dropped rows_prepared=%s selected=%s llm_timeout_skips=%s",
+            int(call_review_payload_for_writer.get("rows_count", 0) or 0),
+            int(selected_anchor_cases_total or 0),
+            llm_timeout_skips,
+        )
     call_review_writer_status = _maybe_write_call_review_sheet(
         cfg=write_cfg,
         logger=logger,
-        call_review_payload=call_review_payload,
+        call_review_payload=call_review_payload_for_writer,
     )
     if analysis_cfg.deal_analyzer_write_enabled and not write_cfg.deal_analyzer_write_enabled:
-        call_review_writer_status["error"] = "write_forced_dry_run_no_live_llm"
+        if force_dry_run_reason == "semantic_preflight_failed":
+            call_review_writer_status["error"] = "write_forced_dry_run_semantic_preflight_failed"
+        elif force_dry_run_reason == "no_live_llm_runtime":
+            call_review_writer_status["error"] = "write_forced_dry_run_no_live_llm"
+        elif force_dry_run_reason == "llm_timeout_rows_dropped":
+            call_review_writer_status["error"] = "write_forced_dry_run_llm_timeout_rows_dropped"
     summary_payload["call_review_writer"] = call_review_writer_status
     summary_payload["daily_control_writer"] = {
         "enabled": False,
@@ -2191,6 +2575,79 @@ def _make_llm_client_from_runtime(runtime: dict[str, Any]) -> OllamaClient | Non
     return None
 
 
+def _is_timeout_like_error(error: str) -> bool:
+    low = str(error or "").strip().lower()
+    if not low:
+        return False
+    tokens = (
+        "timed out",
+        "timeout",
+        "time out",
+        "read timed out",
+        "remote disconnected",
+        "remotedisconnected",
+        "connection reset",
+        "connection aborted",
+    )
+    return any(token in low for token in tokens)
+
+
+def _messages_char_count(messages: list[dict[str, str]]) -> int:
+    total = 0
+    for item in messages:
+        if not isinstance(item, dict):
+            continue
+        total += len(str(item.get("content") or ""))
+    return total
+
+
+def _source_timeout_from_runtime(
+    *,
+    runtime: dict[str, Any],
+    source: str,
+    timeout_overrides: dict[str, int] | None,
+) -> int:
+    if isinstance(timeout_overrides, dict):
+        override = timeout_overrides.get(source)
+        if override is not None:
+            try:
+                return max(1, int(override))
+            except Exception:
+                pass
+    cfg = runtime.get(source, {}) if isinstance(runtime.get(source), dict) else {}
+    try:
+        return max(1, int(cfg.get("timeout_seconds") or 60))
+    except Exception:
+        return 60
+
+
+def _apply_row_deadline_to_timeout(
+    *,
+    timeout_seconds: int,
+    row_deadline_monotonic: float | None,
+) -> int:
+    timeout = max(1, int(timeout_seconds))
+    if row_deadline_monotonic is None:
+        return timeout
+    remaining = int(row_deadline_monotonic - time.monotonic())
+    if remaining <= 0:
+        return 0
+    return max(1, min(timeout, remaining))
+
+
+def _maybe_rebuild_client_with_timeout(client: Any, timeout_seconds: int) -> Any:
+    if not isinstance(client, OllamaClient):
+        return client
+    try:
+        base_url = str(getattr(client, "base_url") or "").strip()
+        model = str(getattr(client, "model") or "").strip()
+        if base_url and model:
+            return OllamaClient(base_url=base_url, model=model, timeout_seconds=max(1, int(timeout_seconds)))
+    except Exception:
+        return client
+    return client
+
+
 def _llm_chat_json_with_runtime(
     *,
     runtime: dict[str, Any],
@@ -2198,6 +2655,10 @@ def _llm_chat_json_with_runtime(
     repair_messages: list[dict[str, str]] | None = None,
     logger: Any | None = None,
     log_prefix: str = "daily llm",
+    timeout_overrides: dict[str, int] | None = None,
+    repair_timeout_overrides: dict[str, int] | None = None,
+    row_deadline_monotonic: float | None = None,
+    diagnostics_out: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], str] | tuple[None, str]:
     selected = str(runtime.get("selected") or "none")
     order: list[str] = []
@@ -2208,34 +2669,211 @@ def _llm_chat_json_with_runtime(
     if selected != "fallback" and bool(runtime.get("fallback_ok")):
         order.append("fallback")
     if not order:
+        if isinstance(diagnostics_out, dict):
+            diagnostics_out.update(
+                {
+                    "llm_source": "",
+                    "llm_model": "",
+                    "llm_timeout_sec": 0,
+                    "llm_elapsed_ms": 0,
+                    "prompt_chars": _messages_char_count(messages),
+                    "response_chars": 0,
+                    "timed_out": False,
+                    "fallback_used": False,
+                    "fallback_reason": "no_runtime",
+                    "json_valid": False,
+                    "repair_used": False,
+                    "attempts": [],
+                }
+            )
         return None, "no_runtime"
 
     last_error = "unknown_error"
+    first_error = ""
+    timed_out = False
+    attempts: list[dict[str, Any]] = []
+    prompt_chars = _messages_char_count(messages)
+    successful_timeout_sec = 0
+    successful_elapsed_ms = 0
+    successful_model = ""
+    successful_source = ""
+    successful_repair = False
+    successful_response_chars = 0
     for idx, source in enumerate(order):
+        timeout_seconds = _source_timeout_from_runtime(runtime=runtime, source=source, timeout_overrides=timeout_overrides)
+        timeout_seconds = _apply_row_deadline_to_timeout(
+            timeout_seconds=timeout_seconds,
+            row_deadline_monotonic=row_deadline_monotonic,
+        )
+        if timeout_seconds <= 0:
+            last_error = "row_hard_timeout_exceeded"
+            timed_out = True
+            break
         try:
             client = _make_llm_client_from_runtime({**runtime, "selected": source})
             if client is None:
                 continue
+            start = time.monotonic()
+            client = _maybe_rebuild_client_with_timeout(client, timeout_seconds)
             parsed = client.chat_json(messages=messages)
             if isinstance(parsed.payload, dict):
+                successful_source = source
+                successful_model = str(getattr(client, "model", "") or "")
+                successful_timeout_sec = timeout_seconds
+                successful_elapsed_ms = int((time.monotonic() - start) * 1000)
+                successful_repair = bool(getattr(parsed, "repair_applied", False))
+                successful_response_chars = len(json.dumps(parsed.payload, ensure_ascii=False))
+                attempts.append(
+                    {
+                        "source": source,
+                        "model": successful_model,
+                        "timeout_sec": timeout_seconds,
+                        "elapsed_ms": successful_elapsed_ms,
+                        "success": True,
+                        "repair_used": successful_repair,
+                        "timed_out": False,
+                        "error": "",
+                    }
+                )
+                if isinstance(diagnostics_out, dict):
+                    diagnostics_out.update(
+                        {
+                            "llm_source": successful_source,
+                            "llm_model": successful_model,
+                            "llm_timeout_sec": successful_timeout_sec,
+                            "llm_elapsed_ms": successful_elapsed_ms,
+                            "prompt_chars": prompt_chars,
+                            "response_chars": successful_response_chars,
+                            "timed_out": False,
+                            "fallback_used": bool(successful_source == "fallback"),
+                            "fallback_reason": (
+                                _fallback_reason_from_main_error(first_error)
+                                if successful_source == "fallback"
+                                else ""
+                            ),
+                            "json_valid": True,
+                            "repair_used": successful_repair,
+                            "attempts": attempts,
+                        }
+                    )
                 return parsed.payload, source
         except Exception as exc:
             last_error = str(exc)
+            if not first_error:
+                first_error = last_error
+            attempt_elapsed = 0
+            try:
+                attempt_elapsed = int((time.monotonic() - start) * 1000)  # type: ignore[name-defined]
+            except Exception:
+                attempt_elapsed = 0
+            attempt_timeout = _is_timeout_like_error(last_error)
+            timed_out = timed_out or attempt_timeout
+            cfg_selected = runtime.get(source, {}) if isinstance(runtime.get(source), dict) else {}
+            attempts.append(
+                {
+                    "source": source,
+                    "model": str(cfg_selected.get("model") or ""),
+                    "timeout_sec": timeout_seconds,
+                    "elapsed_ms": attempt_elapsed,
+                    "success": False,
+                    "repair_used": False,
+                    "timed_out": attempt_timeout,
+                    "error": last_error,
+                }
+            )
             if logger is not None:
                 logger.warning("%s failed on source=%s attempt=%s error=%s", log_prefix, source, idx + 1, exc)
             if repair_messages is not None:
                 try:
+                    repair_timeout_seconds = _source_timeout_from_runtime(
+                        runtime=runtime,
+                        source=source,
+                        timeout_overrides=repair_timeout_overrides,
+                    )
+                    repair_timeout_seconds = _apply_row_deadline_to_timeout(
+                        timeout_seconds=repair_timeout_seconds,
+                        row_deadline_monotonic=row_deadline_monotonic,
+                    )
+                    if repair_timeout_seconds <= 0:
+                        last_error = "row_hard_timeout_exceeded"
+                        timed_out = True
+                        break
                     client = _make_llm_client_from_runtime({**runtime, "selected": source})
                     if client is None:
                         continue
+                    client = _maybe_rebuild_client_with_timeout(client, repair_timeout_seconds)
+                    repair_start = time.monotonic()
                     parsed = client.chat_json(messages=repair_messages)
                     if isinstance(parsed.payload, dict):
+                        successful_source = source
+                        successful_model = str(getattr(client, "model", "") or "")
+                        successful_timeout_sec = repair_timeout_seconds
+                        successful_elapsed_ms = int((time.monotonic() - repair_start) * 1000)
+                        successful_repair = True
+                        successful_response_chars = len(json.dumps(parsed.payload, ensure_ascii=False))
+                        attempts.append(
+                            {
+                                "source": source,
+                                "model": successful_model,
+                                "timeout_sec": repair_timeout_seconds,
+                                "elapsed_ms": successful_elapsed_ms,
+                                "success": True,
+                                "repair_used": True,
+                                "timed_out": False,
+                                "error": "",
+                            }
+                        )
+                        if isinstance(diagnostics_out, dict):
+                            diagnostics_out.update(
+                                {
+                                    "llm_source": successful_source,
+                                    "llm_model": successful_model,
+                                    "llm_timeout_sec": successful_timeout_sec,
+                                    "llm_elapsed_ms": successful_elapsed_ms,
+                                    "prompt_chars": prompt_chars,
+                                    "response_chars": successful_response_chars,
+                                    "timed_out": False,
+                                    "fallback_used": bool(successful_source == "fallback"),
+                                    "fallback_reason": (
+                                        _fallback_reason_from_main_error(first_error)
+                                        if successful_source == "fallback"
+                                        else ""
+                                    ),
+                                    "json_valid": True,
+                                    "repair_used": True,
+                                    "attempts": attempts,
+                                }
+                            )
                         return parsed.payload, source
                 except Exception as exc2:
                     last_error = str(exc2)
+                    if not first_error:
+                        first_error = last_error
+                    timed_out = timed_out or _is_timeout_like_error(last_error)
                     if logger is not None:
                         logger.warning("%s repair failed on source=%s error=%s", log_prefix, source, exc2)
                     continue
+    if isinstance(diagnostics_out, dict):
+        diagnostics_out.update(
+            {
+                "llm_source": "",
+                "llm_model": "",
+                "llm_timeout_sec": 0,
+                "llm_elapsed_ms": 0,
+                "prompt_chars": prompt_chars,
+                "response_chars": 0,
+                "timed_out": bool(timed_out),
+                "fallback_used": False,
+                "fallback_reason": (
+                    _fallback_reason_from_main_error(first_error)
+                    if first_error and "fallback" in order
+                    else ""
+                ),
+                "json_valid": False,
+                "repair_used": False,
+                "attempts": attempts,
+            }
+        )
     return None, last_error
 
 
@@ -2245,6 +2883,9 @@ def _llm_chat_text_with_runtime(
     messages: list[dict[str, str]],
     logger: Any | None = None,
     log_prefix: str = "daily llm text",
+    timeout_overrides: dict[str, int] | None = None,
+    row_deadline_monotonic: float | None = None,
+    diagnostics_out: dict[str, Any] | None = None,
 ) -> tuple[str | None, str]:
     selected = str(runtime.get("selected") or "none")
     order: list[str] = []
@@ -2255,14 +2896,43 @@ def _llm_chat_text_with_runtime(
     if selected != "fallback" and bool(runtime.get("fallback_ok")):
         order.append("fallback")
     if not order:
+        if isinstance(diagnostics_out, dict):
+            diagnostics_out.update(
+                {
+                    "llm_source": "",
+                    "llm_model": "",
+                    "llm_timeout_sec": 0,
+                    "llm_elapsed_ms": 0,
+                    "prompt_chars": _messages_char_count(messages),
+                    "response_chars": 0,
+                    "timed_out": False,
+                    "fallback_used": False,
+                    "fallback_reason": "no_runtime",
+                    "json_valid": False,
+                    "repair_used": False,
+                    "attempts": [],
+                }
+            )
         return None, "no_runtime"
 
     last_error = "unknown_error"
+    first_error = ""
+    timed_out = False
+    prompt_chars = _messages_char_count(messages)
+    attempts: list[dict[str, Any]] = []
     for idx, source in enumerate(order):
         cfg = runtime.get(source, {}) if isinstance(runtime.get(source), dict) else {}
         base_url = str(cfg.get("base_url") or "").strip()
         model = str(cfg.get("model") or "").strip()
-        timeout_seconds = int(cfg.get("timeout_seconds") or 60)
+        timeout_seconds = _source_timeout_from_runtime(runtime=runtime, source=source, timeout_overrides=timeout_overrides)
+        timeout_seconds = _apply_row_deadline_to_timeout(
+            timeout_seconds=timeout_seconds,
+            row_deadline_monotonic=row_deadline_monotonic,
+        )
+        if timeout_seconds <= 0:
+            last_error = "row_hard_timeout_exceeded"
+            timed_out = True
+            break
         if not base_url or not model:
             continue
         payload = {
@@ -2278,6 +2948,7 @@ def _llm_chat_text_with_runtime(
             headers={"Content-Type": "application/json"},
             method="POST",
         )
+        start = time.monotonic()
         try:
             with urlopen(req, timeout=timeout_seconds) as response:
                 raw = response.read().decode("utf-8", errors="replace")
@@ -2285,6 +2956,40 @@ def _llm_chat_text_with_runtime(
             content = envelope.get("message", {}).get("content") if isinstance(envelope, dict) else ""
             text = str(content or "").strip()
             if text:
+                elapsed_ms = int((time.monotonic() - start) * 1000)
+                attempts.append(
+                    {
+                        "source": source,
+                        "model": model,
+                        "timeout_sec": timeout_seconds,
+                        "elapsed_ms": elapsed_ms,
+                        "success": True,
+                        "repair_used": False,
+                        "timed_out": False,
+                        "error": "",
+                    }
+                )
+                if isinstance(diagnostics_out, dict):
+                    diagnostics_out.update(
+                        {
+                            "llm_source": source,
+                            "llm_model": model,
+                            "llm_timeout_sec": timeout_seconds,
+                            "llm_elapsed_ms": elapsed_ms,
+                            "prompt_chars": prompt_chars,
+                            "response_chars": len(text),
+                            "timed_out": False,
+                            "fallback_used": bool(source == "fallback"),
+                            "fallback_reason": (
+                                _fallback_reason_from_main_error(first_error)
+                                if source == "fallback"
+                                else ""
+                            ),
+                            "json_valid": False,
+                            "repair_used": False,
+                            "attempts": attempts,
+                        }
+                    )
                 return text, source
             last_error = "empty_content"
         except HTTPError as exc:
@@ -2294,12 +2999,82 @@ def _llm_chat_text_with_runtime(
             except Exception:
                 preview = ""
             last_error = f"http_{exc.code}:{preview[:200]}"
+            if not first_error:
+                first_error = last_error
+            timed_out = timed_out or _is_timeout_like_error(last_error)
+            attempts.append(
+                {
+                    "source": source,
+                    "model": model,
+                    "timeout_sec": timeout_seconds,
+                    "elapsed_ms": int((time.monotonic() - start) * 1000),
+                    "success": False,
+                    "repair_used": False,
+                    "timed_out": _is_timeout_like_error(last_error),
+                    "error": last_error,
+                }
+            )
             if logger is not None:
                 logger.warning("%s failed on source=%s attempt=%s error=%s", log_prefix, source, idx + 1, last_error)
         except (URLError, TimeoutError, json.JSONDecodeError, RuntimeError) as exc:
             last_error = str(exc)
+            if not first_error:
+                first_error = last_error
+            timed_out = timed_out or _is_timeout_like_error(last_error)
+            attempts.append(
+                {
+                    "source": source,
+                    "model": model,
+                    "timeout_sec": timeout_seconds,
+                    "elapsed_ms": int((time.monotonic() - start) * 1000),
+                    "success": False,
+                    "repair_used": False,
+                    "timed_out": _is_timeout_like_error(last_error),
+                    "error": last_error,
+                }
+            )
             if logger is not None:
                 logger.warning("%s failed on source=%s attempt=%s error=%s", log_prefix, source, idx + 1, exc)
+        except Exception as exc:
+            last_error = str(exc)
+            if not first_error:
+                first_error = last_error
+            timed_out = timed_out or _is_timeout_like_error(last_error)
+            attempts.append(
+                {
+                    "source": source,
+                    "model": model,
+                    "timeout_sec": timeout_seconds,
+                    "elapsed_ms": int((time.monotonic() - start) * 1000),
+                    "success": False,
+                    "repair_used": False,
+                    "timed_out": _is_timeout_like_error(last_error),
+                    "error": last_error,
+                }
+            )
+            if logger is not None:
+                logger.warning("%s failed on source=%s attempt=%s error=%s", log_prefix, source, idx + 1, exc)
+    if isinstance(diagnostics_out, dict):
+        diagnostics_out.update(
+            {
+                "llm_source": "",
+                "llm_model": "",
+                "llm_timeout_sec": 0,
+                "llm_elapsed_ms": 0,
+                "prompt_chars": prompt_chars,
+                "response_chars": 0,
+                "timed_out": bool(timed_out),
+                "fallback_used": False,
+                "fallback_reason": (
+                    _fallback_reason_from_main_error(first_error)
+                    if first_error and "fallback" in order
+                    else ""
+                ),
+                "json_valid": False,
+                "repair_used": False,
+                "attempts": attempts,
+            }
+        )
     return None, last_error
 
 
@@ -2316,6 +3091,16 @@ def _date_only_from_iso(value: str) -> str:
         return text
     except Exception:
         return ""
+
+
+def _extract_period_from_source_name(source_name: str) -> tuple[str, str]:
+    text = str(source_name or "").strip()
+    if not text:
+        return "", ""
+    match = re.search(r"collect_period_(\d{4}-\d{2}-\d{2})_(\d{4}-\d{2}-\d{2})", text)
+    if not match:
+        return "", ""
+    return match.group(1), match.group(2)
 
 
 def _extract_anchor_call_timestamp(*, snapshot: dict[str, Any], selected_call_ids: list[str]) -> str:
@@ -2475,6 +3260,61 @@ def _filter_selected_by_business_window(
     return out, dropped
 
 
+def _filter_selected_by_manager_allowlist(
+    *,
+    cfg: DealAnalyzerConfig,
+    selected_items: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    allowlist_raw = [
+        " ".join(str(x or "").split()).strip().lower()
+        for x in (getattr(cfg, "daily_manager_allowlist", ()) or ())
+        if " ".join(str(x or "").split()).strip()
+    ]
+    if not allowlist_raw:
+        allowlist_raw = ["илья бочков", "рустам хомидов", "илья", "рустам"]
+
+    def _allowed(manager_name: str) -> bool:
+        manager_norm = " ".join(str(manager_name or "").split()).strip().lower()
+        if not manager_norm:
+            return False
+        manager_first = manager_norm.split(" ")[0]
+        for allowed in allowlist_raw:
+            if not allowed:
+                continue
+            allowed_first = allowed.split(" ")[0]
+            if manager_norm == allowed:
+                return True
+            if manager_norm in allowed or allowed in manager_norm:
+                return True
+            if manager_first and manager_first == allowed_first:
+                return True
+        return False
+
+    prepared: list[tuple[dict[str, Any], bool]] = []
+    matched_any = False
+    for item in selected_items:
+        if not isinstance(item, dict):
+            continue
+        manager = str(
+            item.get("anchor_manager_name")
+            or item.get("manager_name_from_call_author")
+            or item.get("owner_name")
+            or ""
+        )
+        is_allowed = _allowed(manager)
+        matched_any = matched_any or is_allowed
+        prepared.append((item, is_allowed))
+
+    # Safety mode for synthetic/test data: if allowlist didn't match anyone,
+    # do not zero-out shortlist.
+    if not matched_any:
+        return [item for item, _ in prepared], 0
+
+    out: list[dict[str, Any]] = [item for item, is_allowed in prepared if is_allowed]
+    dropped = len(prepared) - len(out)
+    return out, dropped
+
+
 def _normalize_call_review_case_mode(*, candidate: dict[str, Any], record: dict[str, Any]) -> str:
     raw = str(candidate.get("call_case_type") or "").strip().lower()
     if raw == "lpr_conversation":
@@ -2548,6 +3388,108 @@ def _call_review_case_has_meaningful_conversation(*, case_mode: str, candidate: 
     return bool(score >= 2 or has_next_step or has_lpr or has_text)
 
 
+def _call_review_adaptive_timeout_seconds(*, transcript_length_chars: int, model_name: str) -> int:
+    text_len = max(0, int(transcript_length_chars or 0))
+    if text_len <= 5000:
+        timeout = 300
+    elif text_len <= 15000:
+        timeout = 600
+    elif text_len <= 40000:
+        timeout = 900
+    else:
+        timeout = 1200
+    model = str(model_name or "").strip().lower()
+    if model.startswith("gemma4"):
+        timeout = max(timeout, 600)
+        if text_len > 15000:
+            timeout = max(timeout, 900)
+    return timeout
+
+
+def _is_local_gemma_runtime(*, model_name: str, base_url: str) -> bool:
+    model = str(model_name or "").strip().lower()
+    if not model.startswith("gemma4"):
+        return False
+    url = str(base_url or "").strip().lower()
+    return ("127.0.0.1" in url) or ("localhost" in url)
+
+
+def _fallback_reason_from_main_error(first_error: str) -> str:
+    text = str(first_error or "").strip()
+    if not text:
+        return ""
+    if _is_timeout_like_error(text):
+        return "main_timeout"
+    return "main_error"
+
+
+def _build_call_review_row_runtime(
+    *,
+    cfg: DealAnalyzerConfig,
+    runtime: dict[str, Any],
+    transcript_length_chars: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    row_runtime = dict(runtime or {})
+    threshold = max(1000, int(getattr(cfg, "call_review_gemma_route_max_transcript_chars", 12000) or 12000))
+    main_cfg = runtime.get("main", {}) if isinstance(runtime.get("main"), dict) else {}
+    main_model = str(main_cfg.get("model") or "")
+    main_base_url = str(main_cfg.get("base_url") or "")
+    forced_fallback = (
+        transcript_length_chars > threshold
+        and _is_local_gemma_runtime(model_name=main_model, base_url=main_base_url)
+        and bool(runtime.get("fallback_ok"))
+    )
+    if forced_fallback:
+        row_runtime["selected"] = "fallback"
+        row_runtime["reason"] = "main_transcript_too_long_use_fallback"
+        row_runtime["main_ok"] = False
+    return row_runtime, {
+        "transcript_length_chars": int(transcript_length_chars or 0),
+        "gemma_route_threshold_chars": threshold,
+        "forced_fallback_due_to_long_transcript": bool(forced_fallback),
+    }
+
+
+def _call_review_timeout_overrides_for_runtime(
+    *,
+    cfg: DealAnalyzerConfig,
+    runtime: dict[str, Any],
+    transcript_length_chars: int,
+    step_kind: str,
+) -> tuple[dict[str, int], dict[str, int]]:
+    source_timeouts: dict[str, int] = {}
+    repair_timeouts: dict[str, int] = {}
+    hard_cap = max(30, int(getattr(cfg, "call_review_row_hard_timeout_seconds", 1200) or 1200))
+    for source in ("main", "fallback"):
+        source_cfg = runtime.get(source, {}) if isinstance(runtime.get(source), dict) else {}
+        model = str(source_cfg.get("model") or "").strip()
+        base_url = str(source_cfg.get("base_url") or "").strip()
+        configured = int(source_cfg.get("timeout_seconds") or getattr(cfg, "ollama_timeout_seconds", 60) or 60)
+        adaptive = _call_review_adaptive_timeout_seconds(
+            transcript_length_chars=transcript_length_chars,
+            model_name=model,
+        )
+        if step_kind == "style_json":
+            timeout = int(getattr(cfg, "call_review_style_json_timeout_seconds", 300) or 300)
+        else:
+            timeout = max(configured, adaptive)
+        if _is_local_gemma_runtime(model_name=model, base_url=base_url):
+            if step_kind in {"structured_json", "style_json"}:
+                timeout = min(
+                    timeout,
+                    int(getattr(cfg, "local_gemma_structured_timeout_sec", 240) or 240),
+                )
+            else:
+                timeout = min(
+                    timeout,
+                    int(getattr(cfg, "local_gemma_generation_timeout_sec", 240) or 240),
+                )
+        source_timeouts[source] = max(1, min(int(timeout), hard_cap))
+        repair_timeout = int(getattr(cfg, "call_review_json_repair_timeout_seconds", 300) or 300)
+        repair_timeouts[source] = max(1, min(repair_timeout, hard_cap))
+    return source_timeouts, repair_timeouts
+
+
 def _sanitize_call_review_llm_fields(payload: dict[str, Any]) -> dict[str, str]:
     def _to_text(value: Any) -> str:
         if isinstance(value, (list, tuple)):
@@ -2580,6 +3522,10 @@ def _sanitize_call_review_llm_fields(payload: dict[str, Any]) -> dict[str, str]:
         return text[:limit]
 
     out = {
+        "primary_case_type": _s("primary_case_type", 80),
+        "relevant_stage_groups": _s("relevant_stage_groups", 420),
+        "one_main_issue": _s("one_main_issue", 320),
+        "evidence_by_stage": _s("evidence_by_stage", 900),
         "key_takeaway": _s("key_takeaway", 420),
         "strong_sides": _s("strong_sides", 420),
         "growth_zones": _s("growth_zones", 420),
@@ -2599,6 +3545,7 @@ def _sanitize_call_review_llm_fields(payload: dict[str, Any]) -> dict[str, str]:
         "stage_speech_comment": _s("stage_speech_comment", 320),
         "stage_crm_comment": _s("stage_crm_comment", 320),
         "stage_discipline_comment": _s("stage_discipline_comment", 320),
+        "stage_confirm_demo_comment": _s("stage_confirm_demo_comment", 320),
         "stage_demo_comment": _s("stage_demo_comment", 320),
         "stage_demo_intro_comment": _s("stage_demo_intro_comment", 320),
         "stage_demo_context_comment": _s("stage_demo_context_comment", 320),
@@ -2655,8 +3602,6 @@ def _call_review_llm_fields_ready(*, fields: dict[str, str], case_mode: str) -> 
     if case_mode == "secretary_analysis":
         if not secretary_stage:
             return False, "llm_missing_stage_secretary_comment"
-        if not need_stage:
-            return False, "llm_missing_stage_need_comment"
         return True, ""
 
     if case_mode == "presentation_analysis":
@@ -2702,6 +3647,118 @@ def _call_review_llm_fields_ready(*, fields: dict[str, str], case_mode: str) -> 
     if conversation_stage_count < 1:
         return False, "llm_missing_stage_comment_coverage"
     return True, ""
+
+
+def _classify_call_review_validation_reason(reason: str) -> str:
+    low = " ".join(str(reason or "").split()).strip().lower()
+    if low.startswith("llm_missing_stage_"):
+        return "missing_required_stage_comment"
+    if low.startswith("llm_missing_"):
+        return "validation_failed"
+    if low in {
+        "no_live_llm_runtime",
+        "free_form_generation_failed",
+        "effect_layer_generation_failed",
+        "structured_generation_failed",
+    }:
+        return "llm_not_ready"
+    if "timeout" in low or "timed out" in low or "connection" in low or "remote" in low:
+        return "llm_timeout"
+    return "validation_failed"
+
+
+def _repair_call_review_llm_fields(*, fields: dict[str, str], case_mode: str) -> tuple[dict[str, str], bool]:
+    out = dict(fields)
+    changed = False
+
+    def _set_if_empty(key: str, value: str) -> None:
+        nonlocal changed
+        if not str(out.get(key) or "").strip() and str(value or "").strip():
+            out[key] = str(value).strip()
+            changed = True
+
+    stage_hint = (
+        str(out.get("key_takeaway") or "").strip()
+        or str(out.get("fix_action") or "").strip()
+        or str(out.get("growth_zones") or "").strip()
+    )
+    _set_if_empty("key_takeaway", "По звонку есть рабочие сигналы, но часть шагов осталась без фиксации.")
+    _set_if_empty("strong_sides", "Сотрудник удерживал контакт и вел разговор без явного срыва.")
+    _set_if_empty("growth_zones", "Не хватает фиксации следующего шага и точных условий.")
+    _set_if_empty("fix_action", "Закрывать разговор на конкретный следующий шаг с датой и временем.")
+    _set_if_empty("why_important", "Когда шаг зафиксирован, сделка не провисает и легче доводится до результата.")
+    _set_if_empty("reinforce", "Держать структуру разговора и подтверждать договоренности вслух.")
+    _set_if_empty(
+        "coaching_list",
+        "1) Разобрали, где теряется следующий шаг.\n2) Дали шаблон фиксации договоренности.\n3) В следующих звонках тестирует закрытие на дату и время.",
+    )
+    _set_if_empty("expected_quantity", "0.2-0.5 шага в работу за неделю")
+    _set_if_empty("expected_quality", "Больше управляемости по сделке и меньше провисаний после звонка.")
+    _set_if_empty("one_main_issue", out.get("growth_zones", ""))
+
+    if case_mode == "test_analysis":
+        _set_if_empty("primary_case_type", "работа с тестом")
+        _set_if_empty("relevant_stage_groups", "[\"test\",\"speech\",\"crm\"]")
+        _set_if_empty("stage_test_launch_comment", stage_hint or "Тест обсуждали, но запуск зафиксирован неполно.")
+        _set_if_empty("stage_test_criteria_comment", "Критерии успеха теста нужно зафиксировать в явном виде.")
+        _set_if_empty("stage_test_owners_comment", "Ответственных и сроки по тесту лучше назвать прямо в звонке.")
+        _set_if_empty("stage_test_support_comment", "Сопровождение теста обозначено частично, без четкого плана.")
+        _set_if_empty("stage_test_feedback_comment", "Нужна договоренность, когда и как собираем обратную связь.")
+        _set_if_empty("stage_test_objections_comment", "Возражения после теста нужно разбирать до перехода к следующему шагу.")
+        _set_if_empty("stage_test_comment", "Блок теста обсуждался, но часть обязательных фиксаций не доведена до конца.")
+    elif case_mode == "presentation_analysis":
+        _set_if_empty("primary_case_type", "презентация")
+        _set_if_empty("relevant_stage_groups", "[\"demo\",\"speech\",\"crm\"]")
+        _set_if_empty("stage_confirm_demo_comment", "Подтверждение демо проговорено частично, без полной фиксации деталей.")
+        _set_if_empty("stage_demo_intro_comment", stage_hint or "Старт демо есть, но рамка встречи обозначена слабо.")
+        _set_if_empty("stage_demo_context_comment", "Перед показом стоит точнее уточнять контекст клиента.")
+        _set_if_empty("stage_demo_relevant_comment", "Показывать только релевантный сценарий под задачу клиента.")
+        _set_if_empty("stage_demo_comment", "Демо обсуждали, но нужна более четкая фиксация результата и следующего шага.")
+    elif case_mode == "dozhim_analysis":
+        _set_if_empty("primary_case_type", "дожим")
+        _set_if_empty("relevant_stage_groups", "[\"dozhim\",\"speech\",\"crm\"]")
+        _set_if_empty("stage_dozhim_recontact_comment", stage_hint or "Повторный контакт по дожиму был, но без четкой рамки.")
+        _set_if_empty("stage_dozhim_terms_comment", "Условия и кп нужно согласовывать конкретнее.")
+        _set_if_empty("stage_dozhim_comment", "Дожим есть, но решение не зафиксировано в явном виде.")
+    elif case_mode == "secretary_analysis":
+        _set_if_empty("primary_case_type", "разговор с секретарем")
+        _set_if_empty("relevant_stage_groups", "[\"secretary\",\"speech\",\"crm\"]")
+        _set_if_empty("stage_secretary_comment", stage_hint or "Контакт с секретарем был, маршрут до лпр нужно уточнять точнее.")
+    else:
+        _set_if_empty("primary_case_type", "разговор с лпр")
+        _set_if_empty("relevant_stage_groups", "[\"lpr\",\"need\",\"speech\",\"crm\"]")
+        _set_if_empty("stage_lpr_comment", stage_hint or "Контакт с лпр есть, но цель звонка обозначена нечетко.")
+        _set_if_empty("stage_need_comment", "Потребность выявлена частично, не хватает уточняющих вопросов.")
+    return out, changed
+
+
+def _safe_fallback_call_review_fields(*, fields: dict[str, str], case_mode: str) -> dict[str, str]:
+    out = dict(fields)
+    out, _ = _repair_call_review_llm_fields(fields=out, case_mode=case_mode)
+
+    def _force_stage(stage_key: str, text: str) -> None:
+        if not str(out.get(stage_key) or "").strip():
+            out[stage_key] = text
+
+    if case_mode == "test_analysis":
+        _force_stage("stage_test_launch_comment", "н/п")
+        _force_stage("stage_test_criteria_comment", "н/п")
+        _force_stage("stage_test_owners_comment", "н/п")
+        _force_stage("stage_test_support_comment", "н/п")
+        _force_stage("stage_test_feedback_comment", "н/п")
+        _force_stage("stage_test_objections_comment", "н/п")
+        _force_stage("stage_test_comment", "По звонку не хватило фактуры по блоку теста, поэтому оставили нейтральную отметку.")
+    if case_mode == "presentation_analysis":
+        _force_stage("stage_confirm_demo_comment", "н/п")
+        _force_stage("stage_demo_intro_comment", "н/п")
+        _force_stage("stage_demo_context_comment", "н/п")
+        _force_stage("stage_demo_relevant_comment", "н/п")
+        _force_stage("stage_demo_comment", "По звонку не хватило прямой фактуры по демонстрации, оставили нейтральную отметку.")
+    if case_mode == "dozhim_analysis":
+        _force_stage("stage_dozhim_recontact_comment", "н/п")
+        _force_stage("stage_dozhim_terms_comment", "н/п")
+        _force_stage("stage_dozhim_comment", "По звонку не хватило фактуры по дожиму, оставили нейтральную отметку.")
+    return out
 
 
 def _resolve_call_review_anchor_context(*, record: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
@@ -2834,6 +3891,24 @@ def _prepare_call_review_llm_fields(
     llm_sources: Counter[str] = Counter()
     failed_steps: Counter[str] = Counter()
     step_artifacts_written = 0
+    llm_timeout_rows = 0
+    llm_json_repair_rows = 0
+    llm_source_rows: Counter[str] = Counter()
+    llm_elapsed_by_source: dict[str, list[int]] = {"main": [], "fallback": []}
+    llm_timeout_by_source: Counter[str] = Counter()
+
+    def _collect_timeout_attempts(step_diag: dict[str, Any]) -> None:
+        attempts = step_diag.get("attempts", []) if isinstance(step_diag, dict) else []
+        if not isinstance(attempts, list):
+            return
+        for attempt in attempts:
+            if not isinstance(attempt, dict):
+                continue
+            source = str(attempt.get("source") or "").strip()
+            if source not in {"main", "fallback"}:
+                continue
+            if bool(attempt.get("timed_out")):
+                llm_timeout_by_source[source] += 1
 
     if step_artifacts_root is not None:
         try:
@@ -2858,6 +3933,7 @@ def _prepare_call_review_llm_fields(
                 reason = "skip_no_meaningful_case"
             record["call_review_llm_ready"] = False
             record["call_review_llm_error"] = reason
+            record["call_review_llm_error_category"] = "case_gated"
             skipped += 1
             skipped_reasons[reason] += 1
             continue
@@ -2866,6 +3942,7 @@ def _prepare_call_review_llm_fields(
             reason = "no_live_llm_runtime"
             record["call_review_llm_ready"] = False
             record["call_review_llm_error"] = reason
+            record["call_review_llm_error_category"] = "llm_not_ready"
             skipped += 1
             skipped_reasons[reason] += 1
             continue
@@ -2884,6 +3961,41 @@ def _prepare_call_review_llm_fields(
         record["call_review_anchor_call_timestamp"] = str(anchor_ctx.get("timestamp") or "")
         record["call_review_anchor_call_duration_seconds"] = int(anchor_ctx.get("duration_seconds", 0) or 0)
         record["call_review_anchor_resolution_source"] = str(anchor_ctx.get("source") or "")
+        transcript_length_chars = int(record.get("transcript_text_len", 0) or 0)
+        if transcript_length_chars <= 0:
+            transcript_length_chars = len(str(record.get("transcript_text_excerpt") or ""))
+        row_runtime, row_runtime_routing = _build_call_review_row_runtime(
+            cfg=cfg,
+            runtime=runtime,
+            transcript_length_chars=transcript_length_chars,
+        )
+        row_started_monotonic = time.monotonic()
+        row_hard_timeout_sec = max(30, int(getattr(cfg, "call_review_row_hard_timeout_seconds", 1200) or 1200))
+        row_deadline_monotonic = row_started_monotonic + row_hard_timeout_sec
+        generation_timeouts, generation_repair_timeouts = _call_review_timeout_overrides_for_runtime(
+            cfg=cfg,
+            runtime=row_runtime,
+            transcript_length_chars=transcript_length_chars,
+            step_kind="generation",
+        )
+        structured_timeouts, structured_repair_timeouts = _call_review_timeout_overrides_for_runtime(
+            cfg=cfg,
+            runtime=row_runtime,
+            transcript_length_chars=transcript_length_chars,
+            step_kind="structured_json",
+        )
+        style_timeouts, style_repair_timeouts = _call_review_timeout_overrides_for_runtime(
+            cfg=cfg,
+            runtime=row_runtime,
+            transcript_length_chars=transcript_length_chars,
+            step_kind="style_json",
+        )
+        llm_runtime_metrics: dict[str, Any] = {
+            "transcript_length_chars": transcript_length_chars,
+            "row_hard_timeout_sec": row_hard_timeout_sec,
+            "routing": row_runtime_routing,
+            "steps": {},
+        }
         base_mix = build_base_mix_text_priority([record])
         factual_payload = {
             "deal_id": did,
@@ -2927,26 +4039,41 @@ def _prepare_call_review_llm_fields(
             style_source_excerpt=style_source_excerpt,
             style_mode=str(getattr(cfg, "daily_style_mode", "mild") or "mild"),
         )
+        free_diag: dict[str, Any] = {}
         free_text, free_source = _llm_chat_text_with_runtime(
-            runtime=runtime,
+            runtime=row_runtime,
             messages=free_messages,
             logger=logger,
             log_prefix=f"call review step_free deal={did}",
+            timeout_overrides=generation_timeouts,
+            row_deadline_monotonic=row_deadline_monotonic,
+            diagnostics_out=free_diag,
         )
+        _collect_timeout_attempts(free_diag)
+        free_diag["transcript_length_chars"] = transcript_length_chars
+        llm_runtime_metrics["steps"]["free_form"] = free_diag
         if not free_text:
+            is_timeout = _is_timeout_like_error(str(free_source or "")) or bool(free_diag.get("timed_out"))
             record["call_review_llm_ready"] = False
-            record["call_review_llm_error"] = "free_form_generation_failed"
+            record["call_review_llm_error"] = "llm_timeout:free_form" if is_timeout else "free_form_generation_failed"
+            record["call_review_llm_error_category"] = "llm_timeout" if is_timeout else "llm_not_ready"
+            if is_timeout:
+                llm_timeout_rows += 1
             if row_artifacts_dir is not None:
                 artifacts["02_free_form_error"] = _write_step_artifact(
                     row_artifacts_dir / "02_free_form_error.json",
-                    {"error": free_source or "free_form_generation_failed"},
+                    {"error": free_source or "free_form_generation_failed", "runtime": free_diag},
                 )
                 step_artifacts_written += 1
             failed += 1
             failed_steps["free_form"] += 1
-            skipped_reasons["free_form_generation_failed"] += 1
+            skipped_reasons["llm_timeout" if is_timeout else "free_form_generation_failed"] += 1
+            llm_runtime_metrics["row_elapsed_ms"] = int((time.monotonic() - row_started_monotonic) * 1000)
+            record["call_review_llm_runtime_metrics"] = llm_runtime_metrics
             continue
         source_by_step["free_form"] = str(free_source or "")
+        if bool(free_diag.get("repair_used")):
+            llm_json_repair_rows += 1
         if row_artifacts_dir is not None:
             artifacts["02_free_form"] = _write_step_artifact(row_artifacts_dir / "02_free_form.md", free_text)
             step_artifacts_written += 1
@@ -2956,26 +4083,41 @@ def _prepare_call_review_llm_fields(
             free_form_text=str(free_text),
             style_mode=str(getattr(cfg, "daily_style_mode", "mild") or "mild"),
         )
+        effect_diag: dict[str, Any] = {}
         effect_text, effect_source = _llm_chat_text_with_runtime(
-            runtime=runtime,
+            runtime=row_runtime,
             messages=effect_messages,
             logger=logger,
             log_prefix=f"call review step_effect deal={did}",
+            timeout_overrides=generation_timeouts,
+            row_deadline_monotonic=row_deadline_monotonic,
+            diagnostics_out=effect_diag,
         )
+        _collect_timeout_attempts(effect_diag)
+        effect_diag["transcript_length_chars"] = transcript_length_chars
+        llm_runtime_metrics["steps"]["effect_layer"] = effect_diag
         if not effect_text:
+            is_timeout = _is_timeout_like_error(str(effect_source or "")) or bool(effect_diag.get("timed_out"))
             record["call_review_llm_ready"] = False
-            record["call_review_llm_error"] = "effect_layer_generation_failed"
+            record["call_review_llm_error"] = "llm_timeout:effect_layer" if is_timeout else "effect_layer_generation_failed"
+            record["call_review_llm_error_category"] = "llm_timeout" if is_timeout else "llm_not_ready"
+            if is_timeout:
+                llm_timeout_rows += 1
             if row_artifacts_dir is not None:
                 artifacts["03_effect_error"] = _write_step_artifact(
                     row_artifacts_dir / "03_effect_error.json",
-                    {"error": effect_source or "effect_layer_generation_failed"},
+                    {"error": effect_source or "effect_layer_generation_failed", "runtime": effect_diag},
                 )
                 step_artifacts_written += 1
             failed += 1
             failed_steps["effect_layer"] += 1
-            skipped_reasons["effect_layer_generation_failed"] += 1
+            skipped_reasons["llm_timeout" if is_timeout else "effect_layer_generation_failed"] += 1
+            llm_runtime_metrics["row_elapsed_ms"] = int((time.monotonic() - row_started_monotonic) * 1000)
+            record["call_review_llm_runtime_metrics"] = llm_runtime_metrics
             continue
         source_by_step["effect_layer"] = str(effect_source or "")
+        if bool(effect_diag.get("repair_used")):
+            llm_json_repair_rows += 1
         if row_artifacts_dir is not None:
             artifacts["03_effect_layer"] = _write_step_artifact(row_artifacts_dir / "03_effect_layer.md", effect_text)
             step_artifacts_written += 1
@@ -2989,27 +4131,43 @@ def _prepare_call_review_llm_fields(
             style_mode=str(getattr(cfg, "daily_style_mode", "mild") or "mild"),
         )
         repaired = append_call_review_case_json_repair_instruction(messages)
+        structured_diag: dict[str, Any] = {}
         payload, source = _llm_chat_json_with_runtime(
-            runtime=runtime,
+            runtime=row_runtime,
             messages=messages,
             repair_messages=repaired,
             logger=logger,
             log_prefix=f"call review step_structured deal={did}",
+            timeout_overrides=structured_timeouts,
+            repair_timeout_overrides=structured_repair_timeouts,
+            row_deadline_monotonic=row_deadline_monotonic,
+            diagnostics_out=structured_diag,
         )
+        _collect_timeout_attempts(structured_diag)
+        structured_diag["transcript_length_chars"] = transcript_length_chars
+        llm_runtime_metrics["steps"]["structured_json"] = structured_diag
         if not isinstance(payload, dict):
+            is_timeout = _is_timeout_like_error(str(source or "")) or bool(structured_diag.get("timed_out"))
             record["call_review_llm_ready"] = False
-            record["call_review_llm_error"] = "structured_generation_failed"
+            record["call_review_llm_error"] = "llm_timeout:structured_json" if is_timeout else "structured_generation_failed"
+            record["call_review_llm_error_category"] = "llm_timeout" if is_timeout else "llm_not_ready"
+            if is_timeout:
+                llm_timeout_rows += 1
             if row_artifacts_dir is not None:
                 artifacts["04_structured_error"] = _write_step_artifact(
                     row_artifacts_dir / "04_structured_error.json",
-                    {"error": source or "structured_generation_failed"},
+                    {"error": source or "structured_generation_failed", "runtime": structured_diag},
                 )
                 step_artifacts_written += 1
             failed += 1
             failed_steps["structured_json"] += 1
-            skipped_reasons["structured_generation_failed"] += 1
+            skipped_reasons["llm_timeout" if is_timeout else "structured_generation_failed"] += 1
+            llm_runtime_metrics["row_elapsed_ms"] = int((time.monotonic() - row_started_monotonic) * 1000)
+            record["call_review_llm_runtime_metrics"] = llm_runtime_metrics
             continue
         source_by_step["structured_json"] = str(source or "")
+        if bool(structured_diag.get("repair_used")):
+            llm_json_repair_rows += 1
         fields = _sanitize_call_review_llm_fields(payload)
         if row_artifacts_dir is not None:
             artifacts["04_structured_json"] = _write_step_artifact(row_artifacts_dir / "04_structured_json.json", fields)
@@ -3020,35 +4178,89 @@ def _prepare_call_review_llm_fields(
             style_source_excerpt=style_source_excerpt,
             style_mode=str(getattr(cfg, "daily_style_mode", "mild") or "mild"),
         )
+        style_diag: dict[str, Any] = {}
         styled_payload, styled_source = _llm_chat_json_with_runtime(
-            runtime=runtime,
+            runtime=row_runtime,
             messages=style_messages,
             repair_messages=append_call_review_case_json_repair_instruction(style_messages),
             logger=logger,
             log_prefix=f"call review step_style deal={did}",
+            timeout_overrides=style_timeouts,
+            repair_timeout_overrides=style_repair_timeouts,
+            row_deadline_monotonic=row_deadline_monotonic,
+            diagnostics_out=style_diag,
         )
+        _collect_timeout_attempts(style_diag)
+        style_diag["transcript_length_chars"] = transcript_length_chars
+        llm_runtime_metrics["steps"]["style_rewrite"] = style_diag
         styled_fields = fields
         if isinstance(styled_payload, dict):
             styled_fields = _sanitize_call_review_llm_fields(styled_payload)
             source_by_step["style_rewrite"] = str(styled_source or "")
+            if bool(style_diag.get("repair_used")):
+                llm_json_repair_rows += 1
             if row_artifacts_dir is not None:
                 artifacts["05_style_json"] = _write_step_artifact(row_artifacts_dir / "05_style_json.json", styled_fields)
                 step_artifacts_written += 1
 
         ready, reason = _call_review_llm_fields_ready(fields=styled_fields, case_mode=case_mode)
+        repair_applied = False
+        safe_fallback_used = False
+        validation_failed_after_repair = False
         if not ready:
-            record["call_review_llm_ready"] = False
-            record["call_review_llm_error"] = reason or "llm_fields_incomplete"
-            if row_artifacts_dir is not None:
-                artifacts["06_validation_error"] = _write_step_artifact(
-                    row_artifacts_dir / "06_validation_error.json",
-                    {"error": reason or "llm_fields_incomplete", "fields": styled_fields},
-                )
-                step_artifacts_written += 1
-            failed += 1
-            failed_steps["validation"] += 1
-            skipped_reasons[reason or "llm_fields_incomplete"] += 1
-            continue
+            reason_text = str(reason or "llm_fields_incomplete")
+            reason_category = _classify_call_review_validation_reason(reason_text)
+            repaired_fields, changed = _repair_call_review_llm_fields(fields=styled_fields, case_mode=case_mode)
+            if changed:
+                repair_applied = True
+                styled_fields = repaired_fields
+                ready, reason = _call_review_llm_fields_ready(fields=styled_fields, case_mode=case_mode)
+                if row_artifacts_dir is not None:
+                    artifacts["06a_validation_repair"] = _write_step_artifact(
+                        row_artifacts_dir / "06a_validation_repair.json",
+                        {
+                            "reason_before_repair": reason_text,
+                            "reason_category": reason_category,
+                            "repaired_fields": styled_fields,
+                        },
+                    )
+                    step_artifacts_written += 1
+            if not ready and reason_category in {"validation_failed", "missing_required_stage_comment"}:
+                styled_fields = _safe_fallback_call_review_fields(fields=styled_fields, case_mode=case_mode)
+                safe_fallback_used = True
+                ready, reason = _call_review_llm_fields_ready(fields=styled_fields, case_mode=case_mode)
+                if row_artifacts_dir is not None:
+                    artifacts["06b_safe_fallback"] = _write_step_artifact(
+                        row_artifacts_dir / "06b_safe_fallback.json",
+                        {
+                            "reason_before_fallback": reason_text,
+                            "reason_category": reason_category,
+                            "fallback_fields": styled_fields,
+                        },
+                    )
+                    step_artifacts_written += 1
+            if not ready:
+                validation_failed_after_repair = reason_category in {"validation_failed", "missing_required_stage_comment"}
+                record["call_review_llm_ready"] = False
+                record["call_review_llm_error"] = f"{reason_category}:{reason or reason_text}"
+                record["call_review_llm_error_category"] = reason_category
+                record["call_review_llm_repair_applied"] = repair_applied
+                record["call_review_llm_safe_fallback_used"] = safe_fallback_used
+                record["call_review_validation_failed_after_repair"] = validation_failed_after_repair
+                if row_artifacts_dir is not None:
+                    artifacts["06_validation_error"] = _write_step_artifact(
+                        row_artifacts_dir / "06_validation_error.json",
+                        {"error": reason or reason_text, "error_category": reason_category, "fields": styled_fields},
+                    )
+                    step_artifacts_written += 1
+                failed += 1
+                failed_steps["validation"] += 1
+                skipped_reasons[reason_category] += 1
+                if reason_category == "llm_timeout":
+                    llm_timeout_rows += 1
+                llm_runtime_metrics["row_elapsed_ms"] = int((time.monotonic() - row_started_monotonic) * 1000)
+                record["call_review_llm_runtime_metrics"] = llm_runtime_metrics
+                continue
 
         if row_artifacts_dir is not None:
             artifacts["06_final_assemble"] = _write_step_artifact(
@@ -3060,7 +4272,29 @@ def _prepare_call_review_llm_fields(
         record["call_review_llm_ready"] = True
         record["call_review_llm_source"] = str(source_by_step.get("style_rewrite") or source_by_step.get("structured_json") or source or "")
         record["call_review_llm_error"] = ""
+        record["call_review_llm_error_category"] = ""
+        record["call_review_llm_repair_applied"] = repair_applied
+        record["call_review_llm_safe_fallback_used"] = safe_fallback_used
+        record["call_review_validation_failed_after_repair"] = validation_failed_after_repair
         record["call_review_llm_fields"] = styled_fields
+        final_step = (
+            llm_runtime_metrics.get("steps", {}).get("style_rewrite")
+            or llm_runtime_metrics.get("steps", {}).get("structured_json")
+            or llm_runtime_metrics.get("steps", {}).get("effect_layer")
+            or llm_runtime_metrics.get("steps", {}).get("free_form")
+            or {}
+        )
+        final_source = str(final_step.get("llm_source") or record["call_review_llm_source"] or "")
+        if final_source in {"main", "fallback"}:
+            llm_source_rows[final_source] += 1
+            llm_elapsed_by_source.setdefault(final_source, []).append(int(final_step.get("llm_elapsed_ms", 0) or 0))
+        if bool(final_step.get("repair_used")):
+            llm_json_repair_rows += 1
+        llm_runtime_metrics["row_elapsed_ms"] = int((time.monotonic() - row_started_monotonic) * 1000)
+        llm_runtime_metrics["timed_out"] = bool(
+            any(bool((step_payload or {}).get("timed_out")) for step_payload in llm_runtime_metrics.get("steps", {}).values())
+        )
+        record["call_review_llm_runtime_metrics"] = llm_runtime_metrics
         record["call_review_llm_provenance"] = {
             "source": str(source or ""),
             "source_by_step": source_by_step,
@@ -3079,6 +4313,7 @@ def _prepare_call_review_llm_fields(
                 for x in (reference_stack.get("prompt_snippets", []) if isinstance(reference_stack.get("prompt_snippets"), list) else [])
                 if isinstance(x, dict) and str(x.get("source") or "").strip()
             ],
+            "runtime_metrics": llm_runtime_metrics,
         }
         generated += 1
         llm_sources[str(source_by_step.get("style_rewrite") or source_by_step.get("structured_json") or source or "unknown")] += 1
@@ -3086,10 +4321,38 @@ def _prepare_call_review_llm_fields(
     return {
         "selected_runtime": selected_runtime,
         "generated_rows": generated,
+        "rows_prepared": generated,
         "failed_rows": failed,
         "skipped_rows": skipped,
         "skip_reasons": dict(skipped_reasons),
         "llm_sources": dict(llm_sources),
+        "llm_source_rows": dict(llm_source_rows),
+        "main_rows_count": int(llm_source_rows.get("main", 0) or 0),
+        "fallback_rows_count": int(llm_source_rows.get("fallback", 0) or 0),
+        "llm_timeout_rows": int(llm_timeout_rows),
+        "main_timeout_count": int(llm_timeout_by_source.get("main", 0) or 0),
+        "fallback_timeout_count": int(llm_timeout_by_source.get("fallback", 0) or 0),
+        "llm_json_repair_count": int(llm_json_repair_rows),
+        "llm_elapsed_ms_by_source": {
+            source: {
+                "avg": round(sum(values) / len(values), 2) if values else 0,
+                "max": max(values) if values else 0,
+                "count": len(values),
+            }
+            for source, values in llm_elapsed_by_source.items()
+        },
+        "main_avg_elapsed_ms": (
+            round(sum(llm_elapsed_by_source.get("main", [])) / len(llm_elapsed_by_source.get("main", [])), 2)
+            if llm_elapsed_by_source.get("main")
+            else 0
+        ),
+        "fallback_avg_elapsed_ms": (
+            round(sum(llm_elapsed_by_source.get("fallback", [])) / len(llm_elapsed_by_source.get("fallback", [])), 2)
+            if llm_elapsed_by_source.get("fallback")
+            else 0
+        ),
+        "main_model": str((runtime.get("main", {}) or {}).get("model") or ""),
+        "fallback_model": str((runtime.get("fallback", {}) or {}).get("model") or ""),
         "failed_steps": dict(failed_steps),
         "step_artifacts_written": int(step_artifacts_written),
         "step_artifacts_root": str(step_artifacts_root) if step_artifacts_root is not None else "",
@@ -3400,6 +4663,13 @@ def _try_live_refresh_period_rows(
     fallback_rows: list[dict[str, Any]],
     fallback_raw_bundles: dict[str, dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], dict[str, Any]]:
+    probe_ids = ("31134627", "31860325", "31937760")
+    candidate_source_mode = (
+        str(getattr(cfg, "live_refresh_candidate_source", "created_or_updated") or "").strip().lower()
+        or "created_or_updated"
+    )
+    if candidate_source_mode not in {"created_at", "updated_at", "created_or_updated"}:
+        candidate_source_mode = "created_or_updated"
     diag: dict[str, Any] = {
         "mode": "fallback_input_json",
         "api_first_attempted": False,
@@ -3408,6 +4678,22 @@ def _try_live_refresh_period_rows(
         "rows_from_api": 0,
         "rows_final": len(fallback_rows),
         "error": "",
+        "candidate_source_mode": candidate_source_mode,
+        "source_created_at_count": 0,
+        "source_updated_at_count": 0,
+        "merged_deals_count": 0,
+        "only_created_count": 0,
+        "only_updated_count": 0,
+        "both_created_and_updated_count": 0,
+        "probe_deals_source_presence": {
+            probe: {
+                "found_in_created_at": False,
+                "found_in_updated_at": False,
+                "found_in_merged": False,
+            }
+            for probe in probe_ids
+        },
+        "probe_deals_direct_api": {},
     }
     if not bool(getattr(cfg, "period_live_refresh_enabled", True)):
         diag["error"] = "period_live_refresh_disabled"
@@ -3454,6 +4740,8 @@ def _try_live_refresh_period_rows(
         )
 
         fetched: list[dict[str, Any]] = []
+        fetched_created: list[dict[str, Any]] = []
+        fetched_updated: list[dict[str, Any]] = []
         page = 1
         users_cache = client.get_users_cache()
         status_cache = client.get_status_cache()
@@ -3463,7 +4751,7 @@ def _try_live_refresh_period_rows(
             for p in client.get_pipelines_cache()
             if isinstance(p, dict) and isinstance(p.get("id"), int)
         }
-        while True:
+        while candidate_source_mode in {"created_at", "created_or_updated"}:
             batch = client.get_leads_by_period(
                 date_from_unix=date_from_unix,
                 date_to_unix=date_to_unix,
@@ -3472,10 +4760,73 @@ def _try_live_refresh_period_rows(
             )
             if not batch:
                 break
-            fetched.extend(batch)
+            fetched_created.extend(batch)
             if len(batch) < 250:
                 break
             page += 1
+
+        page = 1
+        while candidate_source_mode in {"updated_at", "created_or_updated"}:
+            batch = client.get_leads_by_updated_period(
+                date_from_unix=date_from_unix,
+                date_to_unix=date_to_unix,
+                page=page,
+                limit=250,
+            )
+            if not batch:
+                break
+            fetched_updated.extend(batch)
+            if len(batch) < 250:
+                break
+            page += 1
+
+        created_by_id: dict[str, dict[str, Any]] = {
+            str(lead.get("id") or "").strip(): lead
+            for lead in fetched_created
+            if isinstance(lead, dict) and str(lead.get("id") or "").strip()
+        }
+        updated_by_id: dict[str, dict[str, Any]] = {
+            str(lead.get("id") or "").strip(): lead
+            for lead in fetched_updated
+            if isinstance(lead, dict) and str(lead.get("id") or "").strip()
+        }
+        merged_by_id: dict[str, dict[str, Any]] = {}
+        for did, lead in created_by_id.items():
+            merged_by_id[did] = dict(lead)
+        for did, lead in updated_by_id.items():
+            # Prefer updated_at source if duplicate id appears in both sources.
+            merged_by_id[did] = dict(lead)
+        fetched = list(merged_by_id.values())
+
+        only_created = sorted(set(created_by_id.keys()) - set(updated_by_id.keys()))
+        only_updated = sorted(set(updated_by_id.keys()) - set(created_by_id.keys()))
+        both = sorted(set(updated_by_id.keys()) & set(created_by_id.keys()))
+        diag["source_created_at_count"] = len(created_by_id)
+        diag["source_updated_at_count"] = len(updated_by_id)
+        diag["merged_deals_count"] = len(merged_by_id)
+        diag["only_created_count"] = len(only_created)
+        diag["only_updated_count"] = len(only_updated)
+        diag["both_created_and_updated_count"] = len(both)
+        for probe in probe_ids:
+            diag["probe_deals_source_presence"][probe] = {
+                "found_in_created_at": bool(probe in created_by_id),
+                "found_in_updated_at": bool(probe in updated_by_id),
+                "found_in_merged": bool(probe in merged_by_id),
+            }
+
+        missing_in_updated = [
+            probe
+            for probe in probe_ids
+            if candidate_source_mode in {"updated_at", "created_or_updated"} and probe not in updated_by_id
+        ]
+        if missing_in_updated:
+            diag["probe_deals_direct_api"] = _probe_deals_via_direct_api(
+                client=client,
+                deal_ids=missing_in_updated,
+                users_cache=users_cache,
+                status_cache=status_cache,
+                pipeline_names=pipeline_names,
+            )
 
         existing_by_id: dict[str, dict[str, Any]] = {
             str(row.get("deal_id") or row.get("amo_lead_id") or ""): dict(row)
@@ -3557,6 +4908,70 @@ def _try_live_refresh_period_rows(
 
     diag["rows_final"] = len(fallback_rows)
     return fallback_rows, fallback_raw_bundles, diag
+
+
+def _probe_deals_via_direct_api(
+    *,
+    client: AmoCollectorClient,
+    deal_ids: list[str],
+    users_cache: dict[int, dict[str, Any]],
+    status_cache: dict[tuple[int, int], dict[str, Any]],
+    pipeline_names: dict[int, str],
+) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for deal_id in deal_ids:
+        did = str(deal_id or "").strip()
+        if not did.isdigit():
+            continue
+        entry: dict[str, Any] = {
+            "lead_exists": False,
+            "created_at": "",
+            "updated_at": "",
+            "responsible_user_name": "",
+            "pipeline_name": "",
+            "status_name": "",
+            "notes_count": 0,
+            "calls_count_from_notes": 0,
+            "longest_call_duration_seconds": 0,
+            "error": "",
+        }
+        try:
+            lead = client.get_lead(int(did))
+            entry["lead_exists"] = True
+            entry["created_at"] = lead.get("created_at") or ""
+            entry["updated_at"] = lead.get("updated_at") or ""
+            pipeline_id = int(lead.get("pipeline_id")) if isinstance(lead.get("pipeline_id"), int) else None
+            status_id = int(lead.get("status_id")) if isinstance(lead.get("status_id"), int) else None
+            responsible_user_id = int(lead.get("responsible_user_id")) if isinstance(lead.get("responsible_user_id"), int) else None
+            if isinstance(pipeline_id, int):
+                entry["pipeline_name"] = str(pipeline_names.get(pipeline_id) or "")
+            if isinstance(pipeline_id, int) and isinstance(status_id, int):
+                entry["status_name"] = str(status_cache.get((pipeline_id, status_id), {}).get("name") or "")
+            if isinstance(responsible_user_id, int):
+                entry["responsible_user_name"] = str(users_cache.get(responsible_user_id, {}).get("name") or "")
+            notes = client.get_notes_by_lead(int(did))
+            entry["notes_count"] = len(notes) if isinstance(notes, list) else 0
+            call_notes = [
+                note
+                for note in (notes if isinstance(notes, list) else [])
+                if isinstance(note, dict)
+                and str(note.get("note_type") or "").strip().lower() in {"call_in", "call_out"}
+            ]
+            calls = extract_calls_from_notes(
+                notes=call_notes,
+                deal_id=did,
+                users_cache=users_cache,
+                source_location="amocrm_api:direct_probe",
+            )
+            entry["calls_count_from_notes"] = len(calls)
+            entry["longest_call_duration_seconds"] = max(
+                (int(c.duration_seconds or 0) for c in calls),
+                default=0,
+            )
+        except Exception as exc:
+            entry["error"] = str(exc)
+        out[did] = entry
+    return out
 
 
 def _maybe_retry_transcript_quality_for_deal(
@@ -3829,13 +5244,13 @@ def _build_transcript_runtime_diagnostics(period_deal_records: list[dict[str, An
     deals_with_transcript_excerpt = sum(1 for x in deals if str(x.get("transcript_text_excerpt") or "").strip())
     deals_with_nonempty_call_signal_summary = sum(1 for x in deals if str(x.get("call_signal_summary_short") or "").strip())
     deals_with_transcription_error = sum(1 for x in deals if str(x.get("transcript_error") or "").strip())
-    labels = [str(x.get("transcript_usability_label") or "").strip().lower() for x in deals]
+    labels = [_effective_transcript_usability_label(x) for x in deals]
     transcriptions_usable = sum(1 for label in labels if label == "usable")
     transcriptions_weak = sum(1 for label in labels if label == "weak")
     transcriptions_noisy = sum(1 for label in labels if label == "noisy")
     transcriptions_empty = sum(1 for label in labels if label == "empty")
     deals_with_usable_transcript = sum(
-        1 for x in deals if str(x.get("transcript_usability_label") or "").strip().lower() == "usable"
+        1 for x in deals if _effective_transcript_usability_label(x) == "usable"
     )
     transcript_layer_effective = bool(
         deals_with_transcript_excerpt > 0 or deals_with_nonempty_call_signal_summary > 0
@@ -3854,6 +5269,36 @@ def _build_transcript_runtime_diagnostics(period_deal_records: list[dict[str, An
         "deals_with_usable_transcript": deals_with_usable_transcript,
         "transcript_layer_effective": transcript_layer_effective,
     }
+
+
+def _effective_transcript_usability_label(record: dict[str, Any]) -> str:
+    label_raw = str(record.get("transcript_usability_label") or "").strip().lower()
+    try:
+        score = int(record.get("transcript_usability_score_final", 0) or 0)
+    except Exception:
+        score = 0
+    excerpt = " ".join(str(record.get("transcript_text_excerpt") or "").split()).strip()
+    summary = " ".join(str(record.get("call_signal_summary_short") or "").split()).strip()
+    text_len = int(record.get("transcript_text_len", 0) or len(excerpt))
+    segments = int(record.get("transcript_segments_count", 0) or 0)
+    text_blob = f"{excerpt} {summary}".lower()
+    if text_len < 40 and not excerpt and not summary:
+        return "empty"
+    autoanswer_markers = ("абонент", "автоответ", "voicemail", "оставьте сообщение", "не может ответить", "после сигнала")
+    has_autoanswer = any(token in text_blob for token in autoanswer_markers)
+    dialogue_markers = ("лпр", "встреч", "соглас", "договор", "закуп", "демо", "тест", "следующ")
+    has_dialogue = any(token in text_blob for token in dialogue_markers)
+    if has_autoanswer and text_len < 220 and segments <= 1 and score < 2 and not has_dialogue:
+        return "noisy"
+    if text_len >= 220 and (segments >= 2 or score >= 2 or has_dialogue or len(summary) >= 40):
+        return "usable"
+    if score >= 2 and not has_autoanswer:
+        return "usable"
+    if label_raw in {"usable", "weak", "noisy", "empty"}:
+        return label_raw
+    if text_len >= 80 or summary:
+        return "weak"
+    return "empty"
 
 
 def _transcript_error_counters(transcripts: list[dict[str, Any]]) -> dict[str, int]:
@@ -4320,35 +5765,571 @@ def _daily_candidate_retry_score(snapshot: dict[str, Any]) -> int:
     return min(100, score)
 
 
+def _call_dict_dedup_key(call: dict[str, Any], *, deal_id: str) -> str:
+    call_id = str(call.get("call_id") or "").strip()
+    if call_id:
+        return f"id:{call_id}"
+    recording = str(call.get("recording_url") or "").strip().lower()
+    if recording:
+        return f"rec:{recording}"
+    return "mix:{deal}:{ts}:{dur}:{dir}:{mgr}".format(
+        deal=deal_id,
+        ts=str(call.get("timestamp") or call.get("call_datetime_utc") or "").strip(),
+        dur=int(call.get("duration_seconds", 0) or call.get("call_duration_seconds", 0) or 0),
+        dir=str(call.get("direction") or "").strip().lower(),
+        mgr=str(call.get("manager_id") or call.get("manager_name") or "").strip().lower(),
+    )
+
+
+def _merge_call_dicts(*, deal_id: str, calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    dedup: dict[str, dict[str, Any]] = {}
+    for raw in calls:
+        if not isinstance(raw, dict):
+            continue
+        item = dict(raw)
+        key = _call_dict_dedup_key(item, deal_id=deal_id)
+        current = dedup.get(key)
+        if current is None:
+            dedup[key] = item
+            continue
+        cur_score = int(current.get("duration_seconds", 0) or current.get("call_duration_seconds", 0) or 0)
+        new_score = int(item.get("duration_seconds", 0) or item.get("call_duration_seconds", 0) or 0)
+        if bool(item.get("recording_url")) and not bool(current.get("recording_url")):
+            dedup[key] = item
+            continue
+        if new_score > cur_score:
+            dedup[key] = item
+    merged = list(dedup.values())
+    merged.sort(
+        key=lambda x: (
+            str(x.get("timestamp") or x.get("call_datetime_utc") or ""),
+            str(x.get("call_id") or ""),
+        )
+    )
+    return merged
+
+
+def _hydrate_rows_from_call_deals(
+    *,
+    cfg: DealAnalyzerConfig,
+    logger,
+    missing_deal_ids: list[str],
+    base_rows_by_deal: dict[str, dict[str, Any]],
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    resolved_rows: dict[str, dict[str, Any]] = {}
+    failed: dict[str, str] = {}
+    if not missing_deal_ids:
+        return resolved_rows, {"deals_resolved_from_calls": 0, "deals_failed_to_resolve": 0, "failed": failed}
+
+    try:
+        auth_cfg = load_amocrm_auth_config(getattr(cfg, "amocrm_auth_config_path", None))
+        auth_state = load_auth_state(auth_cfg.state_path)
+        access_token = str(getattr(auth_state, "access_token", "") or "").strip()
+        base_domain = str(getattr(cfg, "call_base_domain", "") or "").strip() or str(getattr(auth_cfg, "base_domain", "") or "").strip()
+        if not base_domain or not access_token:
+            raise RuntimeError("missing_base_domain_or_token")
+        client = AmoCollectorClient(base_domain=base_domain, access_token=access_token)
+        users_cache = client.get_users_cache()
+        status_cache = client.get_status_cache()
+        pipeline_names: dict[int, str] = {
+            int(p.get("id")): str(p.get("name") or "").strip()
+            for p in client.get_pipelines_cache()
+            if isinstance(p, dict) and isinstance(p.get("id"), int)
+        }
+        company_tags_cache: dict[int, list[str]] = {}
+        for deal_id in sorted(set(missing_deal_ids)):
+            if deal_id in base_rows_by_deal:
+                continue
+            if not deal_id.isdigit():
+                failed[deal_id] = "deal_id_not_numeric"
+                continue
+            try:
+                lead = client.get_lead(int(deal_id))
+            except Exception as exc:
+                failed[deal_id] = f"get_lead_failed:{exc}"
+                continue
+            base = {"deal_id": int(deal_id), "amo_lead_id": int(deal_id)}
+            pipeline_id = int(lead.get("pipeline_id")) if isinstance(lead.get("pipeline_id"), int) else None
+            status_id = int(lead.get("status_id")) if isinstance(lead.get("status_id"), int) else None
+            responsible_user_id = int(lead.get("responsible_user_id")) if isinstance(lead.get("responsible_user_id"), int) else None
+            responsible_name = ""
+            if isinstance(responsible_user_id, int):
+                responsible_name = str(users_cache.get(responsible_user_id, {}).get("name") or "").strip()
+            status_name = ""
+            if isinstance(pipeline_id, int) and isinstance(status_id, int):
+                status_name = str(status_cache.get((pipeline_id, status_id), {}).get("name") or "").strip()
+            lead_tags = _extract_embedded_tag_names(lead)
+            company_tags = _fetch_company_tags_for_lead(
+                client=client,
+                lead_id=int(deal_id),
+                company_tags_cache=company_tags_cache,
+            )
+            company_id = ""
+            embedded = lead.get("_embedded", {}) if isinstance(lead, dict) else {}
+            companies = embedded.get("companies", []) if isinstance(embedded, dict) and isinstance(embedded.get("companies"), list) else []
+            for company in companies:
+                if not isinstance(company, dict):
+                    continue
+                cid = company.get("id")
+                if isinstance(cid, int):
+                    company_id = str(cid)
+                    break
+                text = str(cid or "").strip()
+                if text.isdigit():
+                    company_id = text
+                    break
+            base.update(
+                {
+                    "deal_name": str(lead.get("name") or "").strip(),
+                    "created_at": lead.get("created_at") or "",
+                    "updated_at": lead.get("updated_at") or "",
+                    "pipeline_id": pipeline_id,
+                    "pipeline_name": pipeline_names.get(pipeline_id or -1, ""),
+                    "status_id": status_id,
+                    "status_name": status_name,
+                    "responsible_user_id": responsible_user_id,
+                    "responsible_user_name": responsible_name,
+                    "tags": normalize_tag_values(lead_tags),
+                    "company_tags": normalize_tag_values(company_tags),
+                    "company_tags_source": "api_tags" if company_tags else "none",
+                    "company_id": company_id,
+                }
+            )
+            resolved_rows[deal_id] = base
+    except Exception as exc:
+        for deal_id in sorted(set(missing_deal_ids)):
+            if deal_id not in failed and deal_id not in resolved_rows:
+                failed[deal_id] = f"context_hydration_failed:{exc}"
+
+    return resolved_rows, {
+        "deals_resolved_from_calls": len(resolved_rows),
+        "deals_failed_to_resolve": len(failed),
+        "failed": failed,
+    }
+
+
+def _period_business_window_bounds_msk(*, period_start, period_end) -> tuple[str, str]:
+    if period_start is None or period_end is None:
+        return "", ""
+    start = period_start
+    if start.weekday() == 0:
+        start = start - timedelta(days=3)
+    else:
+        start = start - timedelta(days=1)
+    while start.weekday() >= 5:
+        start = start - timedelta(days=1)
+    start_dt = datetime(start.year, start.month, start.day, 15, 0, 0, tzinfo=MSK_TZ)
+    end_dt = datetime(period_end.year, period_end.month, period_end.day, 15, 0, 0, tzinfo=MSK_TZ)
+    return start_dt.isoformat(), end_dt.isoformat()
+
+
+def _build_call_collection_audit(
+    *,
+    period_start,
+    period_end,
+    global_audit: dict[str, Any],
+    call_ledger_all: list[dict[str, Any]],
+    calls_seen_from_deal_records: int,
+    resolve_diag: dict[str, Any],
+    call_ledger_audit: dict[str, Any],
+) -> dict[str, Any]:
+    bw_start, bw_end = _period_business_window_bounds_msk(period_start=period_start, period_end=period_end)
+    missing_probe = (
+        call_ledger_audit.get("missing_user_probe", {})
+        if isinstance(call_ledger_audit.get("missing_user_probe"), dict)
+        else {}
+    )
+    probe_call = {
+        "target": "2026-04-22 14:01 Илья 00:44:44",
+        "found": False,
+        "matches": [],
+    }
+    for item in call_ledger_all:
+        if not isinstance(item, dict):
+            continue
+        manager = str(item.get("manager_name_from_call_author") or "").lower()
+        dt_msk = str(item.get("call_datetime_msk") or "")
+        dur = int(item.get("call_duration_seconds", 0) or 0)
+        if "илья" in manager and dt_msk.startswith("2026-04-22T14:01") and dur == 2684:
+            probe_call["found"] = True
+            probe_call["matches"].append(
+                {
+                    "deal_id": str(item.get("deal_id") or ""),
+                    "call_id": str(item.get("call_id") or ""),
+                    "call_datetime_msk": dt_msk,
+                    "call_duration_seconds": dur,
+                }
+            )
+    return {
+        "period_start": period_start.isoformat() if period_start is not None else "",
+        "period_end": period_end.isoformat() if period_end is not None else "",
+        "business_window_start_msk": bw_start,
+        "business_window_end_msk": bw_end,
+        "source_mode": str(global_audit.get("source_mode") or "deal_first_fallback"),
+        "calls_seen_from_global_source": int(global_audit.get("calls_seen_from_global_source", 0) or 0),
+        "calls_seen_from_deal_records": int(calls_seen_from_deal_records or 0),
+        "calls_merged_total": len(call_ledger_all),
+        "calls_missing_deal_id": int(global_audit.get("calls_missing_deal_id", 0) or 0),
+        "deals_resolved_from_calls": int(resolve_diag.get("deals_resolved_from_calls", 0) or 0),
+        "deals_failed_to_resolve": int(resolve_diag.get("deals_failed_to_resolve", 0) or 0),
+        "probe_deals": {
+            "31134627": missing_probe.get("31134627", {}),
+            "31860325": missing_probe.get("31860325", {}),
+            "31937760": missing_probe.get("31937760", {}),
+            "ilya_2026_04_22_14_01_00_44_44": probe_call,
+        },
+        "global_source_attempts": (
+            global_audit.get("global_source_attempts", [])
+            if isinstance(global_audit.get("global_source_attempts"), list)
+            else []
+        ),
+        "events_fallback_attempts": (
+            global_audit.get("events_fallback_attempts", [])
+            if isinstance(global_audit.get("events_fallback_attempts"), list)
+            else []
+        ),
+        "deals_failed_to_resolve_details": (
+            resolve_diag.get("failed", {})
+            if isinstance(resolve_diag.get("failed"), dict)
+            else {}
+        ),
+    }
+
+
+def _build_deal_candidate_audit(
+    *,
+    resolved,
+    refresh_diag: dict[str, Any],
+    call_ledger_all: list[dict[str, Any]],
+) -> dict[str, Any]:
+    probe_ids = ("31134627", "31860325", "31937760")
+    source_presence = (
+        refresh_diag.get("probe_deals_source_presence", {})
+        if isinstance(refresh_diag.get("probe_deals_source_presence"), dict)
+        else {}
+    )
+    direct_probe = (
+        refresh_diag.get("probe_deals_direct_api", {})
+        if isinstance(refresh_diag.get("probe_deals_direct_api"), dict)
+        else {}
+    )
+    calls_by_deal: dict[str, list[dict[str, Any]]] = {}
+    for call in call_ledger_all:
+        if not isinstance(call, dict):
+            continue
+        deal_id = str(call.get("deal_id") or "").strip()
+        if not deal_id:
+            continue
+        calls_by_deal.setdefault(deal_id, []).append(call)
+
+    probe_block: dict[str, dict[str, Any]] = {}
+    for probe in probe_ids:
+        calls = calls_by_deal.get(probe, [])
+        src = source_presence.get(probe, {}) if isinstance(source_presence.get(probe), dict) else {}
+        probe_block[probe] = {
+            "found_in_created_at": bool(src.get("found_in_created_at")),
+            "found_in_updated_at": bool(src.get("found_in_updated_at")),
+            "found_in_merged": bool(src.get("found_in_merged")),
+            "found_in_call_ledger_all": bool(calls),
+            "calls_found_count": len(calls),
+            "longest_call_duration_seconds": max(
+                (int(x.get("call_duration_seconds", 0) or 0) for x in calls if isinstance(x, dict)),
+                default=0,
+            ),
+            "direct_api_probe": direct_probe.get(probe, {}),
+        }
+
+    ilya_probe = {
+        "target": "2026-04-22 14:01 Илья 00:44:44",
+        "found": False,
+        "deal_id": "",
+        "calls_found_count": 0,
+        "longest_call_duration_seconds": 0,
+        "matched_calls": [],
+    }
+    for call in call_ledger_all:
+        if not isinstance(call, dict):
+            continue
+        manager = str(call.get("manager_name_from_call_author") or "").lower()
+        dt_msk = str(call.get("call_datetime_msk") or "")
+        duration = int(call.get("call_duration_seconds", 0) or 0)
+        if "илья" not in manager:
+            continue
+        if duration != 2684:
+            continue
+        if not dt_msk.startswith("2026-04-22T14:01"):
+            continue
+        ilya_probe["found"] = True
+        deal_id = str(call.get("deal_id") or "").strip()
+        ilya_probe["deal_id"] = deal_id
+        ilya_probe["matched_calls"].append(
+            {
+                "deal_id": deal_id,
+                "call_id": str(call.get("call_id") or ""),
+                "call_datetime_msk": dt_msk,
+                "call_duration_seconds": duration,
+            }
+        )
+    if ilya_probe["deal_id"]:
+        probe_calls = calls_by_deal.get(str(ilya_probe["deal_id"]), [])
+        ilya_probe["calls_found_count"] = len(probe_calls)
+        ilya_probe["longest_call_duration_seconds"] = max(
+            (int(x.get("call_duration_seconds", 0) or 0) for x in probe_calls if isinstance(x, dict)),
+            default=0,
+        )
+        did = str(ilya_probe["deal_id"])
+        if did in probe_block:
+            ilya_probe["found_in_created_at"] = probe_block[did].get("found_in_created_at", False)
+            ilya_probe["found_in_updated_at"] = probe_block[did].get("found_in_updated_at", False)
+            ilya_probe["found_in_merged"] = probe_block[did].get("found_in_merged", False)
+        else:
+            ilya_probe["found_in_created_at"] = False
+            ilya_probe["found_in_updated_at"] = False
+            ilya_probe["found_in_merged"] = False
+
+    return {
+        "effective_period_start": resolved.period_start.isoformat(),
+        "effective_period_end": resolved.period_end.isoformat(),
+        "source_created_at_count": int(refresh_diag.get("source_created_at_count", 0) or 0),
+        "source_updated_at_count": int(refresh_diag.get("source_updated_at_count", 0) or 0),
+        "merged_deals_count": int(refresh_diag.get("merged_deals_count", 0) or 0),
+        "only_created_count": int(refresh_diag.get("only_created_count", 0) or 0),
+        "only_updated_count": int(refresh_diag.get("only_updated_count", 0) or 0),
+        "both_created_and_updated_count": int(refresh_diag.get("both_created_and_updated_count", 0) or 0),
+        "probe_deals": {
+            **probe_block,
+            "ilya_2026_04_22_14_01_00_44_44": ilya_probe,
+        },
+    }
+
+
 def _collect_call_pool_debug(
     *,
     cfg: DealAnalyzerConfig,
     logger,
     rows: list[dict[str, Any]],
     raw_bundles_by_deal: dict[str, dict[str, Any]],
+    period_start,
+    period_end,
+    base_domain: str = "",
 ) -> dict[str, Any]:
     downloader = CallDownloader(config=cfg, logger=logger)
+    period_start_date = period_start if hasattr(period_start, "isoformat") else None
+    period_end_date = period_end if hasattr(period_end, "isoformat") else None
+    if period_start_date is not None and period_end_date is not None and period_end_date < period_start_date:
+        period_start_date, period_end_date = period_end_date, period_start_date
+
+    global_calls: list[dict[str, Any]] = []
+    global_audit: dict[str, Any] = {
+        "source_mode": "deal_first_fallback",
+        "calls_seen_from_global_source": 0,
+        "calls_missing_deal_id": 0,
+    }
+    if bool(getattr(cfg, "period_live_refresh_enabled", True)) and period_start_date is not None and period_end_date is not None:
+        try:
+            global_call_evidence, global_audit = downloader.collect_period_calls_call_first(
+                period_start=period_start_date,
+                period_end=period_end_date,
+            )
+            global_calls = call_evidence_to_dicts(global_call_evidence)
+        except Exception as exc:
+            global_audit = {
+                "source_mode": "deal_first_fallback",
+                "calls_seen_from_global_source": 0,
+                "calls_missing_deal_id": 0,
+                "error": str(exc),
+                "global_source_attempts": [],
+                "events_fallback_attempts": [],
+            }
+
     results_by_deal = downloader.collect_period_calls(
         deals=rows,
         raw_bundles_by_deal=raw_bundles_by_deal,
         resolve_audio=False,
     )
+    domain_root = str(base_domain or "").strip().rstrip("/")
+
+    rows_by_deal: dict[str, dict[str, Any]] = {
+        str(row.get("deal_id") or row.get("amo_lead_id") or "").strip(): dict(row)
+        for row in rows
+        if isinstance(row, dict) and str(row.get("deal_id") or row.get("amo_lead_id") or "").strip()
+    }
+    per_deal_calls_raw: dict[str, list[dict[str, Any]]] = {}
+    calls_seen_from_deal_records = 0
+    for deal_id, result in results_by_deal.items():
+        if result is None or not hasattr(result, "calls"):
+            continue
+        call_dicts = call_evidence_to_dicts(result.calls)
+        calls_seen_from_deal_records += len(call_dicts)
+        per_deal_calls_raw.setdefault(str(deal_id).strip(), []).extend(call_dicts)
+    for call in global_calls:
+        if not isinstance(call, dict):
+            continue
+        deal_id = str(call.get("deal_id") or "").strip()
+        if not deal_id:
+            continue
+        per_deal_calls_raw.setdefault(deal_id, []).append(call)
+
+    all_deal_ids_from_calls = [deal_id for deal_id in per_deal_calls_raw.keys() if deal_id]
+    missing_deal_ids = [deal_id for deal_id in all_deal_ids_from_calls if deal_id not in rows_by_deal]
+    resolved_rows, resolve_diag = _hydrate_rows_from_call_deals(
+        cfg=cfg,
+        logger=logger,
+        missing_deal_ids=missing_deal_ids,
+        base_rows_by_deal=rows_by_deal,
+    )
+    rows_by_deal.update(resolved_rows)
+    for deal_id in missing_deal_ids:
+        if deal_id in rows_by_deal:
+            continue
+        rows_by_deal[deal_id] = {
+            "deal_id": int(deal_id) if deal_id.isdigit() else deal_id,
+            "amo_lead_id": int(deal_id) if deal_id.isdigit() else deal_id,
+            "deal_name": f"Сделка #{deal_id}",
+            "created_at": "",
+            "updated_at": "",
+            "pipeline_name": "",
+            "status_name": "",
+            "responsible_user_name": "",
+            "responsible_user_id": "",
+            "tags": [],
+            "company_tags": [],
+            "company_tags_source": "none",
+        }
+    per_deal_calls: dict[str, list[dict[str, Any]]] = {
+        deal_id: _merge_call_dicts(deal_id=deal_id, calls=calls)
+        for deal_id, calls in per_deal_calls_raw.items()
+        if deal_id
+    }
+
     items: list[dict[str, Any]] = []
-    for row in rows:
+    call_ledger_all: list[dict[str, Any]] = []
+    deal_stage_tracker: dict[str, dict[str, Any]] = {}
+    rows_for_iteration = sorted(
+        [x for x in rows_by_deal.values() if isinstance(x, dict)],
+        key=_period_deal_priority_key,
+    )
+    for row in rows_for_iteration:
         deal_id = str(row.get("deal_id") or row.get("amo_lead_id") or "").strip()
         result = results_by_deal.get(deal_id)
-        calls = result.calls if result is not None else []
-        call_dicts = call_evidence_to_dicts(calls)
+        call_dicts = list(per_deal_calls.get(deal_id, []))
+        raw_call_count = len(call_dicts)
+        base_mix_resolution = resolve_base_mix_priority([row])
+        base_tag = str(base_mix_resolution.get("selected_value") or "").strip() or "солянка"
+        product_focus = _top_product_focus([row])
+        row_tags = row.get("tags") if isinstance(row.get("tags"), list) else []
+        row_company_tags = row.get("company_tags") if isinstance(row.get("company_tags"), list) else []
+        deal_url = f"{domain_root}/leads/detail/{deal_id}" if domain_root and deal_id else deal_id
+        deal_calls_for_period: list[dict[str, Any]] = []
+        dropped_outside_period = 0
+        dropped_missing_ts = 0
+        dropped_open_bucket = 0
+        for call in call_dicts:
+            if not isinstance(call, dict):
+                continue
+            ts_utc = _parse_utc_ts(call.get("timestamp"))
+            business_bucket = _business_window_date_for_call(ts_utc) if ts_utc is not None else None
+            in_scope, drop_reason = _is_call_in_period_or_business_window(
+                ts_utc=ts_utc,
+                business_bucket=business_bucket,
+                period_start=period_start_date,
+                period_end=period_end_date,
+            )
+            if not in_scope:
+                if drop_reason == "missing_timestamp":
+                    dropped_missing_ts += 1
+                elif drop_reason == "business_bucket_outside_period":
+                    dropped_open_bucket += 1
+                else:
+                    dropped_outside_period += 1
+                continue
+            duration = max(0, int(call.get("duration_seconds", 0) or 0))
+            manager_name = " ".join(
+                str(call.get("manager_name") or row.get("responsible_user_name") or "").split()
+            ).strip()
+            manager_id = str(call.get("manager_id") or row.get("responsible_user_id") or "").strip()
+            manager_role = _manager_role_label(manager_name, cfg=cfg)
+            call_datetime_utc = ts_utc.isoformat() if ts_utc is not None else ""
+            call_datetime_msk = (
+                ts_utc.astimezone(MSK_TZ).replace(microsecond=0).isoformat() if ts_utc is not None else ""
+            )
+            phone_raw = str(
+                call.get("phone")
+                or call.get("phone_number")
+                or call.get("contact_phone")
+                or ""
+            ).strip()
+            initial_filter_flags: list[str] = []
+            if duration <= 20:
+                initial_filter_flags.append("short_duration_0_20")
+            if _is_no_answer_like_call(call):
+                initial_filter_flags.append("no_answer_like")
+            if _is_autoanswer_like_call(call):
+                initial_filter_flags.append("autoanswer_like")
+            if not str(call.get("recording_url") or "").strip():
+                initial_filter_flags.append("missing_recording")
+            quality_flags = call.get("quality_flags") if isinstance(call.get("quality_flags"), list) else []
+            initial_filter_flags.extend(
+                [str(x).strip() for x in quality_flags if str(x).strip()]
+            )
+            call_ledger_item = {
+                "deal_id": deal_id,
+                "deal_name": str(row.get("deal_name") or "").strip(),
+                "deal_url": deal_url,
+                "manager_name_from_call_author": manager_name,
+                "manager_id_from_call_author": manager_id,
+                "manager_role": manager_role,
+                "owner_name": str(row.get("responsible_user_name") or "").strip(),
+                "call_id": str(call.get("call_id") or "").strip(),
+                "call_datetime_utc": call_datetime_utc,
+                "call_datetime_msk": call_datetime_msk,
+                "business_bucket_date": business_bucket.isoformat() if business_bucket is not None else "",
+                "call_duration_seconds": duration,
+                "direction": str(call.get("direction") or "").strip(),
+                "recording_url": str(call.get("recording_url") or "").strip(),
+                "recording_available": bool(str(call.get("recording_url") or "").strip()),
+                "audio_path": str(call.get("audio_path") or "").strip(),
+                "source_location": str(call.get("source_location") or "").strip(),
+                "pipeline_name": str(row.get("pipeline_name") or "").strip(),
+                "status_name": str(row.get("status_name") or "").strip(),
+                "tags": row_tags,
+                "company_tags": row_company_tags,
+                "product_focus": product_focus,
+                "base_tag": base_tag,
+                "phone_raw": phone_raw,
+                "phone_normalized_last7": _normalize_phone_last7(phone_raw),
+                "initial_filter_flags": sorted(set(initial_filter_flags)),
+            }
+            call_ledger_all.append(call_ledger_item)
+            deal_calls_for_period.append(
+                {
+                    "call_id": call_ledger_item["call_id"],
+                    "timestamp": call_ledger_item["call_datetime_utc"],
+                    "duration_seconds": call_ledger_item["call_duration_seconds"],
+                    "direction": call_ledger_item["direction"],
+                    "recording_url": call_ledger_item["recording_url"],
+                    "audio_path": call_ledger_item["audio_path"],
+                    "phone": call_ledger_item["phone_raw"],
+                    "status": str(call.get("status") or ""),
+                    "result": str(call.get("result") or ""),
+                    "disposition": str(call.get("disposition") or ""),
+                    "quality_flags": sorted(set(initial_filter_flags)),
+                    "source_location": call_ledger_item["source_location"],
+                    "manager_name": manager_name,
+                    "manager_id": manager_id,
+                    "business_bucket_date": call_ledger_item["business_bucket_date"],
+                }
+            )
         dial = _build_dial_discipline_signals(
-            {"call_evidence": {"items": call_dicts}, "normalized_deal": row},
+            {"call_evidence": {"items": deal_calls_for_period}, "normalized_deal": row},
             status_name=str(row.get("status_name") or ""),
         )
-        durations = [max(0, int(c.duration_seconds)) for c in calls]
+        durations = [max(0, int(c.get("duration_seconds", 0) or 0)) for c in deal_calls_for_period]
         short_calls = sum(1 for x in durations if 0 <= x <= 20)
         medium_calls = sum(1 for x in durations if 21 <= x <= 60)
         long_calls = sum(1 for x in durations if x >= 61)
-        rec_count = sum(1 for c in calls if str(c.recording_url or "").strip())
-        audio_path_count = sum(1 for c in calls if str(c.audio_path or "").strip())
+        rec_count = sum(1 for c in deal_calls_for_period if str(c.get("recording_url") or "").strip())
+        audio_path_count = sum(1 for c in deal_calls_for_period if str(c.get("audio_path") or "").strip())
         raw_deal_tags = row.get("tags") if isinstance(row.get("tags"), list) else []
         raw_company_tags = row.get("company_tags") if isinstance(row.get("company_tags"), list) else []
         merged_runtime_tags, normalized_company_tags, propagated_company_tags = _merge_deal_company_tags(
@@ -4375,9 +6356,13 @@ def _collect_call_pool_debug(
             "pipeline_name": str(row.get("pipeline_name") or "").strip(),
             "updated_at": row.get("updated_at") or "",
             "created_at": row.get("created_at") or "",
-            "calls_total": len(calls),
-            "outbound_calls": sum(1 for c in calls if str(c.direction or "").strip().lower() == "outbound"),
-            "inbound_calls": sum(1 for c in calls if str(c.direction or "").strip().lower() == "inbound"),
+            "calls_total_raw": int(raw_call_count),
+            "calls_total": len(deal_calls_for_period),
+            "calls_outside_period_count": int(dropped_outside_period),
+            "calls_missing_timestamp_count": int(dropped_missing_ts),
+            "calls_open_bucket_count": int(dropped_open_bucket),
+            "outbound_calls": sum(1 for c in deal_calls_for_period if str(c.get("direction") or "").strip().lower() == "outbound"),
+            "inbound_calls": sum(1 for c in deal_calls_for_period if str(c.get("direction") or "").strip().lower() == "inbound"),
             "max_duration_seconds": max(durations) if durations else 0,
             "total_duration_seconds": sum(durations),
             "recording_url_count": rec_count,
@@ -4385,8 +6370,8 @@ def _collect_call_pool_debug(
             "short_calls_0_20_count": short_calls,
             "medium_calls_21_60_count": medium_calls,
             "long_calls_61_plus_count": long_calls,
-            "no_answer_like_count": sum(1 for c in call_dicts if _is_no_answer_like_call(c)),
-            "autoanswer_like_count": sum(1 for c in call_dicts if _is_autoanswer_like_call(c)),
+            "no_answer_like_count": sum(1 for c in deal_calls_for_period if _is_no_answer_like_call(c)),
+            "autoanswer_like_count": sum(1 for c in deal_calls_for_period if _is_autoanswer_like_call(c)),
             "repeated_dead_redial_count": int(dial.get("repeated_dead_redial_count", 0) or 0),
             "same_time_redial_pattern_flag": bool(dial.get("same_time_redial_pattern_flag")),
             "same_day_repeat_attempts_flag": bool(dial.get("same_day_repeat_attempts_flag")),
@@ -4408,37 +6393,51 @@ def _collect_call_pool_debug(
             "active_low_attempts_guard": bool(dial.get("active_low_attempts_guard")),
             "numbers_not_fully_covered_flag": bool(dial.get("numbers_not_fully_covered_flag")),
             "numbers_coverage_unknown_flag": bool(dial.get("numbers_coverage_unknown_flag")),
-            "call_source_used": str(result.source_used if result is not None else "none"),
+            "call_source_used": (
+                "merged_call_first_and_deal_records"
+                if (deal_id in per_deal_calls and deal_id in results_by_deal and any(str(c.get("source_location") or "").startswith("amocrm_api:global_notes") or str(c.get("source_location") or "").startswith("amocrm_api:events_fallback") for c in call_dicts))
+                else ("call_first_global" if any(str(c.get("source_location") or "").startswith("amocrm_api:global_notes") or str(c.get("source_location") or "").startswith("amocrm_api:events_fallback") for c in call_dicts) else str(result.source_used if result is not None else "none"))
+            ),
             "warnings": list(result.warnings) if result is not None else [],
             "_text_hints": _call_pool_text_hints(row),
-            "call_items": [
-                {
-                    "call_id": str(c.get("call_id") or ""),
-                    "timestamp": str(c.get("timestamp") or ""),
-                    "duration_seconds": int(c.get("duration_seconds", 0) or 0),
-                    "direction": str(c.get("direction") or ""),
-                    "recording_url": str(c.get("recording_url") or ""),
-                    "audio_path": str(c.get("audio_path") or ""),
-                    "phone": str(c.get("phone") or c.get("phone_number") or c.get("contact_phone") or ""),
-                    "status": str(c.get("status") or ""),
-                    "result": str(c.get("result") or ""),
-                    "disposition": str(c.get("disposition") or ""),
-                    "quality_flags": c.get("quality_flags") if isinstance(c.get("quality_flags"), list) else [],
-                }
-                for c in call_dicts
-                if isinstance(c, dict)
-            ],
+            "call_items": deal_calls_for_period,
         }
-        call_case_type = _classify_call_case_type(item)
+        call_case_type, case_type_source, case_type_reason, case_type_evidence = _classify_call_case_type_with_debug(item)
         pool_type, pool_reason, pool_priority_score = _assign_pool_for_item(
             item=item,
             call_case_type=call_case_type,
         )
         item["call_case_type"] = call_case_type
+        item["case_type_source"] = case_type_source
+        item["case_type_reason"] = case_type_reason
+        item["evidence_used"] = case_type_evidence
         item["pool_type"] = pool_type
         item["pool_reason"] = pool_reason
         item["pool_priority_score"] = pool_priority_score
         items.append(item)
+        deal_stage_tracker[deal_id] = {
+            "deal_in_period_records": True,
+            "calls_total_raw": int(raw_call_count),
+            "calls_total_in_period": int(len(deal_calls_for_period)),
+            "dropped_outside_period": int(dropped_outside_period),
+            "dropped_missing_timestamp": int(dropped_missing_ts),
+            "dropped_open_bucket": int(dropped_open_bucket),
+        }
+
+    call_ledger_audit = _build_call_ledger_audit(
+        call_ledger_all=call_ledger_all,
+        rows=rows,
+        deal_stage_tracker=deal_stage_tracker,
+    )
+    call_collection_audit = _build_call_collection_audit(
+        period_start=period_start_date,
+        period_end=period_end_date,
+        global_audit=global_audit,
+        call_ledger_all=call_ledger_all,
+        calls_seen_from_deal_records=calls_seen_from_deal_records,
+        resolve_diag=resolve_diag,
+        call_ledger_audit=call_ledger_audit,
+    )
 
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -4459,13 +6458,150 @@ def _collect_call_pool_debug(
             if int(x.get("repeated_dead_redial_count", 0) or 0) > 0
             or bool(x.get("same_time_redial_pattern_flag"))
         ),
+        "call_ledger_all": call_ledger_all,
+        "call_ledger_audit": call_ledger_audit,
+        "call_collection_audit": call_collection_audit,
+        "rows_from_call_deals": [x for x in resolved_rows.values() if isinstance(x, dict)],
         "items": items,
+    }
+
+
+def _is_call_in_period_or_business_window(
+    *,
+    ts_utc: datetime | None,
+    business_bucket,
+    period_start,
+    period_end,
+) -> tuple[bool, str]:
+    if ts_utc is None:
+        return False, "missing_timestamp"
+    if period_start is None or period_end is None:
+        return True, ""
+    local_date = ts_utc.astimezone(MSK_TZ).date()
+    if period_start <= local_date <= period_end:
+        return True, ""
+    if business_bucket is not None and period_start <= business_bucket <= period_end:
+        return True, ""
+    return False, "business_bucket_outside_period"
+
+
+def _build_call_ledger_audit(
+    *,
+    call_ledger_all: list[dict[str, Any]],
+    rows: list[dict[str, Any]],
+    deal_stage_tracker: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    manager_counter: Counter[str] = Counter()
+    direction_counter: Counter[str] = Counter()
+    with_recording = 0
+    without_recording = 0
+    ge_120 = 0
+    ge_300 = 0
+    ge_600 = 0
+    for item in call_ledger_all:
+        if not isinstance(item, dict):
+            continue
+        manager = " ".join(str(item.get("manager_name_from_call_author") or "").split()).strip() or "unknown"
+        manager_counter[manager] += 1
+        direction = str(item.get("direction") or "").strip().lower() or "unknown"
+        direction_counter[direction] += 1
+        if bool(item.get("recording_available")):
+            with_recording += 1
+        else:
+            without_recording += 1
+        duration = int(item.get("call_duration_seconds", 0) or 0)
+        if duration >= 120:
+            ge_120 += 1
+        if duration >= 300:
+            ge_300 += 1
+        if duration >= 600:
+            ge_600 += 1
+
+    sorted_top = sorted(
+        [x for x in call_ledger_all if isinstance(x, dict)],
+        key=lambda x: (
+            -int(x.get("call_duration_seconds", 0) or 0),
+            str(x.get("call_datetime_utc") or ""),
+            str(x.get("call_id") or ""),
+        ),
+    )
+    top_30 = [
+        {
+            "deal_id": str(x.get("deal_id") or ""),
+            "deal_name": str(x.get("deal_name") or ""),
+            "manager_name_from_call_author": str(x.get("manager_name_from_call_author") or ""),
+            "call_id": str(x.get("call_id") or ""),
+            "call_datetime_utc": str(x.get("call_datetime_utc") or ""),
+            "call_datetime_msk": str(x.get("call_datetime_msk") or ""),
+            "call_duration_seconds": int(x.get("call_duration_seconds", 0) or 0),
+            "direction": str(x.get("direction") or ""),
+            "recording_available": bool(x.get("recording_available")),
+        }
+        for x in sorted_top[:30]
+    ]
+
+    rows_by_deal = {
+        str(row.get("deal_id") or row.get("amo_lead_id") or "").strip(): row
+        for row in rows
+        if isinstance(row, dict)
+    }
+    ledger_deal_ids = {
+        str(x.get("deal_id") or "").strip()
+        for x in call_ledger_all
+        if isinstance(x, dict) and str(x.get("deal_id") or "").strip()
+    }
+    probe_ids = ("31134627", "31860325", "31937760")
+    missing_probe: dict[str, dict[str, Any]] = {}
+    for probe in probe_ids:
+        in_period = probe in rows_by_deal
+        in_ledger = probe in ledger_deal_ids
+        stage = "ok"
+        if not in_period:
+            stage = "missing_in_period_deal_records"
+        elif not in_ledger:
+            tracker = deal_stage_tracker.get(probe, {})
+            raw_calls = int(tracker.get("calls_total_raw", 0) or 0)
+            period_calls = int(tracker.get("calls_total_in_period", 0) or 0)
+            if raw_calls <= 0:
+                stage = "deal_in_period_but_no_calls_collected"
+            elif period_calls <= 0:
+                stage = "calls_collected_but_outside_period_or_window"
+            else:
+                stage = "calls_lost_before_call_ledger_all"
+        missing_probe[probe] = {
+            "deal_found_in_period_deal_records": bool(in_period),
+            "call_found_in_call_ledger": bool(in_ledger),
+            "dropped_stage": stage,
+            "deal_stage_tracker": deal_stage_tracker.get(probe, {}),
+        }
+
+    return {
+        "calls_total_all": len(call_ledger_all),
+        "calls_by_manager": dict(sorted(manager_counter.items(), key=lambda kv: (-kv[1], kv[0]))),
+        "calls_by_direction": dict(sorted(direction_counter.items(), key=lambda kv: (-kv[1], kv[0]))),
+        "calls_with_recording": int(with_recording),
+        "calls_without_recording": int(without_recording),
+        "calls_duration_ge_120": int(ge_120),
+        "calls_duration_ge_300": int(ge_300),
+        "calls_duration_ge_600": int(ge_600),
+        "top_30_calls_by_duration": top_30,
+        "missing_user_probe": missing_probe,
     }
 
 
 def _call_pool_text_hints(row: dict[str, Any]) -> str:
     chunks: list[str] = []
-    for key in ("status_name", "pipeline_name", "source_name", "source_url", "deal_name"):
+    for key in (
+        "status_name",
+        "pipeline_name",
+        "source_name",
+        "source_url",
+        "deal_name",
+        "company_comment",
+        "contact_comment",
+        "manager_summary",
+        "employee_coaching",
+    ):
         value = " ".join(str(row.get(key) or "").split()).strip()
         if value:
             chunks.append(value.lower())
@@ -4476,14 +6612,22 @@ def _call_pool_text_hints(row: dict[str, Any]) -> str:
                 text = " ".join(str(v or "").split()).strip()
                 if text:
                     chunks.append(text.lower())
+    for key in ("notes_summary_raw", "tasks_summary_raw"):
+        values = row.get(key)
+        if isinstance(values, list):
+            for v in values:
+                text = " ".join(str(v or "").split()).strip()
+                if text:
+                    chunks.append(text.lower())
     return " | ".join(chunks)
 
 
-def _classify_call_case_type(item: dict[str, Any]) -> str:
+def _classify_call_case_type_with_debug(item: dict[str, Any]) -> tuple[str, str, str, list[str]]:
     calls_total = int(item.get("calls_total", 0) or 0)
     short_calls = int(item.get("short_calls_0_20_count", 0) or 0)
     medium_calls = int(item.get("medium_calls_21_60_count", 0) or 0)
     long_calls = int(item.get("long_calls_61_plus_count", 0) or 0)
+    max_duration = int(item.get("max_duration_seconds", 0) or 0)
     no_answer_like = int(item.get("no_answer_like_count", 0) or 0)
     autoanswer_like = int(item.get("autoanswer_like_count", 0) or 0)
     repeated_dead_redial = int(item.get("repeated_dead_redial_count", 0) or 0)
@@ -4509,42 +6653,120 @@ def _classify_call_case_type(item: dict[str, Any]) -> str:
     has_supplier_touch = any(token in call_blob for token in ("поставщик", "supplier", "закуп", "тендер", "etp"))
     has_nontrivial_conversation = (long_calls + medium_calls) > 0
     is_mostly_short_noise = calls_total > 0 and short_calls >= calls_total and (no_answer_like + autoanswer_like) >= max(1, calls_total - 1)
+    evidence_used: list[str] = []
+    if max_duration >= 1200:
+        evidence_used.append("duration_ge_1200")
+    elif max_duration >= 600:
+        evidence_used.append("duration_ge_600")
+    elif max_duration >= 300:
+        evidence_used.append("duration_ge_300")
+    if short_calls:
+        evidence_used.append(f"short_calls={short_calls}")
+    if long_calls:
+        evidence_used.append(f"long_calls={long_calls}")
+    if autoanswer_like:
+        evidence_used.append(f"autoanswer_like={autoanswer_like}")
+    if repeated_dead_redial:
+        evidence_used.append(f"repeated_dead_redial={repeated_dead_redial}")
+    if same_time_repeat:
+        evidence_used.append("same_time_redial_pattern")
+    if not_covered:
+        evidence_used.append("numbers_not_fully_covered")
+
+    presentation_tokens = ("демо", "демонстрац", "презентац", "показ", "экран", "ссылка на показ")
+    test_tokens = ("тест", "пилот", "критери", "сопровожд", "обратн", "запуск тест")
+    dozhim_tokens = ("дожим", "кп", "коммерческ", "счет", "оплат", "согласован")
+    secretary_tokens = ("секрет", "ресепш", "соедините", "маршрут", "переадрес")
+    supplier_tokens = ("поставщик", "supplier", "закуп", "тендер", "etp", "площадк", "регистрац")
+    lpr_tokens = ("лпр", "директор", "собственник", "руководител", "лицо принима")
+
+    def _hint_has(tokens: tuple[str, ...]) -> bool:
+        return any(token in text_hints or token in call_blob for token in tokens)
+
+    has_presentation_hints = _hint_has(presentation_tokens)
+    has_test_hints = _hint_has(test_tokens)
+    has_dozhim_hints = _hint_has(dozhim_tokens)
+    has_secretary_hints = _hint_has(secretary_tokens)
+    has_supplier_hints = _hint_has(supplier_tokens)
+    has_lpr_hints = _hint_has(lpr_tokens)
+
+    if has_presentation_hints:
+        evidence_used.append("hint:presentation")
+    if has_test_hints:
+        evidence_used.append("hint:test")
+    if has_dozhim_hints:
+        evidence_used.append("hint:dozhim")
+    if has_secretary_hints:
+        evidence_used.append("hint:secretary")
+    if has_supplier_hints:
+        evidence_used.append("hint:supplier")
+    if has_lpr_hints:
+        evidence_used.append("hint:lpr")
 
     if calls_total <= 0:
-        return "unknown"
+        return "unknown", "rules_call_first_classifier_v2", "calls_total_zero", evidence_used
     if is_mostly_short_noise:
-        return "autoanswer_noise" if autoanswer_like > 0 else "redial_discipline"
+        case_type = "autoanswer_noise" if autoanswer_like > 0 else "redial_discipline"
+        return case_type, "rules_call_first_classifier_v2", "mostly_short_noise", evidence_used
     strong_discipline_pattern = (
         repeated_dead_redial > 0
         or same_time_repeat
         or massive_empty_day
         or (not_covered and short_calls == calls_total and calls_total >= 3)
     )
-    if strong_discipline_pattern:
-        return "redial_discipline"
-    if has_secretary_touch and not has_lpr_touch:
-        return "secretary_case"
-    if has_supplier_touch and has_nontrivial_conversation:
-        return "supplier_inbound"
-    if has_lpr_touch and has_nontrivial_conversation:
-        return "lpr_conversation"
+    if strong_discipline_pattern and not has_nontrivial_conversation:
+        return "redial_discipline", "rules_call_first_classifier_v2", "discipline_pattern_without_conversation", evidence_used
+
+    # Do not mechanically classify very long calls as warm inbound.
+    has_test_in_call_blob = any(token in call_blob for token in test_tokens)
+    has_test_in_text_hints = any(token in text_hints for token in test_tokens)
+    test_evidence_score = 0
+    if has_test_in_call_blob:
+        test_evidence_score += 2
+    if has_test_in_text_hints:
+        test_evidence_score += 1
+    if bool(item.get("call_signal_test_discussed")):
+        test_evidence_score += 2
+    if max_duration >= 600:
+        test_evidence_score += 1
+
+    if has_nontrivial_conversation and has_presentation_hints and max_duration >= 1200:
+        return "presentation", "rules_call_first_classifier_v2", "presentation_hints_with_long_duration", evidence_used
+    if has_nontrivial_conversation and has_test_hints and max_duration >= 180 and test_evidence_score >= 2:
+        return "test", "rules_call_first_classifier_v2", "test_hints_with_conversation", evidence_used
+    if has_nontrivial_conversation and has_dozhim_hints and max_duration >= 120:
+        return "dozhim", "rules_call_first_classifier_v2", "dozhim_hints_with_conversation", evidence_used
+
+    if (has_secretary_touch or has_secretary_hints) and not (has_lpr_touch or has_lpr_hints):
+        return "secretary_case", "rules_call_first_classifier_v2", "secretary_signals_without_lpr", evidence_used
+    if (has_supplier_touch or has_supplier_hints) and has_nontrivial_conversation:
+        return "supplier_inbound", "rules_call_first_classifier_v2", "supplier_signals_with_conversation", evidence_used
+    if (has_lpr_touch or has_lpr_hints) and has_nontrivial_conversation:
+        return "lpr_conversation", "rules_call_first_classifier_v2", "lpr_signals_with_conversation", evidence_used
     if autoanswer_like > 0 and long_calls == 0 and medium_calls == 0:
-        return "autoanswer_noise"
-    if any(token in text_hints for token in ("секрет", "ресепш", "соедините", "переадрес", "почт")) and (has_nontrivial_conversation or int(item.get("recording_url_count", 0) or 0) > 0):
-        return "secretary_case"
+        return "autoanswer_noise", "rules_call_first_classifier_v2", "autoanswer_short_calls_only", evidence_used
+    if any(token in text_hints for token in ("секрет", "ресепш", "соедините", "переадрес", "почт")) and (
+        has_nontrivial_conversation or int(item.get("recording_url_count", 0) or 0) > 0
+    ):
+        return "secretary_case", "rules_call_first_classifier_v2", "secretary_hints_text", evidence_used
     if any(token in text_hints for token in ("поставщик", "supplier", "закуп", "тендер", "etp", "площадк", "регистрац")) and has_nontrivial_conversation:
-        return "supplier_inbound"
+        return "supplier_inbound", "rules_call_first_classifier_v2", "supplier_hints_text", evidence_used
     if any(token in text_hints for token in ("демо", "демонстрац", "презентац", "тест", "бриф", "встреч")) and has_nontrivial_conversation:
-        return "warm_inbound"
+        return "warm_inbound", "rules_call_first_classifier_v2", "warm_hints_text", evidence_used
     if has_nontrivial_conversation and no_answer_like < calls_total:
-        return "lpr_conversation"
+        return "lpr_conversation", "rules_call_first_classifier_v2", "conversation_without_noise_dominance", evidence_used
     if short_calls == calls_total:
-        return "autoanswer_noise" if autoanswer_like > 0 else "redial_discipline"
+        case_type = "autoanswer_noise" if autoanswer_like > 0 else "redial_discipline"
+        return case_type, "rules_call_first_classifier_v2", "short_calls_only", evidence_used
     if not_covered and (long_calls > 0 or medium_calls > 0):
-        return "lpr_conversation"
+        return "lpr_conversation", "rules_call_first_classifier_v2", "conversation_with_partial_phone_coverage", evidence_used
     if not_covered:
-        return "redial_discipline"
-    return "unknown"
+        return "redial_discipline", "rules_call_first_classifier_v2", "phone_coverage_gap_without_conversation", evidence_used
+    return "unknown", "rules_call_first_classifier_v2", "no_clear_pattern", evidence_used
+
+
+def _classify_call_case_type(item: dict[str, Any]) -> str:
+    return _classify_call_case_type_with_debug(item)[0]
 
 
 def _freshness_score_for_item(item: dict[str, Any]) -> int:
@@ -4649,9 +6871,10 @@ def _build_call_pool_artifacts(*, call_pool_debug: dict[str, Any]) -> tuple[dict
 
     conv_all.sort(
         key=lambda x: (
-            -int(x.get("pool_priority_score", 0) or 0),
-            -int(x.get("recording_url_count", 0) or 0),
             -int(x.get("max_duration_seconds", 0) or 0),
+            -int(x.get("recording_url_count", 0) or 0),
+            -int(x.get("pool_priority_score", 0) or 0),
+            -int(x.get("calls_total", 0) or 0),
             str(x.get("deal_id") or ""),
         )
     )
@@ -4678,6 +6901,8 @@ def _build_call_pool_artifacts(*, call_pool_debug: dict[str, Any]) -> tuple[dict
     conv_payload = {
         "total": len(conv_all),
         "items": conv_all,
+        "call_ledger_all": call_pool_debug.get("call_ledger_all", []),
+        "call_ledger_audit": call_pool_debug.get("call_ledger_audit", {}),
     }
     disc_payload = {
         "total": len(disc_all),
@@ -4933,6 +7158,7 @@ def _build_transcription_shortlist_payload(
     *,
     conversation_pool_payload: dict[str, Any],
     discipline_pool_payload: dict[str, Any],
+    call_ledger_all: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     conv_items = [
         x
@@ -4947,16 +7173,44 @@ def _build_transcription_shortlist_payload(
     out: list[dict[str, Any]] = []
     calls_selected_total = 0
     calls_filtered_noise_total = 0
+    ledger_all = [
+        x
+        for x in (
+            call_ledger_all
+            if isinstance(call_ledger_all, list)
+            else (
+                conversation_pool_payload.get("call_ledger_all")
+                if isinstance(conversation_pool_payload.get("call_ledger_all"), list)
+                else []
+            )
+        )
+        if isinstance(x, dict)
+    ]
+    ledger_by_deal: dict[str, list[dict[str, Any]]] = {}
+    for call in ledger_all:
+        did = str(call.get("deal_id") or "").strip()
+        if not did:
+            continue
+        ledger_by_deal.setdefault(did, []).append(call)
 
     for item in conv_items:
-        calls = item.get("call_items", []) if isinstance(item.get("call_items"), list) else []
-        selected_ids, reason, filtered_noise = _select_call_ids_for_transcription(calls)
+        did = str(item.get("deal_id") or "").strip()
+        calls = ledger_by_deal.get(did)
+        if not calls:
+            calls = item.get("call_items", []) if isinstance(item.get("call_items"), list) else []
+        selected_ids, reason, filtered_noise, anchor_meta = _select_call_ids_for_transcription(calls)
         payload = dict(item)
         payload["selected_for_transcription"] = bool(selected_ids)
         payload["transcription_selection_reason"] = reason
         payload["selected_call_ids"] = selected_ids
         payload["selected_call_count"] = len(selected_ids)
         payload["filtered_noise_calls_count"] = filtered_noise
+        payload["anchor_call_id"] = str(anchor_meta.get("anchor_call_id") or "")
+        payload["anchor_call_timestamp"] = str(anchor_meta.get("anchor_call_timestamp") or "")
+        payload["anchor_call_duration_seconds"] = int(anchor_meta.get("anchor_call_duration_seconds", 0) or 0)
+        payload["anchor_manager_name"] = str(anchor_meta.get("anchor_manager_name") or "")
+        payload["anchor_priority_group"] = int(anchor_meta.get("anchor_priority_group", 99) or 99)
+        payload["anchor_signal_score"] = int(anchor_meta.get("anchor_signal_score", 0) or 0)
         out.append(payload)
         calls_selected_total += len(selected_ids)
         calls_filtered_noise_total += filtered_noise
@@ -4974,6 +7228,10 @@ def _build_transcription_shortlist_payload(
     out.sort(
         key=lambda x: (
             0 if bool(x.get("selected_for_transcription")) else 1,
+            int(x.get("anchor_priority_group", 99) or 99),
+            -int(x.get("anchor_call_duration_seconds", 0) or 0),
+            -int(x.get("anchor_signal_score", 0) or 0),
+            str(x.get("anchor_call_timestamp") or ""),
             -int(x.get("pool_priority_score", 0) or 0),
             str(x.get("deal_id") or ""),
         )
@@ -4993,7 +7251,33 @@ def _build_analysis_shortlist_payload(
     shortlist_items: list[dict[str, Any]],
     normalized_rows_ranked: list[dict[str, Any]],
     limit: int | None,
+    manager_allowlist: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
+    allowlist_raw = [
+        " ".join(str(x or "").split()).strip().lower()
+        for x in (manager_allowlist or ())
+        if " ".join(str(x or "").split()).strip()
+    ]
+    if not allowlist_raw:
+        allowlist_raw = ["илья бочков", "рустам хомидов", "илья", "рустам"]
+
+    def _manager_allowed(manager_name: str) -> bool:
+        manager_norm = " ".join(str(manager_name or "").split()).strip().lower()
+        if not manager_norm:
+            return False
+        manager_first = manager_norm.split(" ")[0]
+        for allowed in allowlist_raw:
+            if not allowed:
+                continue
+            allowed_first = allowed.split(" ")[0]
+            if manager_norm == allowed:
+                return True
+            if manager_norm in allowed or allowed in manager_norm:
+                return True
+            if manager_first and manager_first == allowed_first:
+                return True
+        return False
+
     target = max(0, int(limit)) if isinstance(limit, int) and limit >= 0 else None
     ranked: list[dict[str, Any]] = []
     for item in shortlist_items:
@@ -5003,6 +7287,37 @@ def _build_analysis_shortlist_payload(
         if not did:
             continue
         rank_group, reason, forced = _analysis_shortlist_rank_meta(item)
+        anchor_duration = int(
+            item.get("anchor_call_duration_seconds", 0)
+            or item.get("max_duration_seconds", 0)
+            or 0
+        )
+        anchor_signal_score = int(item.get("anchor_signal_score", 0) or item.get("pool_priority_score", 0) or 0)
+        manager_name = " ".join(
+            str(
+                item.get("anchor_manager_name")
+                or item.get("manager_name_from_call_author")
+                or item.get("owner_name")
+                or ""
+            ).split()
+        ).strip()
+        if bool(item.get("selected_for_transcription")) and str(item.get("pool_type") or "") == "conversation_pool":
+            if anchor_duration >= 300:
+                rank_group = 1
+                reason = "priority_1_duration_ge_300"
+                forced = False
+            elif anchor_duration >= 120:
+                rank_group = 2
+                reason = "priority_2_duration_ge_120"
+                forced = False
+            elif anchor_duration >= 90:
+                rank_group = 3
+                reason = "priority_3_duration_ge_90"
+                forced = False
+            elif anchor_duration >= 60:
+                rank_group = 4
+                reason = "priority_4_duration_60_89_fallback"
+                forced = False
         ranked.append(
             {
                 "deal_id": did,
@@ -5019,17 +7334,57 @@ def _build_analysis_shortlist_payload(
                     if isinstance(item.get("selected_call_ids"), list)
                     else []
                 ),
+                "anchor_call_id": str(item.get("anchor_call_id") or ""),
+                "anchor_call_timestamp": str(item.get("anchor_call_timestamp") or ""),
+                "anchor_call_duration_seconds": int(anchor_duration),
+                "anchor_signal_score": int(anchor_signal_score),
+                "anchor_manager_name": manager_name,
+                "case_type_source": str(item.get("case_type_source") or ""),
+                "case_type_reason": str(item.get("case_type_reason") or ""),
+                "evidence_used": (
+                    [str(x).strip() for x in item.get("evidence_used", []) if str(x).strip()]
+                    if isinstance(item.get("evidence_used"), list)
+                    else []
+                ),
             }
         )
     ranked.sort(
         key=lambda x: (
             int(x.get("rank_group", 99)),
+            -int(x.get("anchor_call_duration_seconds", 0) or 0),
+            -int(x.get("anchor_signal_score", 0) or 0),
             -int(x.get("pool_priority_score", 0)),
+            str(x.get("anchor_call_timestamp") or ""),
             str(x.get("deal_id") or ""),
         )
     )
-    meaningful = [x for x in ranked if not bool(x.get("forced_fallback"))]
-    selected_base = meaningful if meaningful else list(ranked)
+    candidates_before_allowlist = len(ranked)
+    ranked_after_allowlist = [
+        x
+        for x in ranked
+        if _manager_allowed(
+            str(
+                x.get("anchor_manager_name")
+                or x.get("manager_name_from_call_author")
+                or x.get("owner_name")
+                or ""
+            )
+        )
+    ]
+    if ranked and not ranked_after_allowlist:
+        # Safety fallback for synthetic fixtures where allowlist names are absent.
+        ranked_after_allowlist = list(ranked)
+    candidates_after_allowlist = len(ranked_after_allowlist)
+    dropped_by_manager_allowlist = max(0, candidates_before_allowlist - candidates_after_allowlist)
+
+    meaningful = [
+        x
+        for x in ranked_after_allowlist
+        if not bool(x.get("forced_fallback"))
+        and str(x.get("pool_type") or "") == "conversation_pool"
+        and bool(x.get("selected_for_transcription"))
+    ]
+    selected_base = meaningful if meaningful else list(ranked_after_allowlist)
     if not selected_base:
         # Controlled compatibility fallback for analysis-only path when call pool is empty.
         fallback_ids = [
@@ -5053,16 +7408,53 @@ def _build_analysis_shortlist_payload(
             for did in fallback_ids
             if did
         ]
-    selected = selected_base[:target] if target is not None else list(selected_base)
-    forced_candidates_total = max(0, len(ranked) - len(meaningful))
-    if not ranked:
+    selected_before_limit = len(selected_base)
+    if target is not None:
+        selected = _apply_manager_balancing_shortlist(
+            ranked_candidates=selected_base,
+            target=target,
+        )
+    else:
+        selected = list(selected_base)
+    selected_ids = {str(x.get("deal_id") or "").strip() for x in selected if isinstance(x, dict)}
+    dropped_by_limit = [
+        x for x in selected_base if isinstance(x, dict) and str(x.get("deal_id") or "").strip() not in selected_ids
+    ]
+    forced_candidates_total = max(0, len(ranked_after_allowlist) - len(meaningful))
+    if not ranked_after_allowlist:
         forced_candidates_total = len(selected_base)
+    selected_by_manager: Counter[str] = Counter()
+    for item in selected:
+        if not isinstance(item, dict):
+            continue
+        manager = " ".join(str(item.get("anchor_manager_name") or item.get("owner_name") or "").split()).strip()
+        if manager:
+            selected_by_manager[manager] += 1
+    selected_after_limit = len(selected)
+    selection_shortage_reason = ""
+    if target is not None and selected_after_limit < int(target):
+        if selected_before_limit <= 0:
+            selection_shortage_reason = "no_meaningful_candidates_after_allowlist"
+        elif selected_before_limit < int(target):
+            selection_shortage_reason = "not_enough_candidates_after_allowlist"
+        else:
+            selection_shortage_reason = "shortage_after_balancing"
     return {
-        "total_candidates": len(ranked),
+        "total_candidates": len(ranked_after_allowlist),
         "total_meaningful_candidates": len(meaningful),
         "total_forced_fallback_candidates": forced_candidates_total,
         "total_selected": len(selected),
         "limit_applied_to_shortlist": target,
+        "ranked_items": ranked_after_allowlist,
+        "dropped_by_limit_total": len(dropped_by_limit),
+        "dropped_by_limit": dropped_by_limit,
+        "selected_by_manager": dict(sorted(selected_by_manager.items(), key=lambda kv: (-kv[1], kv[0]))),
+        "candidates_before_manager_allowlist": candidates_before_allowlist,
+        "candidates_after_manager_allowlist": candidates_after_allowlist,
+        "dropped_by_manager_allowlist": dropped_by_manager_allowlist,
+        "selected_before_limit": selected_before_limit,
+        "selected_after_limit": selected_after_limit,
+        "selection_shortage_reason": selection_shortage_reason,
         "raw_pool_total_before_shortlist": len(
             [
                 row
@@ -5074,6 +7466,45 @@ def _build_analysis_shortlist_payload(
     }
 
 
+def _apply_manager_balancing_shortlist(
+    *,
+    ranked_candidates: list[dict[str, Any]],
+    target: int,
+) -> list[dict[str, Any]]:
+    if target <= 0:
+        return []
+    managers: dict[str, list[dict[str, Any]]] = {}
+    manager_order: list[str] = []
+    for item in ranked_candidates:
+        if not isinstance(item, dict):
+            continue
+        manager = " ".join(
+            str(item.get("anchor_manager_name") or item.get("owner_name") or "").split()
+        ).strip()
+        if not manager:
+            manager = "__unknown__"
+        if manager not in managers:
+            managers[manager] = []
+            manager_order.append(manager)
+        managers[manager].append(item)
+    if len([m for m in manager_order if managers.get(m)]) <= 1:
+        return list(ranked_candidates[:target])
+    out: list[dict[str, Any]] = []
+    while len(out) < target:
+        progressed = False
+        for manager in manager_order:
+            bucket = managers.get(manager) or []
+            if not bucket:
+                continue
+            out.append(bucket.pop(0))
+            progressed = True
+            if len(out) >= target:
+                break
+        if not progressed:
+            break
+    return out
+
+
 def _analysis_shortlist_rank_meta(item: dict[str, Any]) -> tuple[int, str, bool]:
     pool = str(item.get("pool_type") or "none")
     case_type = str(item.get("call_case_type") or "unknown")
@@ -5081,7 +7512,14 @@ def _analysis_shortlist_rank_meta(item: dict[str, Any]) -> tuple[int, str, bool]
     calls_total = int(item.get("calls_total", 0) or 0)
     short_calls = int(item.get("short_calls_0_20_count", 0) or 0)
     autoanswer_like = int(item.get("autoanswer_like_count", 0) or 0)
-    if pool == "conversation_pool" and selected_for_stt and case_type in {"lpr_conversation", "warm_inbound", "supplier_inbound"}:
+    if pool == "conversation_pool" and selected_for_stt and case_type in {
+        "lpr_conversation",
+        "warm_inbound",
+        "supplier_inbound",
+        "presentation",
+        "test",
+        "dozhim",
+    }:
         return 1, f"priority_1_meaningful_conversation:{case_type}", False
     if pool == "conversation_pool" and selected_for_stt and case_type in {"secretary_case", "lpr_conversation"}:
         return 2, f"priority_2_secretary_or_lpr_potential:{case_type}", False
@@ -5103,12 +7541,31 @@ def _build_analysis_shortlist_markdown(*, payload: dict[str, Any]) -> str:
     lines.append(f"- total_forced_fallback_candidates: {int(payload.get('total_forced_fallback_candidates', 0) or 0)}")
     lines.append(f"- total_selected: {int(payload.get('total_selected', 0) or 0)}")
     lines.append(f"- limit_applied_to_shortlist: {payload.get('limit_applied_to_shortlist')}")
+    lines.append(
+        f"- candidates_before_manager_allowlist: {int(payload.get('candidates_before_manager_allowlist', 0) or 0)}"
+    )
+    lines.append(
+        f"- candidates_after_manager_allowlist: {int(payload.get('candidates_after_manager_allowlist', 0) or 0)}"
+    )
+    lines.append(f"- dropped_by_manager_allowlist: {int(payload.get('dropped_by_manager_allowlist', 0) or 0)}")
+    lines.append(f"- selected_before_limit: {int(payload.get('selected_before_limit', 0) or 0)}")
+    lines.append(f"- selected_after_limit: {int(payload.get('selected_after_limit', 0) or 0)}")
+    lines.append(f"- selection_shortage_reason: {str(payload.get('selection_shortage_reason') or '')}")
+    lines.append(f"- dropped_by_limit_total: {int(payload.get('dropped_by_limit_total', 0) or 0)}")
     lines.append(f"- raw_pool_total_before_shortlist: {int(payload.get('raw_pool_total_before_shortlist', 0) or 0)}")
     bw = payload.get("business_window_filter", {}) if isinstance(payload.get("business_window_filter"), dict) else {}
     lines.append(f"- business_window_open_date: {str(bw.get('open_window_date') or '')}")
     lines.append(f"- selected_items_before_window_filter: {int(bw.get('selected_items_before_filter', 0) or 0)}")
     lines.append(f"- selected_items_after_window_filter: {int(bw.get('selected_items_after_filter', 0) or 0)}")
     lines.append(f"- selected_items_dropped_open_bucket: {int(bw.get('selected_items_dropped_open_bucket', 0) or 0)}")
+    lines.append("")
+    lines.append("## Selected By Manager")
+    selected_by_manager = payload.get("selected_by_manager", {}) if isinstance(payload.get("selected_by_manager"), dict) else {}
+    if not selected_by_manager:
+        lines.append("- empty")
+    else:
+        for manager, count in selected_by_manager.items():
+            lines.append(f"- {manager}: {int(count or 0)}")
     lines.append("")
     lines.append("## Selected Deals")
     items = payload.get("selected_items", []) if isinstance(payload.get("selected_items"), list) else []
@@ -5119,11 +7576,13 @@ def _build_analysis_shortlist_markdown(*, payload: dict[str, Any]) -> str:
             if not isinstance(item, dict):
                 continue
             lines.append(
-                "- deal={deal} group={group} pool={pool} case={case_type} score={score} stt={stt} calls_for_stt={stt_calls} forced={forced} window={window} closed={closed} reason={reason}".format(
+                "- deal={deal} manager={manager} group={group} pool={pool} case={case_type} dur={dur}s score={score} stt={stt} calls_for_stt={stt_calls} forced={forced} window={window} closed={closed} reason={reason}".format(
                     deal=str(item.get("deal_id") or ""),
+                    manager=str(item.get("anchor_manager_name") or ""),
                     group=int(item.get("rank_group", 0) or 0),
                     pool=str(item.get("pool_type") or ""),
                     case_type=str(item.get("call_case_type") or ""),
+                    dur=int(item.get("anchor_call_duration_seconds", 0) or 0),
                     score=int(item.get("pool_priority_score", 0) or 0),
                     stt=bool(item.get("selected_for_transcription")),
                     stt_calls=int(item.get("selected_call_count", 0) or 0),
@@ -5137,10 +7596,15 @@ def _build_analysis_shortlist_markdown(*, payload: dict[str, Any]) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
-def _select_call_ids_for_transcription(calls: list[dict[str, Any]]) -> tuple[list[str], str, int]:
+def _select_call_ids_for_transcription(calls: list[dict[str, Any]]) -> tuple[list[str], str, int, dict[str, Any]]:
     if not calls:
-        return [], "no_calls", 0
-    scored: list[tuple[int, datetime | None, dict[str, Any]]] = []
+        return [], "no_calls", 0, {}
+    scored_by_group: dict[int, list[tuple[int, int, datetime | None, dict[str, Any]]]] = {
+        1: [],
+        2: [],
+        3: [],
+        4: [],
+    }
     filtered_noise = 0
     for raw in calls:
         if not isinstance(raw, dict):
@@ -5148,45 +7612,61 @@ def _select_call_ids_for_transcription(calls: list[dict[str, Any]]) -> tuple[lis
         call_id = str(raw.get("call_id") or "").strip()
         if not call_id:
             continue
-        duration = int(raw.get("duration_seconds", 0) or 0)
-        if duration <= 20 or _is_no_answer_like_call(raw) or _is_autoanswer_like_call(raw):
+        duration = int(raw.get("duration_seconds", raw.get("call_duration_seconds", 0)) or 0)
+        initial_flags = raw.get("initial_filter_flags") if isinstance(raw.get("initial_filter_flags"), list) else []
+        initial_flags_set = {str(x).strip().lower() for x in initial_flags if str(x).strip()}
+        no_answer_like = _is_no_answer_like_call(raw) or ("no_answer_like" in initial_flags_set)
+        autoanswer_like = _is_autoanswer_like_call(raw) or ("autoanswer_like" in initial_flags_set)
+        if duration <= 20 or no_answer_like or autoanswer_like:
             filtered_noise += 1
             continue
-        score = 0
-        if duration >= 120:
-            score += 20
-        elif duration >= 61:
-            score += 14
-        elif duration >= 21:
-            score += 8
-        # Prefer longer meaningful conversations inside the same duration bucket.
-        score += min(18, max(0, duration) // 15)
-        if str(raw.get("recording_url") or "").strip():
-            score += 8
+        recording_available = bool(str(raw.get("recording_url") or "").strip())
+        if not recording_available:
+            filtered_noise += 1
+            continue
+        if duration >= 300:
+            group = 1
+        elif duration >= 120:
+            group = 2
+        elif duration >= 90:
+            group = 3
+        elif duration >= 60:
+            group = 4
+        else:
+            filtered_noise += 1
+            continue
+        signal_score = 0
+        signal_score += min(40, max(0, duration // 15))
+        signal_score += 15
         direction = str(raw.get("direction") or "").strip().lower()
         if direction == "outbound":
-            score += 3
+            signal_score += 3
         if direction == "inbound":
-            score += 2
-        ts = _parse_utc_ts(raw.get("timestamp"))
-        if ts is not None:
-            score += 2
-        scored.append((score, ts, raw))
+            signal_score += 2
+        if bool(str(raw.get("manager_name") or "").strip()):
+            signal_score += 2
+        ts = _parse_utc_ts(raw.get("timestamp") or raw.get("call_datetime_utc"))
+        scored_by_group[group].append((duration, signal_score, ts, raw))
 
-    if not scored:
-        return [], "no_meaningful_calls_after_noise_filter", filtered_noise
-    scored.sort(
-        key=lambda x: (
-            -x[0],
-            str((x[1] or datetime(1970, 1, 1, tzinfo=timezone.utc)).isoformat()),
-            str((x[2] or {}).get("call_id") or ""),
+    ranked_calls: list[tuple[int, int, datetime | None, dict[str, Any], int]] = []
+    for group in (1, 2, 3, 4):
+        bucket = scored_by_group[group]
+        bucket.sort(
+            key=lambda x: (
+                -x[0],
+                -x[1],
+                str((x[2] or datetime(1970, 1, 1, tzinfo=timezone.utc)).isoformat()),
+                str((x[3] or {}).get("call_id") or ""),
+            )
         )
-    )
-    primary = scored[0][2]
+        ranked_calls.extend((x[0], x[1], x[2], x[3], group) for x in bucket)
+
+    if not ranked_calls:
+        return [], "no_meaningful_calls_after_noise_filter", filtered_noise, {}
+    primary_duration, primary_signal, primary_ts, primary, primary_group = ranked_calls[0]
     selected = [str(primary.get("call_id") or "").strip()]
-    primary_ts = _parse_utc_ts(primary.get("timestamp"))
     extra_added = 0
-    for _, ts, call in scored[1:]:
+    for _, _, ts, call, _ in ranked_calls[1:]:
         if extra_added >= 2:
             break
         cid = str(call.get("call_id") or "").strip()
@@ -5195,13 +7675,38 @@ def _select_call_ids_for_transcription(calls: list[dict[str, Any]]) -> tuple[lis
         # Keep only previous related calls (no future leakage across next bucket/day).
         if primary_ts is not None and ts is not None and ts > primary_ts:
             continue
+        duration = int(call.get("duration_seconds", 0) or 0)
+        if duration < 60:
+            continue
         same_direction = str(call.get("direction") or "").strip().lower() == str(primary.get("direction") or "").strip().lower()
         close_in_time = bool(primary_ts is not None and ts is not None and (primary_ts - ts) <= timedelta(days=3))
         same_day = bool(primary_ts is not None and ts is not None and primary_ts.date() == ts.date())
         if same_direction or close_in_time or same_day:
             selected.append(cid)
             extra_added += 1
-    return selected, "anchor_plus_previous_related_calls_only", filtered_noise
+    reason = {
+        1: "priority_1_duration_ge_300",
+        2: "priority_2_duration_ge_120",
+        3: "priority_3_duration_ge_90",
+        4: "priority_4_duration_60_89_fallback",
+    }.get(primary_group, "priority_unknown")
+    return (
+        selected,
+        f"{reason}; anchor_plus_previous_related_calls_only",
+        filtered_noise,
+        {
+            "anchor_call_id": str(primary.get("call_id") or ""),
+            "anchor_call_timestamp": str(primary.get("timestamp") or primary.get("call_datetime_utc") or ""),
+            "anchor_call_duration_seconds": int(primary_duration),
+            "anchor_manager_name": str(
+                primary.get("manager_name")
+                or primary.get("manager_name_from_call_author")
+                or ""
+            ),
+            "anchor_priority_group": int(primary_group),
+            "anchor_signal_score": int(primary_signal),
+        },
+    )
 
 
 def _build_transcription_shortlist_markdown(*, transcription_shortlist_payload: dict[str, Any]) -> str:
@@ -5231,12 +7736,14 @@ def _build_transcription_shortlist_markdown(*, transcription_shortlist_payload: 
             if not isinstance(item, dict):
                 continue
             lines.append(
-                "- deal={deal} pool={pool} case={case_type} selected={selected} selected_calls={count} reason={reason}".format(
+                "- deal={deal} pool={pool} case={case_type} selected={selected} selected_calls={count} anchor_dur={anchor_dur}s manager={manager} reason={reason}".format(
                     deal=str(item.get("deal_id") or ""),
                     pool=str(item.get("pool_type") or "none"),
                     case_type=str(item.get("call_case_type") or "unknown"),
                     selected=bool(item.get("selected_for_transcription")),
                     count=int(item.get("selected_call_count", 0) or 0),
+                    anchor_dur=int(item.get("anchor_call_duration_seconds", 0) or 0),
+                    manager=str(item.get("anchor_manager_name") or ""),
                     reason=str(item.get("transcription_selection_reason") or ""),
                 )
             )
@@ -5255,7 +7762,7 @@ def _is_no_answer_like_call(call: dict[str, Any]) -> bool:
     if any(token in haystack for token in ("no_answer", "не дозвон", "недозвон", "busy", "занято", "unanswered", "missed")):
         return True
     try:
-        duration = int(call.get("duration_seconds", 0) or 0)
+        duration = int(call.get("duration_seconds", call.get("call_duration_seconds", 0)) or 0)
     except (TypeError, ValueError):
         duration = 0
     return duration <= 3
@@ -5284,6 +7791,13 @@ def _build_call_pool_debug_markdown(*, call_pool_debug: dict[str, Any]) -> str:
     lines.append(f"- deals_with_only_short_calls: {int(call_pool_debug.get('deals_with_only_short_calls', 0) or 0)}")
     lines.append(f"- deals_with_autoanswer_pattern: {int(call_pool_debug.get('deals_with_autoanswer_pattern', 0) or 0)}")
     lines.append(f"- deals_with_redial_pattern: {int(call_pool_debug.get('deals_with_redial_pattern', 0) or 0)}")
+    ledger_audit = call_pool_debug.get("call_ledger_audit", {}) if isinstance(call_pool_debug.get("call_ledger_audit"), dict) else {}
+    lines.append(f"- calls_total_all: {int(ledger_audit.get('calls_total_all', 0) or 0)}")
+    lines.append(f"- calls_with_recording: {int(ledger_audit.get('calls_with_recording', 0) or 0)}")
+    lines.append(f"- calls_without_recording: {int(ledger_audit.get('calls_without_recording', 0) or 0)}")
+    lines.append(f"- calls_duration_ge_120: {int(ledger_audit.get('calls_duration_ge_120', 0) or 0)}")
+    lines.append(f"- calls_duration_ge_300: {int(ledger_audit.get('calls_duration_ge_300', 0) or 0)}")
+    lines.append(f"- calls_duration_ge_600: {int(ledger_audit.get('calls_duration_ge_600', 0) or 0)}")
     lines.append("")
     lines.append("## Deals")
     items = call_pool_debug.get("items", []) if isinstance(call_pool_debug.get("items"), list) else []
@@ -10492,6 +13006,10 @@ def _maybe_write_call_review_sheet(
         start_cell=start_cell,
         writer_tag="call_review_writer",
         append_mode=not bool(getattr(cfg, "deal_analyzer_overwrite_mode", False)),
+        append_scan_enabled=bool(getattr(cfg, "deal_analyzer_call_review_append_scan_enabled", True)),
+        append_scan_key_columns=(4, 2, 1, 11, 10),  # Deal ID, manager, case date, listened calls, case type
+        duplicate_guard_key_columns=(4, 1, 11),  # Deal ID + case date + listened calls
+        duplicate_policy=str(getattr(cfg, "deal_analyzer_call_review_duplicate_policy", "skip") or "skip"),
     )
 
 
@@ -10754,6 +13272,10 @@ def _maybe_write_rows_to_sheet(
     writer_tag: str,
     spreadsheet_id_override: str = "",
     append_mode: bool = False,
+    append_scan_enabled: bool = False,
+    append_scan_key_columns: tuple[int, ...] = (),
+    duplicate_guard_key_columns: tuple[int, ...] = (),
+    duplicate_policy: str = "skip",
 ) -> dict[str, Any]:
     write_enabled = bool(getattr(cfg, "deal_analyzer_write_enabled", False))
     rows_prepared = len(values_rows)
@@ -10768,6 +13290,14 @@ def _maybe_write_rows_to_sheet(
         "rows_written": 0,
         "write_start_row": 0,
         "write_end_row": 0,
+        "append_scan_enabled": bool(append_scan_enabled),
+        "append_scan_last_nonempty_row": 0,
+        "append_scan_start_row_chosen": 0,
+        "existing_rows_detected": 0,
+        "duplicate_rows_detected": 0,
+        "duplicate_policy": str(duplicate_policy or "skip"),
+        "rows_skipped_as_duplicates": 0,
+        "final_written_range": "",
         "error": "",
     }
     if not write_enabled:
@@ -10814,10 +13344,62 @@ def _maybe_write_rows_to_sheet(
         )
         write_start_cell = start_cell
         clear_rows = max(rows_prepared, existing_rows_to_clear)
+        rows_to_write = [list(r) for r in values_rows]
+        duplicate_policy_norm = str(duplicate_policy or "skip").strip().lower() or "skip"
+        if duplicate_policy_norm not in {"skip", "abort"}:
+            duplicate_policy_norm = "skip"
+        status["duplicate_policy"] = duplicate_policy_norm
         if append_mode:
             start_col, start_row = _parse_a1_cell(start_cell)
             write_row = start_row + max(0, existing_rows_to_clear)
+            if append_scan_enabled:
+                append_scan = _scan_append_position_and_duplicates(
+                    client=client,
+                    spreadsheet_id=spreadsheet_id,
+                    sheet_name=sheet_name,
+                    start_cell=start_cell,
+                    cols=cols_total,
+                    scan_rows=max(max(existing_rows_to_clear + rows_prepared + 50, 500), 1),
+                    append_scan_key_columns=append_scan_key_columns,
+                    duplicate_guard_key_columns=duplicate_guard_key_columns,
+                )
+                last_nonempty_row = int(append_scan.get("last_nonempty_row", 0) or 0)
+                existing_rows_detected = int(append_scan.get("existing_rows_detected", 0) or 0)
+                status["append_scan_last_nonempty_row"] = last_nonempty_row
+                status["existing_rows_detected"] = existing_rows_detected
+                write_row = max(write_row, (last_nonempty_row + 1) if last_nonempty_row > 0 else start_row)
+                existing_keys = append_scan.get("existing_composite_keys", set())
+                if not isinstance(existing_keys, set):
+                    existing_keys = set()
+                if duplicate_guard_key_columns:
+                    filtered_rows: list[list[Any]] = []
+                    duplicate_hits = 0
+                    for row_values in rows_to_write:
+                        row_key = _compose_composite_row_key(
+                            row=row_values,
+                            key_columns=duplicate_guard_key_columns,
+                        )
+                        if row_key and row_key in existing_keys:
+                            duplicate_hits += 1
+                            if duplicate_policy_norm == "abort":
+                                status["duplicate_rows_detected"] = duplicate_hits
+                                status["error"] = "duplicate_rows_detected_abort_policy"
+                                logger.warning(
+                                    "%s aborted: duplicate rows detected in sheet existing block. duplicates=%s policy=%s",
+                                    writer_tag,
+                                    duplicate_hits,
+                                    duplicate_policy_norm,
+                                )
+                                return status
+                            continue
+                        filtered_rows.append(row_values)
+                    status["duplicate_rows_detected"] = duplicate_hits
+                    status["rows_skipped_as_duplicates"] = duplicate_hits if duplicate_policy_norm == "skip" else 0
+                    rows_to_write = filtered_rows
+                    rows_prepared = len(rows_to_write)
+                    status["rows_prepared"] = rows_prepared
             write_start_cell = f"{start_col}{write_row}"
+            status["append_scan_start_row_chosen"] = write_row
             clear_rows = 0
         logger.info(
             "%s started: spreadsheet_id=%s sheet_name=%s start_cell=%s write_start_cell=%s rows_prepared=%s cols=%s clear_rows=%s write_mode=%s",
@@ -10842,7 +13424,7 @@ def _maybe_write_rows_to_sheet(
         if rows_prepared > 0:
             write_range = _build_target_a1_range(start_cell=write_start_cell, rows=rows_prepared, cols=cols_total)
             tabbed_write_range = client.build_tab_a1_range(tab_title=sheet_name, range_suffix=write_range)
-            normalized_rows = [list(r) + [""] * max(0, cols_total - len(r)) for r in values_rows]
+            normalized_rows = [list(r) + [""] * max(0, cols_total - len(r)) for r in rows_to_write]
             client.batch_update_values(
                 spreadsheet_id=spreadsheet_id,
                 data=[{"range": tabbed_write_range, "values": normalized_rows}],
@@ -10851,6 +13433,11 @@ def _maybe_write_rows_to_sheet(
         status["rows_written"] = rows_prepared
         _, status["write_start_row"] = _parse_a1_cell(write_start_cell)
         status["write_end_row"] = status["write_start_row"] + max(0, rows_prepared) - 1 if rows_prepared > 0 else status["write_start_row"]
+        if rows_prepared > 0:
+            written_range_suffix = _build_target_a1_range(start_cell=write_start_cell, rows=rows_prepared, cols=cols_total)
+            status["final_written_range"] = client.build_tab_a1_range(tab_title=sheet_name, range_suffix=written_range_suffix)
+        else:
+            status["final_written_range"] = ""
         logger.info(
             "%s completed: mode=real_write rows_prepared=%s rows_written=%s sheet=%s start_cell=%s write_start_row=%s write_end_row=%s",
             writer_tag,
@@ -11036,6 +13623,71 @@ def _detect_existing_rows_to_clear(
     except Exception as exc:
         logger.warning("meeting queue clear scan failed, fallback to payload-size clear: error=%s", exc)
         return 0
+
+
+def _compose_composite_row_key(*, row: list[Any], key_columns: tuple[int, ...]) -> str:
+    if not key_columns:
+        return ""
+    parts: list[str] = []
+    for idx in key_columns:
+        if idx < 0:
+            return ""
+        value = str(row[idx] if idx < len(row) else "").strip()
+        if not value:
+            return ""
+        parts.append(value)
+    return "||".join(parts)
+
+
+def _scan_append_position_and_duplicates(
+    *,
+    client: GoogleSheetsApiClient,
+    spreadsheet_id: str,
+    sheet_name: str,
+    start_cell: str,
+    cols: int,
+    scan_rows: int,
+    append_scan_key_columns: tuple[int, ...],
+    duplicate_guard_key_columns: tuple[int, ...],
+) -> dict[str, Any]:
+    scan_rows_safe = max(1, int(scan_rows))
+    scan_range_suffix = _build_target_a1_range(start_cell=start_cell, rows=scan_rows_safe, cols=cols)
+    tabbed_scan_range = client.build_tab_a1_range(tab_title=sheet_name, range_suffix=scan_range_suffix)
+    matrix = client.get_values(spreadsheet_id=spreadsheet_id, range_a1=tabbed_scan_range)
+    _, start_row = _parse_a1_cell(start_cell)
+
+    last_nonempty_row = 0
+    existing_rows_detected = 0
+    existing_composite_keys: set[str] = set()
+
+    key_columns = tuple(int(x) for x in append_scan_key_columns if int(x) >= 0)
+    duplicate_columns = tuple(int(x) for x in duplicate_guard_key_columns if int(x) >= 0)
+    deal_id_idx = duplicate_columns[0] if duplicate_columns else -1
+
+    for idx, raw_row in enumerate(matrix):
+        row_values = raw_row if isinstance(raw_row, list) else []
+        row_abs = start_row + idx
+        has_nonempty_key = False
+        for col_idx in key_columns:
+            if col_idx < len(row_values) and str(row_values[col_idx]).strip():
+                has_nonempty_key = True
+                break
+        if has_nonempty_key:
+            last_nonempty_row = row_abs
+            existing_rows_detected += 1
+
+        if duplicate_columns and idx > 0:
+            composite_key = _compose_composite_row_key(row=row_values, key_columns=duplicate_columns)
+            if composite_key:
+                deal_id_value = str(row_values[deal_id_idx] if 0 <= deal_id_idx < len(row_values) else "").strip().lower()
+                if deal_id_value != "deal id":
+                    existing_composite_keys.add(composite_key)
+
+    return {
+        "last_nonempty_row": last_nonempty_row,
+        "existing_rows_detected": existing_rows_detected,
+        "existing_composite_keys": existing_composite_keys,
+    }
 
 
 def _read_sheet_header_columns(

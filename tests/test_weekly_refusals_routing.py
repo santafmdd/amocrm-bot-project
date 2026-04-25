@@ -20,7 +20,7 @@ if "playwright" not in sys.modules:
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.run_profile_analytics import _build_weekly_refusals_flow_input, _resolve_weekly_period_mode, _run_weekly_refusals_profile, _resolve_google_auth_mode, _apply_google_auth_mode_override, RuntimeOptions
+from src.run_profile_analytics import _build_weekly_refusals_flow_input, _resolve_weekly_period_mode, _run_weekly_refusals_profile, _resolve_google_auth_mode, _apply_google_auth_mode_override, _build_weekly_period_key, RuntimeOptions
 
 
 def u(s: str) -> str:
@@ -91,6 +91,37 @@ def test_resolve_weekly_period_mode_monday_current_week() -> None:
 
 def test_resolve_weekly_period_mode_tuesday_previous_week() -> None:
     assert _resolve_weekly_period_mode(date(2026, 4, 14)) == u("\\u0417\\u0430 \\u043f\\u0440\\u043e\\u0448\\u043b\\u0443\\u044e \\u043d\\u0435\\u0434\\u0435\\u043b\\u044e")
+
+
+def test_weekly_period_key_includes_absolute_date_range_for_current_week_label() -> None:
+    period_key, eff_from, eff_to = _build_weekly_period_key(
+        report_id="weekly_refusals_cumulative_2m",
+        period_mode=u("\\u0417\\u0430 \\u044d\\u0442\\u0443 \\u043d\\u0435\\u0434\\u0435\\u043b\\u044e"),
+        date_from="",
+        date_to="",
+        current_date=date(2026, 4, 24),
+    )
+    assert eff_from == "2026-04-20"
+    assert eff_to == "2026-04-26"
+    assert period_key.endswith("|2026-04-20|2026-04-26")
+
+
+def test_weekly_period_key_different_weeks_do_not_collide_by_text_label() -> None:
+    key_week_1, _, _ = _build_weekly_period_key(
+        report_id="weekly_refusals_cumulative_2m",
+        period_mode=u("\\u0417\\u0430 \\u044d\\u0442\\u0443 \\u043d\\u0435\\u0434\\u0435\\u043b\\u044e"),
+        date_from="",
+        date_to="",
+        current_date=date(2026, 4, 24),
+    )
+    key_week_2, _, _ = _build_weekly_period_key(
+        report_id="weekly_refusals_cumulative_2m",
+        period_mode=u("\\u0417\\u0430 \\u044d\\u0442\\u0443 \\u043d\\u0435\\u0434\\u0435\\u043b\\u044e"),
+        date_from="",
+        date_to="",
+        current_date=date(2026, 5, 1),
+    )
+    assert key_week_1 != key_week_2
 
 
 def test_build_weekly_refusals_flow_input_saved_preset_mode() -> None:

@@ -1031,7 +1031,7 @@ class WeeklyRefusalsBlockWriter:
                 "Duplicate cumulative period apply blocked: "
                 f"target_id={target_key} period_key={period_key} "
                 f"previous_applied_at={prev.get('applied_at', '')} "
-                "(use cumulative_force_reapply=true only for intentional rerun)."
+                "(run dry-run preview first; cumulative_force_reapply=true is unsafe without idempotent delta check)."
             )
         return {
             "status": "ok",

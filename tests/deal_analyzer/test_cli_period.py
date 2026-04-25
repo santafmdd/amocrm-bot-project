@@ -170,6 +170,38 @@ def test_preflight_soft_nonjson_is_treated_as_live_runtime():
     assert forced_rules is False
 
 
+def test_preflight_uses_configured_preflight_timeouts():
+    logger = _Logger()
+    cfg = DealAnalyzerConfig(
+        **{
+            **_cfg().__dict__,
+            "ollama_preflight_timeout_seconds": 120,
+            "local_gemma_preflight_timeout_sec": 120,
+            "ollama_fallback_enabled": True,
+            "ollama_fallback_model": "deepseek-v3.1:671b-cloud",
+            "ollama_fallback_preflight_timeout_seconds": 120,
+        }
+    )
+    seen: list[tuple[str, int]] = []
+
+    class _Client:
+        def __init__(self, *, base_url, model, timeout_seconds):
+            self.model = model
+
+        def preflight(self, *, probe_timeout_seconds):
+            seen.append((self.model, int(probe_timeout_seconds)))
+            if self.model == "gemma4:e4b":
+                return OllamaPreflightResult(ok=False, error="main_down")
+            return OllamaPreflightResult(ok=True, error=None)
+
+    with patch("src.deal_analyzer.llm_runtime.OllamaClient", _Client):
+        forced_rules = _run_ollama_preflight(cfg, logger)
+
+    assert forced_rules is False
+    assert ("gemma4:e4b", 120) in seen
+    assert ("deepseek-v3.1:671b-cloud", 120) in seen
+
+
 def test_cli_analyze_period_parses_limit():
     import sys
     from unittest.mock import patch as _patch

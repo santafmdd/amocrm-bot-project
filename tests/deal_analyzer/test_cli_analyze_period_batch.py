@@ -1,16 +1,21 @@
 ﻿import json
+import re
 import shutil
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
+from src.amocrm_collector.client import AmoCollectorClient
 from src.config import load_config
 from src.deal_analyzer.cli import (
     _call_role_signal,
     _build_dial_discipline_signals,
     _build_daily_control_sheet_payload,
+    _collect_call_pool_debug,
+    _build_call_ledger_audit,
     _merge_deal_company_tags,
     _normalize_phone_last7,
     _build_transcription_impact_row,
@@ -18,19 +23,40 @@ from src.deal_analyzer.cli import (
     _expected_quality_text,
     _expected_quantity_text,
     _llm_chat_json_with_runtime,
+    _call_review_adaptive_timeout_seconds,
+    _call_review_timeout_overrides_for_runtime,
+    _build_call_review_row_runtime,
     _sanitize_daily_llm_columns,
     _daily_candidate_tier,
     _transcript_usability_score,
+    _try_live_refresh_period_rows,
     _select_daily_package_records,
     _build_call_pool_artifacts,
     _build_transcription_shortlist_payload,
     _build_analysis_shortlist_payload,
+    _classify_call_case_type_with_debug,
     _business_window_date_for_call,
     _open_business_window_date,
     _build_daily_table_factual_payload,
     _expand_daily_rows_to_case_rows,
     _build_company_tag_propagation_dry_run_plan,
+    _build_transcript_runtime_diagnostics,
+    _repair_call_review_llm_fields,
+    _call_review_llm_fields_ready,
+    _prepare_call_review_llm_fields,
+    _maybe_write_rows_to_sheet,
     _run_analyze_period,
+)
+from src.deal_analyzer.call_evidence import CallEvidence
+from src.deal_analyzer.call_review_v3_builder import (
+    _apply_payload_style_normalization,
+    _evaluate_transcript_usability_for_case,
+    _repair_final_payload_broken_quotes,
+    _resolve_llm_case_unready_reason,
+    _run_semantic_preflight,
+    _sanitize_user_text,
+    _transcript_skip_reason_detail,
+    build_call_review_v3_payload,
 )
 from src.deal_analyzer.daily_case_modes import classify_daily_case, get_role_scope_policy
 from src.deal_analyzer.config import DealAnalyzerConfig
@@ -1667,6 +1693,252 @@ def test_meeting_queue_writer_appends_below_existing_rows():
     assert writer.get("write_start_row", 0) >= 6
 
 
+def test_call_review_append_scan_empty_sheet_starts_from_row_3() -> None:
+    logger = _Logger()
+    cfg = replace(
+        _cfg(),
+        deal_analyzer_write_enabled=True,
+        deal_analyzer_spreadsheet_id="sheet123",
+    )
+
+    class _FakeSheetsClient:
+        def __init__(self, project_root, logger):
+            self.calls = []
+
+        def build_tab_a1_range(self, *, tab_title, range_suffix):
+            return f"'{tab_title}'!{range_suffix}"
+
+        def get_values(self, spreadsheet_id, range_a1):
+            # Header row only (row 2), no data rows yet.
+            return [["Дата анализа", "Дата кейса", "Менеджер", "", "Deal ID", "", "", "", "", "", "Тип кейса", "Прослушанные звонки"]]
+
+        def batch_update_values(self, spreadsheet_id, data):
+            self.calls.append((spreadsheet_id, data))
+            return {"ok": True}
+
+    fake_client = _FakeSheetsClient(None, None)
+    with patch("src.deal_analyzer.cli.GoogleSheetsApiClient", return_value=fake_client), patch(
+        "src.deal_analyzer.cli.load_config",
+        return_value=SimpleNamespace(project_root=Path("D:/AI_Automation/amocrm_bot/project")),
+    ):
+        status = _maybe_write_rows_to_sheet(
+            cfg=cfg,
+            logger=logger,
+            values_rows=[["2026-04-25", "2026-04-24", "Илья Бочков", "менеджер по продажам", "32162059", "", "", "", "инфо", "впрок 26", "разговор с лпр", "2026-04-24 11:59 - 05:51"]],
+            sheet_name="Разбор звонков",
+            start_cell="A2",
+            writer_tag="call_review_writer",
+            append_mode=True,
+            append_scan_enabled=True,
+            append_scan_key_columns=(4, 2, 1, 11, 10),
+            duplicate_guard_key_columns=(4, 1, 11),
+            duplicate_policy="skip",
+        )
+
+    assert status["mode"] == "real_write"
+    assert status["write_start_row"] == 3
+    assert status["append_scan_start_row_chosen"] == 3
+
+
+def test_call_review_append_scan_existing_rows_starts_after_last_nonempty() -> None:
+    logger = _Logger()
+    cfg = replace(
+        _cfg(),
+        deal_analyzer_write_enabled=True,
+        deal_analyzer_spreadsheet_id="sheet123",
+    )
+
+    class _FakeSheetsClient:
+        def __init__(self, project_root, logger):
+            self.calls = []
+
+        def build_tab_a1_range(self, *, tab_title, range_suffix):
+            return f"'{tab_title}'!{range_suffix}"
+
+        def get_values(self, spreadsheet_id, range_a1):
+            rows = [["Дата анализа", "Дата кейса", "Менеджер", "", "Deal ID", "", "", "", "", "", "Тип кейса", "Прослушанные звонки"]]
+            for i in range(10):  # rows 3..12 occupied
+                rows.append(["2026-04-25", f"2026-04-{10+i:02d}", "Рустам Хомидов", "", str(30000000 + i), "", "", "", "", "", "разговор с лпр", "2026-04-24 11:59 - 05:51"])
+            return rows
+
+        def batch_update_values(self, spreadsheet_id, data):
+            self.calls.append((spreadsheet_id, data))
+            return {"ok": True}
+
+    fake_client = _FakeSheetsClient(None, None)
+    with patch("src.deal_analyzer.cli.GoogleSheetsApiClient", return_value=fake_client), patch(
+        "src.deal_analyzer.cli.load_config",
+        return_value=SimpleNamespace(project_root=Path("D:/AI_Automation/amocrm_bot/project")),
+    ):
+        status = _maybe_write_rows_to_sheet(
+            cfg=cfg,
+            logger=logger,
+            values_rows=[["2026-04-25", "2026-04-24", "Илья Бочков", "менеджер по продажам", "32162059", "", "", "", "инфо", "впрок 26", "разговор с лпр", "2026-04-24 11:59 - 05:51"]],
+            sheet_name="Разбор звонков",
+            start_cell="A2",
+            writer_tag="call_review_writer",
+            append_mode=True,
+            append_scan_enabled=True,
+            append_scan_key_columns=(4, 2, 1, 11, 10),
+            duplicate_guard_key_columns=(4, 1, 11),
+            duplicate_policy="skip",
+        )
+
+    assert status["mode"] == "real_write"
+    assert status["write_start_row"] == 13
+    assert status["append_scan_start_row_chosen"] == 13
+
+
+def test_call_review_append_scan_with_gaps_appends_after_last_nonempty_not_into_gap() -> None:
+    logger = _Logger()
+    cfg = replace(
+        _cfg(),
+        deal_analyzer_write_enabled=True,
+        deal_analyzer_spreadsheet_id="sheet123",
+    )
+
+    class _FakeSheetsClient:
+        def __init__(self, project_root, logger):
+            self.calls = []
+
+        def build_tab_a1_range(self, *, tab_title, range_suffix):
+            return f"'{tab_title}'!{range_suffix}"
+
+        def get_values(self, spreadsheet_id, range_a1):
+            # row2 header, row3 data, row4 gap, row5 data -> append must start row6
+            return [
+                ["Дата анализа", "Дата кейса", "Менеджер", "", "Deal ID", "", "", "", "", "", "Тип кейса", "Прослушанные звонки"],
+                ["2026-04-25", "2026-04-20", "Илья Бочков", "", "101", "", "", "", "", "", "разговор с лпр", "2026-04-20 09:10 - 03:00"],
+                ["", "", "", "", "", "", "", "", "", "", "", ""],
+                ["2026-04-25", "2026-04-21", "Рустам Хомидов", "", "102", "", "", "", "", "", "секретарь", "2026-04-21 10:10 - 02:10"],
+            ]
+
+        def batch_update_values(self, spreadsheet_id, data):
+            self.calls.append((spreadsheet_id, data))
+            return {"ok": True}
+
+    fake_client = _FakeSheetsClient(None, None)
+    with patch("src.deal_analyzer.cli.GoogleSheetsApiClient", return_value=fake_client), patch(
+        "src.deal_analyzer.cli.load_config",
+        return_value=SimpleNamespace(project_root=Path("D:/AI_Automation/amocrm_bot/project")),
+    ):
+        status = _maybe_write_rows_to_sheet(
+            cfg=cfg,
+            logger=logger,
+            values_rows=[["2026-04-25", "2026-04-24", "Илья Бочков", "менеджер по продажам", "32162059", "", "", "", "инфо", "впрок 26", "разговор с лпр", "2026-04-24 11:59 - 05:51"]],
+            sheet_name="Разбор звонков",
+            start_cell="A2",
+            writer_tag="call_review_writer",
+            append_mode=True,
+            append_scan_enabled=True,
+            append_scan_key_columns=(4, 2, 1, 11, 10),
+            duplicate_guard_key_columns=(4, 1, 11),
+            duplicate_policy="skip",
+        )
+
+    assert status["mode"] == "real_write"
+    assert status["write_start_row"] == 6
+
+
+def test_call_review_append_scan_duplicate_guard_skips_duplicate_rows() -> None:
+    logger = _Logger()
+    cfg = replace(
+        _cfg(),
+        deal_analyzer_write_enabled=True,
+        deal_analyzer_spreadsheet_id="sheet123",
+    )
+
+    class _FakeSheetsClient:
+        def __init__(self, project_root, logger):
+            self.calls = []
+
+        def build_tab_a1_range(self, *, tab_title, range_suffix):
+            return f"'{tab_title}'!{range_suffix}"
+
+        def get_values(self, spreadsheet_id, range_a1):
+            return [
+                ["Дата анализа", "Дата кейса", "Менеджер", "", "Deal ID", "", "", "", "", "", "Тип кейса", "Прослушанные звонки"],
+                ["2026-04-25", "2026-04-24", "Илья Бочков", "", "32162059", "", "", "", "", "", "разговор с лпр", "2026-04-24 11:59 - 05:51"],
+            ]
+
+        def batch_update_values(self, spreadsheet_id, data):
+            self.calls.append((spreadsheet_id, data))
+            return {"ok": True}
+
+    fake_client = _FakeSheetsClient(None, None)
+    with patch("src.deal_analyzer.cli.GoogleSheetsApiClient", return_value=fake_client), patch(
+        "src.deal_analyzer.cli.load_config",
+        return_value=SimpleNamespace(project_root=Path("D:/AI_Automation/amocrm_bot/project")),
+    ):
+        status = _maybe_write_rows_to_sheet(
+            cfg=cfg,
+            logger=logger,
+            values_rows=[["2026-04-25", "2026-04-24", "Илья Бочков", "менеджер по продажам", "32162059", "", "", "", "инфо", "впрок 26", "разговор с лпр", "2026-04-24 11:59 - 05:51"]],
+            sheet_name="Разбор звонков",
+            start_cell="A2",
+            writer_tag="call_review_writer",
+            append_mode=True,
+            append_scan_enabled=True,
+            append_scan_key_columns=(4, 2, 1, 11, 10),
+            duplicate_guard_key_columns=(4, 1, 11),
+            duplicate_policy="skip",
+        )
+
+    assert status["mode"] == "real_write"
+    assert status["rows_skipped_as_duplicates"] == 1
+    assert status["duplicate_rows_detected"] == 1
+    assert status["rows_written"] == 0
+
+
+def test_call_review_append_scan_duplicate_guard_can_abort_by_policy() -> None:
+    logger = _Logger()
+    cfg = replace(
+        _cfg(),
+        deal_analyzer_write_enabled=True,
+        deal_analyzer_spreadsheet_id="sheet123",
+    )
+
+    class _FakeSheetsClient:
+        def __init__(self, project_root, logger):
+            self.calls = []
+
+        def build_tab_a1_range(self, *, tab_title, range_suffix):
+            return f"'{tab_title}'!{range_suffix}"
+
+        def get_values(self, spreadsheet_id, range_a1):
+            return [
+                ["Дата анализа", "Дата кейса", "Менеджер", "", "Deal ID", "", "", "", "", "", "Тип кейса", "Прослушанные звонки"],
+                ["2026-04-25", "2026-04-24", "Илья Бочков", "", "32162059", "", "", "", "", "", "разговор с лпр", "2026-04-24 11:59 - 05:51"],
+            ]
+
+        def batch_update_values(self, spreadsheet_id, data):
+            self.calls.append((spreadsheet_id, data))
+            return {"ok": True}
+
+    fake_client = _FakeSheetsClient(None, None)
+    with patch("src.deal_analyzer.cli.GoogleSheetsApiClient", return_value=fake_client), patch(
+        "src.deal_analyzer.cli.load_config",
+        return_value=SimpleNamespace(project_root=Path("D:/AI_Automation/amocrm_bot/project")),
+    ):
+        status = _maybe_write_rows_to_sheet(
+            cfg=cfg,
+            logger=logger,
+            values_rows=[["2026-04-25", "2026-04-24", "Илья Бочков", "менеджер по продажам", "32162059", "", "", "", "инфо", "впрок 26", "разговор с лпр", "2026-04-24 11:59 - 05:51"]],
+            sheet_name="Разбор звонков",
+            start_cell="A2",
+            writer_tag="call_review_writer",
+            append_mode=True,
+            append_scan_enabled=True,
+            append_scan_key_columns=(4, 2, 1, 11, 10),
+            duplicate_guard_key_columns=(4, 1, 11),
+            duplicate_policy="abort",
+        )
+
+    assert status["mode"] == "dry_run"
+    assert status["rows_written"] == 0
+    assert status["error"] == "duplicate_rows_detected_abort_policy"
+
+
 def test_daily_control_payload_uses_business_columns_only():
     summary = {
         "period_start": "2026-04-14",
@@ -3010,6 +3282,124 @@ def test_llm_runtime_generation_uses_fallback_when_main_call_fails():
     assert source == "fallback"
 
 
+def test_call_review_adaptive_timeout_scales_with_transcript_and_gemma_floor():
+    assert _call_review_adaptive_timeout_seconds(transcript_length_chars=1200, model_name="deepseek-v3.1:671b-cloud") == 300
+    assert _call_review_adaptive_timeout_seconds(transcript_length_chars=7000, model_name="deepseek-v3.1:671b-cloud") == 600
+    assert _call_review_adaptive_timeout_seconds(transcript_length_chars=20000, model_name="deepseek-v3.1:671b-cloud") == 900
+    assert _call_review_adaptive_timeout_seconds(transcript_length_chars=50000, model_name="deepseek-v3.1:671b-cloud") == 1200
+    assert _call_review_adaptive_timeout_seconds(transcript_length_chars=2000, model_name="gemma4:26b") == 600
+    assert _call_review_adaptive_timeout_seconds(transcript_length_chars=18000, model_name="gemma4:26b") == 900
+
+
+def test_llm_runtime_json_diagnostics_capture_timeout_and_fallback():
+    runtime = {
+        "selected": "main",
+        "main_ok": True,
+        "fallback_ok": True,
+        "main": {"base_url": "http://main", "model": "gemma4:26b", "timeout_seconds": 10},
+        "fallback": {"base_url": "http://fb", "model": "deepseek-v3.1:671b-cloud", "timeout_seconds": 10},
+    }
+
+    class _MainClient:
+        base_url = "http://main"
+        model = "gemma4:26b"
+
+        def chat_json(self, *, messages):
+            raise RuntimeError("timed out while waiting")
+
+    class _FallbackClient:
+        base_url = "http://fb"
+        model = "deepseek-v3.1:671b-cloud"
+
+        def chat_json(self, *, messages):
+            return SimpleNamespace(payload={"key_takeaway": "ok"}, repair_applied=False)
+
+    def _fake_make(runtime_payload):
+        selected = str(runtime_payload.get("selected") or "")
+        if selected == "main":
+            return _MainClient()
+        if selected == "fallback":
+            return _FallbackClient()
+        return None
+
+    diagnostics: dict[str, Any] = {}
+    with patch("src.deal_analyzer.cli._make_llm_client_from_runtime", side_effect=_fake_make):
+        payload, source = _llm_chat_json_with_runtime(
+            runtime=runtime,
+            messages=[{"role": "user", "content": "{}"}],
+            repair_messages=None,
+            logger=_Logger(),
+            log_prefix="test",
+            diagnostics_out=diagnostics,
+        )
+
+    assert isinstance(payload, dict)
+    assert source == "fallback"
+    assert diagnostics.get("llm_source") == "fallback"
+    assert diagnostics.get("fallback_used") is True
+    assert diagnostics.get("fallback_reason") == "main_timeout"
+    assert diagnostics.get("json_valid") is True
+    attempts = diagnostics.get("attempts", [])
+    assert isinstance(attempts, list) and len(attempts) >= 2
+    assert any(bool(x.get("timed_out")) for x in attempts if isinstance(x, dict))
+
+
+def test_call_review_row_runtime_routes_long_gemma_to_fallback():
+    cfg = replace(_cfg(), call_review_gemma_route_max_transcript_chars=12000)
+    runtime = {
+        "selected": "main",
+        "main_ok": True,
+        "fallback_ok": True,
+        "main": {"base_url": "http://127.0.0.1:11434", "model": "gemma4:26b", "timeout_seconds": 900},
+        "fallback": {
+            "base_url": "http://127.0.0.1:11434",
+            "model": "deepseek-v3.1:671b-cloud",
+            "timeout_seconds": 900,
+        },
+    }
+    row_runtime, routing = _build_call_review_row_runtime(
+        cfg=cfg,
+        runtime=runtime,
+        transcript_length_chars=22000,
+    )
+    assert row_runtime["selected"] == "fallback"
+    assert row_runtime["main_ok"] is False
+    assert routing["forced_fallback_due_to_long_transcript"] is True
+
+
+def test_call_review_timeout_overrides_use_fast_limits_for_local_gemma():
+    cfg = replace(
+        _cfg(),
+        local_gemma_generation_timeout_sec=240,
+        local_gemma_structured_timeout_sec=240,
+        call_review_style_json_timeout_seconds=300,
+        call_review_row_hard_timeout_seconds=1200,
+    )
+    runtime = {
+        "main": {"base_url": "http://127.0.0.1:11434", "model": "gemma4:26b", "timeout_seconds": 900},
+        "fallback": {
+            "base_url": "http://127.0.0.1:11434",
+            "model": "deepseek-v3.1:671b-cloud",
+            "timeout_seconds": 900,
+        },
+    }
+    generation, _ = _call_review_timeout_overrides_for_runtime(
+        cfg=cfg,
+        runtime=runtime,
+        transcript_length_chars=30000,
+        step_kind="generation",
+    )
+    structured, _ = _call_review_timeout_overrides_for_runtime(
+        cfg=cfg,
+        runtime=runtime,
+        transcript_length_chars=30000,
+        step_kind="structured_json",
+    )
+    assert generation["main"] == 240
+    assert structured["main"] == 240
+    assert generation["fallback"] >= 900
+
+
 def test_company_tags_are_propagated_to_deal_tags():
     merged, company, propagated = _merge_deal_company_tags(
         deal_tags=["expo", "priority"],
@@ -3716,6 +4106,1872 @@ def test_analysis_shortlist_drops_forced_candidates_when_meaningful_exists() -> 
     assert isinstance(selected, list)
     assert [str(x.get("deal_id") or "") for x in selected] == ["100"]
     assert all(not bool(x.get("forced_fallback")) for x in selected)
+
+
+def test_call_pool_debug_full_ledger_contains_all_calls_before_limit() -> None:
+    rows = [
+        {"deal_id": 101, "deal_name": "Deal 101", "responsible_user_name": "Илья", "pipeline_name": "P", "status_name": "S"},
+        {"deal_id": 202, "deal_name": "Deal 202", "responsible_user_name": "Рустам", "pipeline_name": "P", "status_name": "S"},
+    ]
+
+    fake_results = {
+        "101": SimpleNamespace(
+            calls=[
+                CallEvidence(
+                    call_id="c101a",
+                    deal_id="101",
+                    manager_id="11",
+                    manager_name="Илья",
+                    timestamp="2026-04-23T10:00:00+00:00",
+                    duration_seconds=397,
+                    direction="outbound",
+                    source_location="amocrm_api:notes",
+                    recording_url="https://rec/101a.mp3",
+                    recording_ref="u101a",
+                    quality_flags=[],
+                    missing_recording=False,
+                ),
+                CallEvidence(
+                    call_id="c101b",
+                    deal_id="101",
+                    manager_id="11",
+                    manager_name="Илья",
+                    timestamp="2026-04-23T11:00:00+00:00",
+                    duration_seconds=63,
+                    direction="outbound",
+                    source_location="amocrm_api:notes",
+                    recording_url="https://rec/101b.mp3",
+                    recording_ref="u101b",
+                    quality_flags=[],
+                    missing_recording=False,
+                ),
+            ],
+            source_used="amocrm_api",
+            warnings=[],
+        ),
+        "202": SimpleNamespace(
+            calls=[
+                CallEvidence(
+                    call_id="c202a",
+                    deal_id="202",
+                    manager_id="22",
+                    manager_name="Рустам",
+                    timestamp="2026-04-24T08:00:00+00:00",
+                    duration_seconds=690,
+                    direction="outbound",
+                    source_location="amocrm_api:notes",
+                    recording_url="https://rec/202a.mp3",
+                    recording_ref="u202a",
+                    quality_flags=[],
+                    missing_recording=False,
+                )
+            ],
+            source_used="amocrm_api",
+            warnings=[],
+        ),
+    }
+    with patch("src.deal_analyzer.cli.CallDownloader.collect_period_calls", return_value=fake_results), patch(
+        "src.deal_analyzer.cli.CallDownloader.collect_period_calls_call_first",
+        return_value=([], {"source_mode": "deal_first_fallback", "calls_seen_from_global_source": 0, "calls_missing_deal_id": 0}),
+    ):
+        debug = _collect_call_pool_debug(
+            cfg=_cfg(),
+            logger=_Logger(),
+            rows=rows,
+            raw_bundles_by_deal={},
+            period_start=datetime(2026, 4, 21).date(),
+            period_end=datetime(2026, 4, 24).date(),
+            base_domain="https://example.amocrm.ru",
+        )
+
+    ledger = debug.get("call_ledger_all", [])
+    assert isinstance(ledger, list)
+    assert len(ledger) == 3
+    assert int(debug.get("deals_total_before_limit", 0) or 0) == 2
+    assert int(debug.get("deals_with_any_calls", 0) or 0) == 2
+
+
+def test_transcription_shortlist_duration_ranking_prefers_690_and_397_before_short_calls() -> None:
+    conv_payload = {
+        "items": [
+            {"deal_id": "32162059", "pool_type": "conversation_pool", "call_case_type": "lpr_conversation", "pool_priority_score": 80},
+            {"deal_id": "32159349", "pool_type": "conversation_pool", "call_case_type": "lpr_conversation", "pool_priority_score": 75},
+            {"deal_id": "32157001", "pool_type": "conversation_pool", "call_case_type": "supplier_inbound", "pool_priority_score": 70},
+            {"deal_id": "32165711", "pool_type": "conversation_pool", "call_case_type": "lpr_conversation", "pool_priority_score": 65},
+        ]
+    }
+    disc_payload = {"items": []}
+    call_ledger_all = [
+        {
+            "deal_id": "32162059",
+            "call_id": "a690",
+            "call_duration_seconds": 690,
+            "recording_url": "https://rec/690.mp3",
+            "recording_available": True,
+            "direction": "outbound",
+            "call_datetime_utc": "2026-04-23T10:00:00+00:00",
+            "manager_name_from_call_author": "Рустам",
+            "initial_filter_flags": [],
+        },
+        {
+            "deal_id": "32159349",
+            "call_id": "a397",
+            "call_duration_seconds": 397,
+            "recording_url": "https://rec/397.mp3",
+            "recording_available": True,
+            "direction": "outbound",
+            "call_datetime_utc": "2026-04-23T09:00:00+00:00",
+            "manager_name_from_call_author": "Илья",
+            "initial_filter_flags": [],
+        },
+        {
+            "deal_id": "32157001",
+            "call_id": "a63",
+            "call_duration_seconds": 63,
+            "recording_url": "https://rec/63.mp3",
+            "recording_available": True,
+            "direction": "outbound",
+            "call_datetime_utc": "2026-04-23T08:00:00+00:00",
+            "manager_name_from_call_author": "Илья",
+            "initial_filter_flags": [],
+        },
+        {
+            "deal_id": "32165711",
+            "call_id": "a34",
+            "call_duration_seconds": 34,
+            "recording_url": "https://rec/34.mp3",
+            "recording_available": True,
+            "direction": "outbound",
+            "call_datetime_utc": "2026-04-23T07:00:00+00:00",
+            "manager_name_from_call_author": "Рустам",
+            "initial_filter_flags": ["short_duration_0_20"],
+        },
+    ]
+    shortlist = _build_transcription_shortlist_payload(
+        conversation_pool_payload=conv_payload,
+        discipline_pool_payload=disc_payload,
+        call_ledger_all=call_ledger_all,
+    )
+    items = [x for x in shortlist.get("items", []) if isinstance(x, dict) and bool(x.get("selected_for_transcription"))]
+    assert [str(x.get("deal_id") or "") for x in items[:2]] == ["32162059", "32159349"]
+    assert "32165711" not in {str(x.get("deal_id") or "") for x in items}
+
+
+def test_analysis_shortlist_manager_balancing_round_robin_when_both_have_meaningful() -> None:
+    shortlist_items = [
+        {
+            "deal_id": "a1",
+            "pool_type": "conversation_pool",
+            "call_case_type": "lpr_conversation",
+            "pool_priority_score": 90,
+            "selected_for_transcription": True,
+            "selected_call_count": 1,
+            "selected_call_ids": ["a1c"],
+            "anchor_call_duration_seconds": 420,
+            "anchor_manager_name": "Илья",
+        },
+        {
+            "deal_id": "a2",
+            "pool_type": "conversation_pool",
+            "call_case_type": "lpr_conversation",
+            "pool_priority_score": 88,
+            "selected_for_transcription": True,
+            "selected_call_count": 1,
+            "selected_call_ids": ["a2c"],
+            "anchor_call_duration_seconds": 360,
+            "anchor_manager_name": "Илья",
+        },
+        {
+            "deal_id": "b1",
+            "pool_type": "conversation_pool",
+            "call_case_type": "lpr_conversation",
+            "pool_priority_score": 86,
+            "selected_for_transcription": True,
+            "selected_call_count": 1,
+            "selected_call_ids": ["b1c"],
+            "anchor_call_duration_seconds": 300,
+            "anchor_manager_name": "Рустам",
+        },
+        {
+            "deal_id": "b2",
+            "pool_type": "conversation_pool",
+            "call_case_type": "secretary_case",
+            "pool_priority_score": 84,
+            "selected_for_transcription": True,
+            "selected_call_count": 1,
+            "selected_call_ids": ["b2c"],
+            "anchor_call_duration_seconds": 210,
+            "anchor_manager_name": "Рустам",
+        },
+    ]
+    payload = _build_analysis_shortlist_payload(
+        shortlist_items=shortlist_items,
+        normalized_rows_ranked=[],
+        limit=3,
+    )
+    selected = payload.get("selected_items", [])
+    assert isinstance(selected, list)
+    assert len(selected) == 3
+    selected_by_manager = payload.get("selected_by_manager", {})
+    assert isinstance(selected_by_manager, dict)
+    assert int(selected_by_manager.get("Илья", 0) or 0) >= 1
+    assert int(selected_by_manager.get("Рустам", 0) or 0) >= 1
+
+
+def test_analysis_shortlist_applies_manager_allowlist_before_limit_with_replacement() -> None:
+    shortlist_items = [
+        {
+            "deal_id": "x1",
+            "pool_type": "conversation_pool",
+            "call_case_type": "lpr_conversation",
+            "pool_priority_score": 99,
+            "selected_for_transcription": True,
+            "selected_call_count": 1,
+            "selected_call_ids": ["x1c"],
+            "anchor_call_duration_seconds": 500,
+            "anchor_manager_name": "Антон",
+        },
+        {
+            "deal_id": "x2",
+            "pool_type": "conversation_pool",
+            "call_case_type": "lpr_conversation",
+            "pool_priority_score": 98,
+            "selected_for_transcription": True,
+            "selected_call_count": 1,
+            "selected_call_ids": ["x2c"],
+            "anchor_call_duration_seconds": 480,
+            "anchor_manager_name": "Артур",
+        },
+        {
+            "deal_id": "i1",
+            "pool_type": "conversation_pool",
+            "call_case_type": "lpr_conversation",
+            "pool_priority_score": 90,
+            "selected_for_transcription": True,
+            "selected_call_count": 1,
+            "selected_call_ids": ["i1c"],
+            "anchor_call_duration_seconds": 300,
+            "anchor_manager_name": "Илья",
+        },
+        {
+            "deal_id": "i2",
+            "pool_type": "conversation_pool",
+            "call_case_type": "secretary_case",
+            "pool_priority_score": 88,
+            "selected_for_transcription": True,
+            "selected_call_count": 1,
+            "selected_call_ids": ["i2c"],
+            "anchor_call_duration_seconds": 260,
+            "anchor_manager_name": "Илья",
+        },
+        {
+            "deal_id": "r1",
+            "pool_type": "conversation_pool",
+            "call_case_type": "lpr_conversation",
+            "pool_priority_score": 87,
+            "selected_for_transcription": True,
+            "selected_call_count": 1,
+            "selected_call_ids": ["r1c"],
+            "anchor_call_duration_seconds": 240,
+            "anchor_manager_name": "Рустам",
+        },
+        {
+            "deal_id": "r2",
+            "pool_type": "conversation_pool",
+            "call_case_type": "secretary_case",
+            "pool_priority_score": 86,
+            "selected_for_transcription": True,
+            "selected_call_count": 1,
+            "selected_call_ids": ["r2c"],
+            "anchor_call_duration_seconds": 220,
+            "anchor_manager_name": "Рустам",
+        },
+    ]
+    payload = _build_analysis_shortlist_payload(
+        shortlist_items=shortlist_items,
+        normalized_rows_ranked=[],
+        limit=4,
+        manager_allowlist=["Илья Бочков", "Рустам Хомидов"],
+    )
+    selected = payload.get("selected_items", [])
+    assert isinstance(selected, list)
+    assert len(selected) == 4
+    assert int(payload.get("candidates_before_manager_allowlist", 0) or 0) == 6
+    assert int(payload.get("candidates_after_manager_allowlist", 0) or 0) == 4
+    assert int(payload.get("dropped_by_manager_allowlist", 0) or 0) == 2
+    assert int(payload.get("selected_before_limit", 0) or 0) >= 4
+    assert int(payload.get("selected_after_limit", 0) or 0) == 4
+    selected_managers = {str(x.get("anchor_manager_name") or "") for x in selected if isinstance(x, dict)}
+    assert selected_managers == {"Илья", "Рустам"}
+
+
+def test_analysis_shortlist_propagates_case_type_debug_fields() -> None:
+    payload = _build_analysis_shortlist_payload(
+        shortlist_items=[
+            {
+                "deal_id": "9001",
+                "pool_type": "conversation_pool",
+                "call_case_type": "presentation",
+                "pool_priority_score": 91,
+                "selected_for_transcription": True,
+                "selected_call_count": 1,
+                "selected_call_ids": ["c9001"],
+                "anchor_call_duration_seconds": 1800,
+                "anchor_manager_name": "Илья",
+                "case_type_source": "rules_call_first_classifier_v2",
+                "case_type_reason": "presentation_hints_with_long_duration",
+                "evidence_used": ["duration_ge_1200", "hint:presentation"],
+            }
+        ],
+        normalized_rows_ranked=[],
+        limit=1,
+    )
+    selected = payload.get("selected_items", [])
+    assert isinstance(selected, list) and len(selected) == 1
+    item = selected[0]
+    assert item.get("case_type_source") == "rules_call_first_classifier_v2"
+    assert item.get("case_type_reason") == "presentation_hints_with_long_duration"
+    assert item.get("evidence_used") == ["duration_ge_1200", "hint:presentation"]
+
+
+def test_call_review_v3_row_has_non_empty_substages_for_relevant_blocks() -> None:
+    output_dir = _fresh_output_dir("call_review_v3_substages")
+    artifact_path = output_dir / "deal_5001.json"
+    artifact_path.write_text(
+        json.dumps(
+            {
+                "snapshot": {
+                    "call_evidence": {
+                        "items": [
+                            {
+                                "call_id": "c5001",
+                                "timestamp": "2026-04-23T10:00:00+00:00",
+                                "duration_seconds": 360,
+                                "direction": "outbound",
+                                "recording_url": "https://rec/5001.mp3",
+                                "manager_name": "Илья Бочков",
+                                "status": "connected",
+                            }
+                        ]
+                    }
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    record = {
+        "deal_id": "5001",
+        "deal_name": "Сделка 5001",
+        "company_name": "ООО Клиент",
+        "owner_name": "Илья Бочков",
+        "status_name": "Есть интерес",
+        "pipeline_name": "Основная",
+        "artifact_path": str(artifact_path),
+        "call_review_llm_ready": True,
+        "call_review_llm_source": "main",
+        "call_review_llm_fields": {
+            "key_takeaway": "Разговор с ЛПР, шаг зафиксирован.",
+            "strong_sides": "Хорошо держит рамку разговора.",
+            "growth_zones": "Мало уточняющих вопросов по процессу.",
+            "why_important": "Так сотруднику проще переводить в встречу.",
+            "reinforce": "Закрепить заход с уточнением текущего процесса.",
+            "fix_action": "Добавить 2 уточняющих вопроса по текущей схеме.",
+            "coaching_list": "1) Разобрали рамку.\n2) Дали модуль вопросов.\n3) Проверим в следующем звонке.",
+            "expected_quantity": "+0.3 встречи в неделю.",
+            "expected_quality": "Квалификация станет точнее.",
+            "stage_lpr_comment": "С ЛПР контакт есть, цель звонка озвучил четко.",
+            "stage_need_comment": "Проблему раскрыл частично, но не добил уточнения.",
+            "stage_presentation_comment": "Ценность встречи обозначил, но можно короче.",
+            "stage_closing_comment": "Следующий шаг зафиксирован по времени.",
+            "stage_objections_comment": "Одно возражение отработал без давления.",
+            "stage_speech_comment": "Речь собранная и спокойная.",
+            "stage_crm_comment": "В црм зафиксировал итог и задачу.",
+        },
+        "transcript_text_len": 700,
+        "transcript_segments_count": 6,
+        "transcript_longest_segment_sec": 120,
+        "transcript_text_excerpt": "Говорили с ЛПР, согласовали следующий шаг и время.",
+        "call_signal_summary_short": "ЛПР подтвердил встречу на четверг.",
+        "call_signal_next_step_present": True,
+        "call_signal_decision_maker_reached": True,
+        "product_hypothesis": "info",
+    }
+    payload = build_call_review_v3_payload(
+        summary={},
+        period_deal_records=[record],
+        analysis_shortlist_payload={
+            "selected_items": [
+                {
+                    "deal_id": "5001",
+                    "pool_type": "conversation_pool",
+                    "call_case_type": "lpr_conversation",
+                    "selected_for_transcription": True,
+                    "selected_call_ids": ["c5001"],
+                    "selected_call_count": 1,
+                    "anchor_manager_name": "Илья Бочков",
+                    "shortlist_reason": "priority_1_duration_ge_300",
+                }
+            ]
+        },
+        base_domain="https://officeistockinfo.amocrm.ru",
+        manager_allowlist=["Илья", "Рустам"],
+        manager_role_registry={"Илья": "sales_manager"},
+    )
+    assert payload.get("rows_count") == 1
+    row = payload["rows"][0]
+    assert row["Здоровается (лпр)"] in {"да", "нет", "частично", "н/п"}
+    assert row["Открытые вопросы"] in {"да", "нет", "частично", "н/п"}
+    assert row["Дает вилку выбора по времени"] in {"да", "нет", "частично", "н/п"}
+    assert row["Присоединение"] in {"да", "нет", "частично", "н/п"}
+    assert row["Комментарий понятный и лаконичный"] in {"да", "нет", "частично", "н/п"}
+    assert row["Комментарий по этапу (лпр)"] != ""
+    assert row["Комментарий по этапу (актуальность и потребность)"] != ""
+
+
+def test_call_review_v3_test_case_clears_irrelevant_upper_funnel_blocks() -> None:
+    output_dir = _fresh_output_dir("call_review_v3_test_case_irrelevant_clear")
+    artifact_path = output_dir / "deal_5101.json"
+    artifact_path.write_text(
+        json.dumps(
+            {
+                "snapshot": {
+                    "call_evidence": {
+                        "items": [
+                            {
+                                "call_id": "c5101",
+                                "timestamp": "2026-04-23T10:00:00+00:00",
+                                "duration_seconds": 420,
+                                "direction": "outbound",
+                                "recording_url": "https://rec/5101.mp3",
+                                "manager_name": "Илья Бочков",
+                                "status": "connected",
+                            }
+                        ]
+                    }
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    record = {
+        "deal_id": "5101",
+        "deal_name": "Сделка 5101",
+        "company_name": "ООО Клиент",
+        "owner_name": "Илья Бочков",
+        "status_name": "Тестирование системы",
+        "pipeline_name": "Основная",
+        "artifact_path": str(artifact_path),
+        "call_review_llm_ready": True,
+        "call_review_llm_source": "main",
+        "call_review_llm_fields": {
+            "primary_case_type": "работа с тестом",
+            "relevant_stage_groups": "[\"test\",\"speech\",\"crm\"]",
+            "evidence_by_stage": "{\"test\":\"\\\"согласуем критерии теста\\\"\"}",
+            "key_takeaway": "Фокус на тестовом этапе.",
+            "strong_sides": "Контакт удержан.",
+            "growth_zones": "Нет точной фиксации сроков теста.",
+            "why_important": "Иначе тест провиснет.",
+            "reinforce": "Фиксировать результат блока теста.",
+            "fix_action": "Закрыть тест на ответственных и дедлайн.",
+            "coaching_list": "1) Разобрали критерии.\n2) Дали шаблон фиксации.\n3) Проверить в следующем касании.",
+            "expected_quantity": "0.2-0.4 шага в работу за неделю",
+            "expected_quality": "Тест станет управляемым.",
+            "stage_lpr_comment": "\"мы иначе не поговорим\" - заполнили не тот блок",
+            "stage_need_comment": "Лишний комментарий для верхнего блока.",
+            "stage_test_comment": "\"согласуем критерии теста\" - тест обсуждали по делу.",
+            "stage_test_launch_comment": "Запуск теста обсудили и зафиксировали.",
+            "stage_test_criteria_comment": "Критерии теста назвали частично.",
+            "stage_crm_comment": "В црм есть фиксация результата теста.",
+            "stage_speech_comment": "Речь собранная.",
+        },
+        "transcript_text_len": 1800,
+        "transcript_segments_count": 8,
+        "transcript_longest_segment_sec": 140,
+        "transcript_text_excerpt": "Обсуждали критерии теста и сроки.",
+        "call_signal_summary_short": "Тест в работе, согласуют критерии.",
+        "call_signal_test_discussed": True,
+        "product_hypothesis": "link",
+    }
+    payload = build_call_review_v3_payload(
+        summary={},
+        period_deal_records=[record],
+        analysis_shortlist_payload={
+            "selected_items": [
+                {
+                    "deal_id": "5101",
+                    "pool_type": "conversation_pool",
+                    "call_case_type": "test",
+                    "selected_for_transcription": True,
+                    "selected_call_ids": ["c5101"],
+                    "selected_call_count": 1,
+                    "anchor_manager_name": "Илья Бочков",
+                    "shortlist_reason": "priority_1_duration_ge_300",
+                }
+            ]
+        },
+        base_domain="https://officeistockinfo.amocrm.ru",
+        manager_allowlist=["Илья", "Рустам"],
+        manager_role_registry={"Илья": "sales_manager"},
+    )
+    row = payload["rows"][0]
+    assert row["Комментарий по этапу (секретарь)"] == ""
+    assert row["Комментарий по этапу (лпр)"] == ""
+    assert row["Комментарий по этапу (актуальность и потребность)"] == ""
+    assert row["Комментарий по этапу (презентация встречи)"] == ""
+    assert row["Комментарий по этапу (закрытие на встречу)"] == ""
+    assert row["Комментарий по этапу (дисциплина дозвонов)"] == ""
+    assert row["Здоровается"] == "н/п"
+    assert row["Здоровается (лпр)"] == "н/п"
+    assert row["Открытые вопросы"] == "н/п"
+    assert row["Дает вилку выбора по времени"] == "н/п"
+    assert row["Покрыты все уникальные номера"] == "н/п"
+    assert row["Комментарий по этапу (работа с тестом)"] != ""
+
+
+def test_call_review_semantic_preflight_detects_reused_quote() -> None:
+    row = {
+        "Deal ID": "777",
+        "Тип кейса": "разговор с лпр",
+        "Комментарий по этапу (лпр)": '"одна цитата" - этап лпр. Лучше сказать: "короче и конкретнее"',
+        "Комментарий по этапу (актуальность и потребность)": '"одна цитата" - этап потребности. Лучше сказать: "уточните процесс"',
+        "Комментарий по этапу (закрытие на встречу)": '"одна цитата" - этап закрытия. Лучше сказать: "фиксируем дату и время"',
+    }
+    semantic = {
+        "stage_relevance": {
+            "lpr": {"relevant": True, "cross_stage_evidence": False},
+            "need": {"relevant": True, "cross_stage_evidence": False},
+            "closing": {"relevant": True, "cross_stage_evidence": False},
+        }
+    }
+    row_entries = [{"row": row, "semantic_debug": semantic}]
+    result = _run_semantic_preflight(rows=[row], row_entries=row_entries)
+    assert result["passed"] is False
+    assert int(result.get("max_same_quote_usage_per_row", 0) or 0) > 2
+    failed_rules = result.get("failed_rules", [])
+    assert any(str(item.get("rule") or "").startswith("quote_usage") or str(item.get("rule") or "").startswith("max_same_quote") for item in failed_rules if isinstance(item, dict))
+
+
+def test_call_review_sanitizer_removes_forbidden_quotes_dash_and_terms() -> None:
+    raw = '«Зоны роста - это "модуль" — и transcript с CRM, email, call signal… и next step → Модули и Приемы на Tilda»'
+    clean = _sanitize_user_text(raw)
+    assert "«" not in clean and "»" not in clean
+    assert "—" not in clean and "–" not in clean
+    assert "→" not in clean
+    assert "…" not in clean
+    assert '""' not in clean
+    assert "CRM" not in clean and "crm" not in clean
+    assert "LLM" not in clean and "transcript" not in clean and "call signal" not in clean
+    assert "email" not in clean.lower()
+    assert "модуль" not in clean.lower()
+    assert "прием" not in clean.lower()
+    assert "зоны роста" not in clean.lower()
+    assert "tilda" not in clean.lower()
+    assert "црм" in clean
+    assert "почта" in clean.lower()
+
+
+def test_call_review_sanitizer_replaces_no_need_and_uppercase_crm() -> None:
+    raw = 'No need по задаче. В CRM ничего не зафиксировано, mixed-signal и CTA не закрыли.'
+    clean = _sanitize_user_text(raw)
+    low = clean.lower()
+    assert "no need" not in low
+    assert "нет потребности" in low
+    assert "crm" not in clean
+    assert "црм" in low
+    assert "mixed-signal" not in low
+    assert "cta" not in low
+    assert "смешанный интерес" in low
+    assert "следующий шаг" in low
+
+
+def test_call_review_sanitizer_removes_training_jargon_terms() -> None:
+    raw = (
+        'Модуль по этапу сильный, но техника слабая. '
+        'Нужен прием, рабочий шаг и фрейм, не дирижер разговора.'
+    )
+    clean = _sanitize_user_text(raw)
+    low = clean.lower()
+    assert "модул" not in low
+    assert "техник" not in low
+    assert "прием" not in low and "приём" not in low
+    assert "рабочий шаг" not in low
+    assert "фрейм" not in low
+    assert "дириж" not in low
+
+
+def test_call_review_sanitizer_normalizes_call_signal_and_budget_terms() -> None:
+    raw = (
+        "LINK-признак и call_signal_objection_no_need=true. "
+        "Budget qualification не закрыт, Not Now, filler words и email."
+    )
+    clean = _sanitize_user_text(raw)
+    low = clean.lower()
+    assert "link-признак" not in low
+    assert "call_signal" not in low
+    assert "budget qualification" not in low
+    assert "not now" not in low
+    assert "filler words" not in low
+    assert "email" not in low
+    assert "интерес к линку" in low
+    assert "нет потребности" in low
+    assert "уточнение бюджета" in low
+    assert "не сейчас" in low
+    assert "слова-паразиты" in low
+    assert "почта" in low
+
+
+def test_call_review_sanitizer_normalizes_no_need_token_and_signal_phrases() -> None:
+    raw = "no_need, в сигналах пусто. признак разговора: true"
+    clean = _sanitize_user_text(raw)
+    low = clean.lower()
+    assert "no_need" not in low
+    assert "в сигналах" not in low
+    assert "признак разговора" not in low
+    assert "true" not in low
+    assert "нет потребности" in low
+    assert "по разговору" in low
+
+
+def test_call_review_sanitizer_normalizes_info_link_and_double_better_phrase() -> None:
+    raw = 'INFO/LINK и Лучше Лучше сказать: "Тут неч тко, надо ч тко."'
+    clean = _sanitize_user_text(raw)
+    low = clean.lower()
+    assert "info" not in low
+    assert "link" not in low
+    assert "лучше лучше сказать" not in low
+    assert "неч тко" not in low
+    assert "ч тко" not in low
+    assert "инфо" in low
+    assert "линк" in low
+    assert "лучше сказать" in low
+    assert "нечетко" in low
+    assert "четко" in low
+
+
+def test_call_review_sanitizer_removes_not_relevant_phrase() -> None:
+    raw = 'Не актуально. Лучше сказать: "Давайте зафиксируем шаг."'
+    clean = _sanitize_user_text(raw)
+    assert "не актуально" not in clean.lower()
+
+
+def test_call_review_semantic_preflight_detects_repeated_better_phrase_across_payload() -> None:
+    repeated = 'Провисли по фиксации. Лучше сказать: "Давайте не оставлять это в воздухе: вторник 11:00 или среда 15:00 удобнее?"'
+    rows = []
+    row_entries = []
+    for idx in range(4):
+        row = {
+            "Deal ID": str(9000 + idx),
+            "Тип кейса": "разговор с лпр",
+            "Комментарий по этапу (закрытие на встречу)": repeated,
+            "Ключевой вывод": "",
+            "Сильная сторона": "",
+            "Зона роста": "",
+            "Почему это важно": "",
+            "Что закрепить": "",
+            "Что исправить": "",
+            "Что донести сотруднику": "",
+            "Эффект качество": "",
+        }
+        semantic = {
+            "stage_relevance": {
+                "closing": {"relevant": True, "cross_stage_evidence": False},
+            }
+        }
+        rows.append(row)
+        row_entries.append({"row": row, "semantic_debug": semantic})
+    result = _run_semantic_preflight(rows=rows, row_entries=row_entries)
+    assert result["passed"] is False
+    assert int(result.get("repeated_better_phrase_count", 0) or 0) > 0
+    assert any(
+        str(item.get("rule") or "") == "repeated_better_phrase_count_gt_0"
+        for item in result.get("failed_rules", [])
+        if isinstance(item, dict)
+    )
+
+
+def test_call_review_payload_style_normalization_rewrites_repeated_better_phrase_to_max_two() -> None:
+    repeated = 'Провисли по фиксации. Лучше сказать: "Согласен, возражение важное. Давайте уточним детали и проверим, что сняли риск."'
+    row_entries: list[dict[str, Any]] = []
+    for idx in range(3):
+        row = {
+            "Deal ID": str(9900 + idx),
+            "Комментарий по этапу (отработка возражений)": repeated,
+            "Ключевой вывод": "",
+            "Сильная сторона": "",
+            "Зона роста": "",
+            "Почему это важно": "",
+            "Что закрепить": "",
+            "Что исправить": "",
+            "Что донести сотруднику": "",
+            "Эффект количество / неделя": "",
+            "Эффект качество": "",
+        }
+        row_entries.append({"row": row, "semantic_debug": {}})
+    norm = _apply_payload_style_normalization(row_entries=row_entries)
+    rows = [x["row"] for x in row_entries]
+    result = _run_semantic_preflight(rows=rows, row_entries=row_entries, style_payload_normalization=norm)
+    usage = result.get("better_phrase_usage", {})
+    target = "согласен, возражение важное. давайте уточним детали и проверим, что сняли риск."
+    assert int(usage.get(target, 0) or 0) <= 2
+    assert int(result.get("repeated_better_phrase_count", 0) or 0) == 0
+
+
+def test_call_review_payload_style_normalization_compacts_long_stage_comment() -> None:
+    raw_comment = (
+        '"Клиент говорит, что пока не готов" - длинное начало; '
+        "слишком много деталей без фокуса; "
+        "потом перечисление шагов через точку с запятой; "
+        "еще один кусок без явного действия; "
+        "добавили лишний блок; "
+        "и еще лишний блок; "
+        'Лучше сказать: "Согласен, возражение важное. Давайте уточним детали и проверим, что сняли риск."'
+    )
+    row = {
+        "Deal ID": "31813489",
+        "Комментарий по этапу (работа с тестом)": raw_comment,
+        "Ключевой вывод": "",
+        "Сильная сторона": "",
+        "Зона роста": "",
+        "Почему это важно": "",
+        "Что закрепить": "",
+        "Что исправить": "",
+        "Что донести сотруднику": "",
+        "Эффект количество / неделя": "",
+        "Эффект качество": "",
+    }
+    row_entries = [{"row": row, "semantic_debug": {}}]
+    _apply_payload_style_normalization(row_entries=row_entries)
+    out = str(row_entries[0]["row"].get("Комментарий по этапу (работа с тестом)") or "")
+    assert len(out) <= 700
+    assert out.count(";") <= 2
+    assert out.count("Лучше сказать:") <= 1
+    assert len(re.findall(r'"([^"]+)"', out)) <= 2
+
+
+def test_call_review_semantic_preflight_flags_forbidden_terms_in_final_payload_rows() -> None:
+    row = {
+        "Deal ID": "8801",
+        "Тип кейса": "разговор с лпр",
+        "Ключевой вывод": "LINK-признак и call_signal_objection_no_need=true. Budget qualification и Not Now. filler words.",
+    }
+    result = _run_semantic_preflight(rows=[row], row_entries=[{"row": dict(row), "semantic_debug": {}}])
+    assert result["passed"] is False
+    assert int(result.get("final_payload_forbidden_terms_count", 0) or 0) > 0
+    assert any(
+        str(item.get("rule") or "") == "final_payload_forbidden_terms_present"
+        for item in result.get("failed_rules", [])
+        if isinstance(item, dict)
+    )
+
+
+def test_call_review_semantic_preflight_detects_broken_better_phrase_quotes() -> None:
+    row = {
+        "Deal ID": "8802",
+        "Тип кейса": "разговор с лпр",
+        "Комментарий по этапу (лпр)": 'Контакт смазанный. Лучше сказать: "Подскажите, вы сами принимаете решение',
+    }
+    result = _run_semantic_preflight(rows=[row], row_entries=[{"row": dict(row), "semantic_debug": {}}])
+    assert result["passed"] is False
+    assert int(result.get("final_payload_broken_quotes_count", 0) or 0) > 0
+    assert int(result.get("final_payload_broken_quotes_unrepaired_count", 0) or 0) > 0
+    assert any(
+        str(item.get("rule") or "") == "final_payload_broken_quotes_unrepaired_present"
+        for item in result.get("failed_rules", [])
+        if isinstance(item, dict)
+    )
+
+
+def test_call_review_semantic_preflight_repair_broken_better_phrase_quotes() -> None:
+    rows = [
+        {
+            "Deal ID": "8802",
+            "Тип кейса": "разговор с лпр",
+            "Комментарий по этапу (лпр)": 'Контакт смазанный. Лучше сказать: "Подскажите, вы сами принимаете решение',
+        }
+    ]
+    repair = _repair_final_payload_broken_quotes(rows=rows)
+    result = _run_semantic_preflight(
+        rows=rows,
+        row_entries=[{"row": dict(rows[0]), "semantic_debug": {}}],
+        final_payload_quote_repair=repair,
+    )
+    assert int(repair.get("final_payload_broken_quotes_count", 0) or 0) == 1
+    assert int(repair.get("final_payload_broken_quotes_repaired_count", 0) or 0) == 1
+    assert int(repair.get("final_payload_broken_quotes_unrepaired_count", 0) or 0) == 0
+    assert result["passed"] is True
+    assert int(result.get("final_payload_broken_quotes_unrepaired_count", 0) or 0) == 0
+    assert rows[0]["Комментарий по этапу (лпр)"].endswith('"')
+
+
+def test_call_review_semantic_preflight_repairs_odd_quote_count_in_narrative() -> None:
+    rows = [
+        {
+            "Deal ID": "8804",
+            "Тип кейса": "разговор с лпр",
+            "Ключевой вывод": '"клиент сказал, что сейчас не готов - нужен возврат с датой',
+        }
+    ]
+    repair = _repair_final_payload_broken_quotes(rows=rows)
+    result = _run_semantic_preflight(
+        rows=rows,
+        row_entries=[{"row": dict(rows[0]), "semantic_debug": {}}],
+        final_payload_quote_repair=repair,
+    )
+    assert int(repair.get("final_payload_broken_quotes_count", 0) or 0) == 1
+    assert int(repair.get("final_payload_broken_quotes_unrepaired_count", 0) or 0) == 0
+    assert int(result.get("final_payload_broken_quotes_unrepaired_count", 0) or 0) == 0
+    assert result["passed"] is True
+
+
+def test_call_review_semantic_preflight_ignores_url_and_deal_name_fields_for_quote_lint() -> None:
+    rows = [
+        {
+            "Deal ID": "8805",
+            "Тип кейса": "разговор с лпр",
+            "Сделка": 'ООО "ТД "ГИПРОМЕД" PLM',
+            "Ссылка на сделку": 'https://example.test/leads/detail/123?note="broken',
+            "Ключевой вывод": "Разбор без ошибок по кавычкам.",
+        }
+    ]
+    repair = _repair_final_payload_broken_quotes(rows=rows)
+    result = _run_semantic_preflight(
+        rows=rows,
+        row_entries=[{"row": dict(rows[0]), "semantic_debug": {}}],
+        final_payload_quote_repair=repair,
+    )
+    assert int(repair.get("final_payload_broken_quotes_count", 0) or 0) == 0
+    assert int(result.get("final_payload_broken_quotes_count", 0) or 0) == 0
+    assert result["passed"] is True
+
+
+def test_call_review_semantic_preflight_unrepaired_broken_quote_has_field_diagnostics() -> None:
+    row = {
+        "Deal ID": "8806",
+        "Тип кейса": "разговор с лпр",
+        "Ключевой вывод": "Лучше сказать: ",
+    }
+    result = _run_semantic_preflight(rows=[row], row_entries=[{"row": dict(row), "semantic_debug": {}}])
+    assert result["passed"] is False
+    assert int(result.get("final_payload_broken_quotes_unrepaired_count", 0) or 0) > 0
+    examples = [x for x in result.get("broken_quote_examples", []) if isinstance(x, dict)]
+    assert examples
+    sample = examples[0]
+    assert str(sample.get("deal_id") or "") == "8806"
+    assert str(sample.get("column") or "") == "Ключевой вывод"
+    assert str(sample.get("repair_status") or "") == "unrepaired"
+
+
+def test_call_review_semantic_preflight_reports_final_truncated_examples() -> None:
+    row = {
+        "Deal ID": "8807",
+        "Менеджер": "Илья Бочков",
+        "Тип кейса": "разговор с лпр",
+        "Ключевой вывод": "Что делаем дальше:",
+    }
+    result = _run_semantic_preflight(rows=[row], row_entries=[{"row": dict(row), "semantic_debug": {}}])
+    assert result["passed"] is False
+    assert int(result.get("final_payload_truncated_text_count", 0) or 0) > 0
+    examples = [x for x in result.get("final_payload_truncated_examples", []) if isinstance(x, dict)]
+    assert examples
+    sample = examples[0]
+    assert int(sample.get("row_index", 0) or 0) == 1
+    assert str(sample.get("deal_id") or "") == "8807"
+    assert str(sample.get("manager") or "") == "Илья Бочков"
+    assert str(sample.get("column") or "") == "Ключевой вывод"
+    assert str(sample.get("value") or "") == "Что делаем дальше:"
+    assert str(sample.get("reason") or "")
+
+
+def test_call_review_semantic_preflight_uses_final_rows_not_intermediate_debug_rows() -> None:
+    clean_entry_row = {
+        "Deal ID": "8803",
+        "Тип кейса": "разговор с лпр",
+        "Ключевой вывод": "Чистый текст без технички.",
+    }
+    final_row = {
+        "Deal ID": "8803",
+        "Тип кейса": "разговор с лпр",
+        "Ключевой вывод": "call_signal_objection_no_need=true",
+    }
+    result = _run_semantic_preflight(
+        rows=[final_row],
+        row_entries=[{"row": clean_entry_row, "semantic_debug": {}}],
+    )
+    assert result["passed"] is False
+    assert int(result.get("final_payload_forbidden_terms_count", 0) or 0) > 0
+
+
+def test_call_review_repair_fills_missing_test_stage_comment() -> None:
+    raw_fields = {
+        "key_takeaway": "Обсуждали тест, но часть шагов не зафиксировали.",
+        "strong_sides": "Контакт удержан.",
+        "growth_zones": "Нет четкой фиксации условий теста.",
+        "why_important": "Без фиксации тест провисает.",
+        "reinforce": "Подтверждать итог теста вслух.",
+        "fix_action": "Зафиксировать критерии и сроки теста.",
+        "coaching_list": "1) Разобрали провал.\n2) Дали шаблон.\n3) Применить в следующем звонке.",
+        "expected_quantity": "0.3-0.5 шага в работу за неделю",
+        "expected_quality": "Больше управляемости по тесту.",
+        "stage_test_launch_comment": "",
+        "stage_test_criteria_comment": "",
+        "stage_test_comment": "",
+    }
+    ready, reason = _call_review_llm_fields_ready(fields=raw_fields, case_mode="test_analysis")
+    assert ready is False
+    assert reason == "llm_missing_stage_test_comment"
+    repaired, changed = _repair_call_review_llm_fields(fields=raw_fields, case_mode="test_analysis")
+    assert changed is True
+    ready_repaired, reason_repaired = _call_review_llm_fields_ready(fields=repaired, case_mode="test_analysis")
+    assert ready_repaired is True
+    assert reason_repaired == ""
+
+
+def test_validation_failed_not_mapped_to_llm_not_ready() -> None:
+    reason = _resolve_llm_case_unready_reason(
+        record={
+            "call_review_llm_error": "llm_missing_stage_test_comment",
+            "call_review_llm_error_category": "validation_failed",
+        }
+    )
+    assert reason == "validation_failed"
+
+
+def test_llm_timeout_kept_as_distinct_skip_reason() -> None:
+    reason = _resolve_llm_case_unready_reason(
+        record={
+            "call_review_llm_error": "llm_timeout:structured_json",
+            "call_review_llm_error_category": "llm_timeout",
+        }
+    )
+    assert reason == "llm_timeout"
+
+
+def test_call_review_scoring_can_produce_different_values() -> None:
+    output_dir = _fresh_output_dir("call_review_v3_scoring")
+    artifact_1 = output_dir / "deal_6001.json"
+    artifact_2 = output_dir / "deal_6002.json"
+    artifact_1.write_text(
+        json.dumps(
+            {
+                "snapshot": {
+                    "call_evidence": {
+                        "items": [
+                            {
+                                "call_id": "c6001",
+                                "timestamp": "2026-04-23T10:00:00+00:00",
+                                "duration_seconds": 680,
+                                "direction": "outbound",
+                                "recording_url": "https://rec/6001.mp3",
+                                "manager_name": "Илья Бочков",
+                                "status": "connected",
+                            }
+                        ]
+                    }
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    artifact_2.write_text(
+        json.dumps(
+            {
+                "snapshot": {
+                    "call_evidence": {
+                        "items": [
+                            {
+                                "call_id": "c6002",
+                                "timestamp": "2026-04-23T11:00:00+00:00",
+                                "duration_seconds": 130,
+                                "direction": "outbound",
+                                "recording_url": "https://rec/6002.mp3",
+                                "manager_name": "Илья Бочков",
+                                "status": "connected",
+                            }
+                        ]
+                    }
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    rich = {
+        "deal_id": "6001",
+        "deal_name": "Сделка rich",
+        "company_name": "ООО rich",
+        "owner_name": "Илья Бочков",
+        "status_name": "Есть интерес",
+        "pipeline_name": "Основная",
+        "artifact_path": str(artifact_1),
+        "call_review_llm_ready": True,
+        "call_review_llm_source": "main",
+        "call_review_llm_fields": {
+            "key_takeaway": "ok",
+            "strong_sides": "ok",
+            "growth_zones": "ok",
+            "why_important": "ok",
+            "reinforce": "ok",
+            "fix_action": "ok",
+            "coaching_list": "1) ok\n2) ok\n3) ok",
+            "expected_quantity": "+0.4 встречи в неделю",
+            "expected_quality": "ok",
+            "stage_lpr_comment": "ok",
+            "stage_need_comment": "ok",
+            "stage_closing_comment": "ok",
+            "stage_objections_comment": "ok",
+            "stage_speech_comment": "ok",
+            "stage_crm_comment": "ok",
+        },
+        "transcript_text_len": 1200,
+        "transcript_segments_count": 10,
+        "transcript_text_excerpt": "Длинный и содержательный разговор с ЛПР.",
+        "call_signal_summary_short": "Есть следующий шаг.",
+        "call_signal_next_step_present": True,
+        "call_signal_decision_maker_reached": True,
+        "product_hypothesis": "info",
+    }
+    thin = dict(rich)
+    thin["deal_id"] = "6002"
+    thin["deal_name"] = "Сделка thin"
+    thin["artifact_path"] = str(artifact_2)
+    thin["transcript_text_len"] = 220
+    thin["transcript_segments_count"] = 1
+    thin["transcript_text_excerpt"] = "Короткий разговор."
+    thin["call_signal_summary_short"] = "Обсудили шаг, но без фиксации времени."
+    thin["call_signal_next_step_present"] = False
+    thin["call_signal_decision_maker_reached"] = False
+    thin["transcript_usability_label"] = "weak"
+    thin["transcript_usability_score_final"] = 36
+    thin["call_review_llm_fields"] = dict(rich["call_review_llm_fields"])
+    thin["call_review_llm_fields"]["stage_need_comment"] = ""
+    thin["call_review_llm_fields"]["stage_objections_comment"] = ""
+
+    payload = build_call_review_v3_payload(
+        summary={},
+        period_deal_records=[rich, thin],
+        analysis_shortlist_payload={
+            "selected_items": [
+                {
+                    "deal_id": "6001",
+                    "pool_type": "conversation_pool",
+                    "call_case_type": "lpr_conversation",
+                    "selected_for_transcription": True,
+                    "selected_call_count": 1,
+                    "selected_call_ids": ["c6001"],
+                    "anchor_manager_name": "Илья Бочков",
+                    "shortlist_reason": "priority_1_duration_ge_300",
+                },
+                {
+                    "deal_id": "6002",
+                    "pool_type": "conversation_pool",
+                    "call_case_type": "lpr_conversation",
+                    "selected_for_transcription": True,
+                    "selected_call_count": 1,
+                    "selected_call_ids": ["c6002"],
+                    "anchor_manager_name": "Илья Бочков",
+                    "shortlist_reason": "priority_2_duration_ge_120",
+                },
+            ]
+        },
+        base_domain="https://officeistockinfo.amocrm.ru",
+        manager_allowlist=["Илья"],
+        manager_role_registry={"Илья": "sales_manager"},
+    )
+    rows = payload.get("rows", [])
+    assert isinstance(rows, list) and len(rows) == 2
+    scores = {int(row.get("Оценка 0-100") or 0) for row in rows}
+    assert len(scores) >= 2
+
+
+def test_call_review_prepare_repairs_missing_test_stage_and_not_drop_row() -> None:
+    output_dir = _fresh_output_dir("call_review_prepare_repair_test_stage")
+    artifact_path = output_dir / "deal_9101.json"
+    artifact_path.write_text(
+        json.dumps(
+            {
+                "snapshot": {
+                    "call_evidence": {
+                        "items": [
+                            {
+                                "call_id": "c9101",
+                                "timestamp": "2026-04-23T10:00:00+00:00",
+                                "duration_seconds": 600,
+                                "direction": "outbound",
+                                "recording_url": "https://rec/9101.mp3",
+                                "manager_name": "Илья Бочков",
+                                "status": "connected",
+                            }
+                        ]
+                    }
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    record = {
+        "deal_id": "9101",
+        "deal_name": "Сделка 9101",
+        "company_name": "ООО Клиент",
+        "owner_name": "Илья Бочков",
+        "status_name": "Тестирование системы",
+        "pipeline_name": "Основная",
+        "artifact_path": str(artifact_path),
+        "product_hypothesis": "link",
+        "call_signal_summary_short": "Обсудили тест, но сроки не закрепили.",
+        "transcript_text_excerpt": "Есть обсуждение теста и следующего шага.",
+        "transcript_usability_label": "usable",
+        "transcript_usability_score_final": 80,
+        "analysis_confidence": "high",
+        "call_signal_test_discussed": True,
+    }
+    selected_items = [
+        {
+            "deal_id": "9101",
+            "pool_type": "conversation_pool",
+            "call_case_type": "test",
+            "selected_for_transcription": True,
+            "selected_call_ids": ["c9101"],
+            "selected_call_count": 1,
+            "anchor_manager_name": "Илья Бочков",
+            "anchor_call_id": "c9101",
+            "anchor_call_duration_seconds": 600,
+            "shortlist_reason": "priority_1_duration_ge_300",
+        }
+    ]
+    llm_json_missing_stage = {
+        "key_takeaway": "Тест обсуждали, но шаги не закрепили.",
+        "strong_sides": "Контакт с клиентом удержан.",
+        "growth_zones": "Не закрепили критерии и сроки теста.",
+        "why_important": "Без фиксации тест зависнет.",
+        "reinforce": "Закрывать разговор на договоренность.",
+        "fix_action": "Закрепить критерии и сроки теста.",
+        "coaching_list": "1) Разобрали провисание.\n2) Дали шаблон фиксации.\n3) Проверить в следующем звонке.",
+        "expected_quantity": "0.3 шага в работу за неделю",
+        "expected_quality": "Больше управляемости по тесту.",
+        "stage_test_launch_comment": "",
+        "stage_test_criteria_comment": "",
+        "stage_test_comment": "",
+    }
+
+    with patch(
+        "src.deal_analyzer.cli._llm_chat_text_with_runtime",
+        side_effect=[("free form ok", "main"), ("effect ok", "main")],
+    ), patch(
+        "src.deal_analyzer.cli._llm_chat_json_with_runtime",
+        side_effect=[(llm_json_missing_stage, "main"), (llm_json_missing_stage, "main")],
+    ):
+        result = _prepare_call_review_llm_fields(
+            cfg=_cfg(),
+            logger=_Logger(),
+            llm_runtime={"selected": "main", "reason": "ok"},
+            style_source_excerpt="",
+            period_deal_records=[record],
+            analysis_shortlist_payload={"selected_items": selected_items},
+            step_artifacts_root=output_dir / "artifacts",
+        )
+    assert int(result.get("generated_rows", 0) or 0) == 1
+    assert int(result.get("failed_rows", 0) or 0) == 0
+    assert record.get("call_review_llm_ready") is True
+    assert bool(record.get("call_review_llm_repair_applied")) is True
+    fields = record.get("call_review_llm_fields", {})
+    assert isinstance(fields, dict)
+    assert str(fields.get("stage_test_comment") or "").strip()
+
+
+def test_call_review_v3_pipeline_summary_splits_selected_vs_writer_by_manager() -> None:
+    output_dir = _fresh_output_dir("call_review_v3_summary_manager_split")
+    artifact_ok = output_dir / "deal_9201.json"
+    artifact_skip = output_dir / "deal_9202.json"
+    snapshot = {
+        "snapshot": {
+            "call_evidence": {
+                "items": [
+                    {
+                        "call_id": "c9201",
+                        "timestamp": "2026-04-23T10:00:00+00:00",
+                        "duration_seconds": 480,
+                        "direction": "outbound",
+                        "recording_url": "https://rec/9201.mp3",
+                        "manager_name": "Илья Бочков",
+                        "status": "connected",
+                    }
+                ]
+            }
+        }
+    }
+    artifact_ok.write_text(json.dumps(snapshot, ensure_ascii=False), encoding="utf-8")
+    artifact_skip.write_text(json.dumps(snapshot, ensure_ascii=False), encoding="utf-8")
+
+    ok_record = {
+        "deal_id": "9201",
+        "deal_name": "Сделка 9201",
+        "owner_name": "Илья Бочков",
+        "status_name": "Есть интерес",
+        "pipeline_name": "Основная",
+        "artifact_path": str(artifact_ok),
+        "call_review_llm_ready": True,
+        "call_review_llm_fields": {
+            "key_takeaway": "ok",
+            "strong_sides": "ok",
+            "growth_zones": "ok",
+            "why_important": "ok",
+            "reinforce": "ok",
+            "fix_action": "ok",
+            "coaching_list": "1) ok",
+            "expected_quantity": "0.2 шага",
+            "expected_quality": "ok",
+            "stage_lpr_comment": "ok",
+        },
+        "call_signal_summary_short": "ok",
+        "transcript_text_len": 500,
+        "transcript_segments_count": 5,
+    }
+    skipped_record = {
+        "deal_id": "9202",
+        "deal_name": "Сделка 9202",
+        "owner_name": "Рустам Хомидов",
+        "status_name": "Есть интерес",
+        "pipeline_name": "Основная",
+        "artifact_path": str(artifact_skip),
+        "call_review_llm_ready": False,
+        "call_review_llm_error": "validation_failed:llm_missing_key_takeaway",
+        "call_review_llm_error_category": "validation_failed",
+        "call_signal_summary_short": "ok",
+        "transcript_text_len": 500,
+        "transcript_segments_count": 5,
+    }
+    selected_cases = [
+        {
+            "deal_id": "9201",
+            "pool_type": "conversation_pool",
+            "call_case_type": "lpr_conversation",
+            "selected_for_transcription": True,
+            "selected_call_ids": ["c9201"],
+            "selected_call_count": 1,
+            "anchor_manager_name": "Илья Бочков",
+            "case_type_source": "rules_call_first_classifier_v2",
+            "case_type_reason": "lpr_signals_with_conversation",
+            "evidence_used": ["long_calls=1"],
+        },
+        {
+            "deal_id": "9202",
+            "pool_type": "conversation_pool",
+            "call_case_type": "lpr_conversation",
+            "selected_for_transcription": True,
+            "selected_call_ids": ["c9202"],
+            "selected_call_count": 1,
+            "anchor_manager_name": "Рустам Хомидов",
+            "case_type_source": "rules_call_first_classifier_v2",
+            "case_type_reason": "lpr_signals_with_conversation",
+            "evidence_used": ["long_calls=1"],
+        },
+    ]
+    payload = build_call_review_v3_payload(
+        summary={},
+        period_deal_records=[ok_record, skipped_record],
+        analysis_shortlist_payload={"selected_items": selected_cases},
+        base_domain="https://officeistockinfo.amocrm.ru",
+        manager_allowlist=["Илья Бочков", "Рустам Хомидов"],
+        manager_role_registry={"Илья": "sales_manager", "Рустам": "telemarketer"},
+        run_dir=output_dir,
+        selected_anchor_cases=selected_cases,
+    )
+    assert int(payload.get("rows_count", 0) or 0) == 1
+    pipeline_summary = json.loads((output_dir / "call_review_v3" / "pipeline_summary.json").read_text(encoding="utf-8"))
+    assert pipeline_summary.get("selected_cases_by_manager", {}).get("Илья Бочков", 0) == 1
+    assert pipeline_summary.get("selected_cases_by_manager", {}).get("Рустам Хомидов", 0) == 1
+    assert pipeline_summary.get("writer_rows_by_manager", {}).get("Илья Бочков", 0) == 1
+    assert pipeline_summary.get("skipped_after_llm_by_manager", {}).get("Рустам Хомидов", 0) >= 1
+
+
+def test_long_transcript_not_marked_noisy_by_default() -> None:
+    gate = _evaluate_transcript_usability_for_case(
+        candidate={"transcript_usability_label": "noisy", "transcript_usability_score_final": 1},
+        record={
+            "transcript_text_len": 820,
+            "transcript_segments_count": 7,
+            "transcript_longest_segment_sec": 95.0,
+            "transcript_text_excerpt": "Говорили с ЛПР и согласовали следующий шаг на этой неделе.",
+            "call_signal_summary_short": "Есть следующий шаг и обсуждение потребности.",
+        },
+    )
+    assert gate.get("usable") is True
+    assert str(gate.get("label") or "") == "usable"
+
+
+def test_case_classifier_prefers_presentation_for_long_demo_like_call() -> None:
+    case_type, source, reason, evidence = _classify_call_case_type_with_debug(
+        {
+            "calls_total": 1,
+            "short_calls_0_20_count": 0,
+            "medium_calls_21_60_count": 0,
+            "long_calls_61_plus_count": 1,
+            "max_duration_seconds": 2664,  # 44:24
+            "no_answer_like_count": 0,
+            "autoanswer_like_count": 0,
+            "repeated_dead_redial_count": 0,
+            "same_time_redial_pattern_flag": False,
+            "numbers_not_fully_covered_flag": False,
+            "massive_empty_attempts_day_flag": False,
+            "_text_hints": "проведена демонстрация демо показ экрана ссылка",
+            "call_items": [{"status": "connected", "result": "демо", "disposition": "показ"}],
+        }
+    )
+    assert case_type == "presentation"
+    assert source == "rules_call_first_classifier_v2"
+    assert "presentation" in reason
+    assert isinstance(evidence, list) and any("hint:presentation" in x for x in evidence)
+
+
+def test_case_classifier_not_mechanical_test_by_status_only() -> None:
+    case_type, source, reason, evidence = _classify_call_case_type_with_debug(
+        {
+            "calls_total": 2,
+            "short_calls_0_20_count": 0,
+            "medium_calls_21_60_count": 1,
+            "long_calls_61_plus_count": 1,
+            "max_duration_seconds": 239,
+            "no_answer_like_count": 0,
+            "autoanswer_like_count": 0,
+            "repeated_dead_redial_count": 0,
+            "same_time_redial_pattern_flag": False,
+            "numbers_not_fully_covered_flag": False,
+            "massive_empty_attempts_day_flag": False,
+            # status-like hint only; no direct test wording in call items
+            "_text_hints": "статус тестирование системы",
+            "call_items": [{"status": "connected", "result": "обсуждение", "disposition": "разговор"}],
+        }
+    )
+    assert source == "rules_call_first_classifier_v2"
+    assert case_type != "test"
+    assert isinstance(reason, str) and reason != ""
+    assert isinstance(evidence, list)
+
+
+def test_transcript_skip_reason_detail_has_required_fields() -> None:
+    detail = _transcript_skip_reason_detail(
+        candidate={
+            "transcript_usability_label": "noisy",
+            "transcript_usability_score_final": 1,
+        },
+        record={
+            "transcript_text_len": 22,
+            "transcript_segments_count": 0,
+            "transcript_longest_segment_sec": 0.0,
+            "transcript_text_excerpt": "",
+            "call_signal_summary_short": "абонент не может ответить",
+        },
+    )
+    assert isinstance(detail, dict)
+    required = {
+        "transcript_length_chars",
+        "transcript_segments_count",
+        "longest_segment_sec",
+        "usability_label",
+        "usability_reason",
+        "llm_allowed",
+        "detected_noise_reason",
+        "why_not_usable",
+    }
+    assert required.issubset(set(detail.keys()))
+    assert int(detail.get("transcript_length_chars", 0) or 0) >= 0
+    assert isinstance(detail.get("why_not_usable"), str)
+
+
+def test_call_ledger_audit_missing_probe_marks_drop_stage() -> None:
+    audit = _build_call_ledger_audit(
+        call_ledger_all=[],
+        rows=[{"deal_id": "31134627"}],
+        deal_stage_tracker={
+            "31134627": {
+                "calls_total_raw": 3,
+                "calls_total_in_period": 0,
+                "dropped_outside_period": 3,
+            }
+        },
+    )
+    probe = audit.get("missing_user_probe", {})
+    assert isinstance(probe, dict)
+    assert probe.get("31134627", {}).get("deal_found_in_period_deal_records") is True
+    assert probe.get("31134627", {}).get("call_found_in_call_ledger") is False
+    assert probe.get("31134627", {}).get("dropped_stage") == "calls_collected_but_outside_period_or_window"
+    assert probe.get("31860325", {}).get("dropped_stage") == "missing_in_period_deal_records"
+
+
+def test_call_first_collector_not_limited_by_period_deal_records() -> None:
+    cfg = replace(_cfg(), period_live_refresh_enabled=True)
+    rows = [
+        {"deal_id": 101, "deal_name": "Deal 101", "responsible_user_name": "Илья", "pipeline_name": "P", "status_name": "S"},
+    ]
+    fake_results = {
+        "101": SimpleNamespace(
+            calls=[],
+            source_used="amocrm_api",
+            warnings=[],
+        ),
+    }
+    global_calls = [
+        CallEvidence(
+            call_id="c999",
+            deal_id="999",
+            manager_id="22",
+            manager_name="Рустам",
+            timestamp="2026-04-23T11:03:00+00:00",
+            duration_seconds=315,
+            direction="outbound",
+            source_location="amocrm_api:global_notes:notes_call_out",
+            recording_url="https://rec/999.mp3",
+            recording_ref="u999",
+            quality_flags=[],
+            missing_recording=False,
+        )
+    ]
+    with patch("src.deal_analyzer.cli.CallDownloader.collect_period_calls", return_value=fake_results), patch(
+        "src.deal_analyzer.cli.CallDownloader.collect_period_calls_call_first",
+        return_value=(
+            global_calls,
+            {"source_mode": "call_first", "calls_seen_from_global_source": 1, "calls_missing_deal_id": 0},
+        ),
+    ), patch(
+        "src.deal_analyzer.cli._hydrate_rows_from_call_deals",
+        return_value=(
+            {
+                "999": {
+                    "deal_id": 999,
+                    "amo_lead_id": 999,
+                    "deal_name": "Deal 999",
+                    "responsible_user_name": "Рустам",
+                    "pipeline_name": "P2",
+                    "status_name": "S2",
+                    "tags": [],
+                    "company_tags": [],
+                }
+            },
+            {"deals_resolved_from_calls": 1, "deals_failed_to_resolve": 0, "failed": {}},
+        ),
+    ):
+        debug = _collect_call_pool_debug(
+            cfg=cfg,
+            logger=_Logger(),
+            rows=rows,
+            raw_bundles_by_deal={},
+            period_start=datetime(2026, 4, 20).date(),
+            period_end=datetime(2026, 4, 24).date(),
+            base_domain="https://example.amocrm.ru",
+        )
+    ledger = debug.get("call_ledger_all", [])
+    assert isinstance(ledger, list)
+    assert any(str(x.get("deal_id") or "") == "999" for x in ledger if isinstance(x, dict))
+    collection_audit = debug.get("call_collection_audit", {})
+    assert isinstance(collection_audit, dict)
+    assert str(collection_audit.get("source_mode") or "") == "call_first"
+    assert int(collection_audit.get("calls_seen_from_global_source", 0) or 0) >= 1
+
+
+def test_probe_deal_can_appear_in_ledger_even_if_missing_in_period_records() -> None:
+    cfg = replace(_cfg(), period_live_refresh_enabled=True)
+    rows = []
+    fake_results = {}
+    global_calls = [
+        CallEvidence(
+            call_id="probe311",
+            deal_id="31134627",
+            manager_id="22",
+            manager_name="Рустам",
+            timestamp="2026-04-23T11:03:00+00:00",
+            duration_seconds=315,
+            direction="outbound",
+            source_location="amocrm_api:global_notes:notes_call_out",
+            recording_url="https://rec/31134627.mp3",
+            recording_ref="u311",
+            quality_flags=[],
+            missing_recording=False,
+        )
+    ]
+    with patch("src.deal_analyzer.cli.CallDownloader.collect_period_calls", return_value=fake_results), patch(
+        "src.deal_analyzer.cli.CallDownloader.collect_period_calls_call_first",
+        return_value=(
+            global_calls,
+            {"source_mode": "call_first", "calls_seen_from_global_source": 1, "calls_missing_deal_id": 0},
+        ),
+    ), patch(
+        "src.deal_analyzer.cli._hydrate_rows_from_call_deals",
+        return_value=(
+            {
+                "31134627": {
+                    "deal_id": 31134627,
+                    "amo_lead_id": 31134627,
+                    "deal_name": "Deal 31134627",
+                    "responsible_user_name": "Рустам",
+                    "pipeline_name": "P2",
+                    "status_name": "S2",
+                    "tags": [],
+                    "company_tags": [],
+                }
+            },
+            {"deals_resolved_from_calls": 1, "deals_failed_to_resolve": 0, "failed": {}},
+        ),
+    ):
+        debug = _collect_call_pool_debug(
+            cfg=cfg,
+            logger=_Logger(),
+            rows=rows,
+            raw_bundles_by_deal={},
+            period_start=datetime(2026, 4, 20).date(),
+            period_end=datetime(2026, 4, 24).date(),
+            base_domain="https://example.amocrm.ru",
+        )
+    audit = debug.get("call_ledger_audit", {})
+    probe = (audit.get("missing_user_probe", {}) if isinstance(audit, dict) else {}).get("31134627", {})
+    assert probe.get("deal_found_in_period_deal_records") is False
+    assert probe.get("call_found_in_call_ledger") is True
+
+
+def test_get_leads_by_updated_period_uses_updated_at_filters() -> None:
+    captured: dict[str, Any] = {}
+
+    class _CaptureClient(AmoCollectorClient):
+        def __init__(self):
+            super().__init__(base_domain="example.amocrm.ru", access_token="tok")
+
+        def _get(self, path: str, *, params: dict[str, Any] | None = None):
+            captured["path"] = path
+            captured["params"] = params or {}
+            return {"_embedded": {"leads": []}}
+
+    client = _CaptureClient()
+    rows = client.get_leads_by_updated_period(
+        date_from_unix=1713744000,
+        date_to_unix=1714348799,
+        page=3,
+        limit=200,
+        pipeline_ids=[11],
+    )
+    assert rows == []
+    assert captured.get("path") == "/api/v4/leads"
+    params = captured.get("params", {})
+    assert isinstance(params, dict)
+    assert params.get("filter[updated_at][from]") == 1713744000
+    assert params.get("filter[updated_at][to]") == 1714348799
+    assert "filter[created_at][from]" not in params
+    assert "filter[created_at][to]" not in params
+
+
+def test_created_or_updated_live_refresh_merge_dedupes_leads() -> None:
+    cfg = replace(
+        _cfg(),
+        period_live_refresh_enabled=True,
+        live_refresh_candidate_source="created_or_updated",
+    )
+    fallback_rows: list[dict[str, Any]] = []
+    fallback_raw: dict[str, dict[str, Any]] = {}
+    logger = _Logger()
+    created_batches = [
+        [{"id": 1, "name": "Deal 1"}, {"id": 2, "name": "Deal 2"}],
+        [],
+    ]
+    updated_batches = [
+        [{"id": 2, "name": "Deal 2 upd"}, {"id": 3, "name": "Deal 3"}],
+        [],
+    ]
+
+    class _LiveClient:
+        def __init__(self, *args, **kwargs):
+            self.created_idx = 0
+            self.updated_idx = 0
+
+        def get_users_cache(self):
+            return {}
+
+        def get_status_cache(self):
+            return {}
+
+        def get_pipelines_cache(self):
+            return []
+
+        def get_leads_by_period(self, **kwargs):
+            idx = self.created_idx
+            self.created_idx += 1
+            return created_batches[idx] if idx < len(created_batches) else []
+
+        def get_leads_by_updated_period(self, **kwargs):
+            idx = self.updated_idx
+            self.updated_idx += 1
+            return updated_batches[idx] if idx < len(updated_batches) else []
+
+    with patch(
+        "src.deal_analyzer.cli.load_amocrm_auth_config",
+        return_value=SimpleNamespace(base_domain="example.amocrm.ru", state_path=Path("state.json")),
+    ), patch(
+        "src.deal_analyzer.cli.load_auth_state",
+        return_value=SimpleNamespace(access_token="tok"),
+    ), patch(
+        "src.deal_analyzer.cli.AmoCollectorClient",
+        _LiveClient,
+    ), patch(
+        "src.deal_analyzer.cli._fetch_company_tags_for_lead",
+        return_value=[],
+    ):
+        rows, _, diag = _try_live_refresh_period_rows(
+            cfg=cfg,
+            logger=logger,
+            resolved=SimpleNamespace(
+                period_start=datetime(2026, 4, 20).date(),
+                period_end=datetime(2026, 4, 24).date(),
+            ),
+            fallback_rows=fallback_rows,
+            fallback_raw_bundles=fallback_raw,
+        )
+
+    deal_ids = {int(x.get("deal_id")) for x in rows if isinstance(x, dict) and x.get("deal_id")}
+    assert deal_ids == {1, 2, 3}
+    assert diag.get("source_created_at_count") == 2
+    assert diag.get("source_updated_at_count") == 2
+    assert diag.get("merged_deals_count") == 3
+    assert diag.get("only_created_count") == 1
+    assert diag.get("only_updated_count") == 1
+    assert diag.get("both_created_and_updated_count") == 1
+
+
+def test_call_review_v3_uses_merged_live_refresh_candidates_before_call_ledger_all() -> None:
+    output_dir = _fresh_output_dir("period_batch_merged_candidates_before_ledger")
+    payload = {"normalized_deals": [{"deal_id": 1, "deal_name": "Deal 1", "responsible_user_name": "Илья"}]}
+    logger = _Logger()
+
+    merged_rows = [
+        {"deal_id": 1, "amo_lead_id": 1, "deal_name": "Deal 1", "responsible_user_name": "Илья", "status_name": "S", "pipeline_name": "P"},
+        {"deal_id": 999, "amo_lead_id": 999, "deal_name": "Deal 999", "responsible_user_name": "Рустам", "status_name": "S2", "pipeline_name": "P2"},
+    ]
+    refresh_diag = {
+        "mode": "live_refresh_amocrm_api",
+        "api_first_attempted": True,
+        "api_refresh_success": True,
+        "fallback_used": False,
+        "rows_from_api": 2,
+        "rows_final": 2,
+        "error": "",
+        "candidate_source_mode": "created_or_updated",
+        "source_created_at_count": 1,
+        "source_updated_at_count": 1,
+        "merged_deals_count": 2,
+        "only_created_count": 1,
+        "only_updated_count": 1,
+        "both_created_and_updated_count": 0,
+        "probe_deals_source_presence": {},
+        "probe_deals_direct_api": {},
+    }
+
+    def _fake_collect_call_pool_debug(*, cfg, logger, rows, raw_bundles_by_deal, period_start, period_end, base_domain):
+        deal_ids = {str(x.get("deal_id") or x.get("amo_lead_id") or "").strip() for x in rows if isinstance(x, dict)}
+        assert "999" in deal_ids
+        return {
+            "generated_at": "2026-04-24T12:00:00+00:00",
+            "deals_total_before_limit": 2,
+            "deals_with_any_calls": 0,
+            "deals_with_recordings": 0,
+            "deals_with_long_calls": 0,
+            "deals_with_only_short_calls": 0,
+            "deals_with_autoanswer_pattern": 0,
+            "deals_with_redial_pattern": 0,
+            "call_ledger_all": [],
+            "call_ledger_audit": {},
+            "call_collection_audit": {},
+            "rows_from_call_deals": [],
+            "items": [],
+        }
+
+    with patch(
+        "src.deal_analyzer.cli._try_live_refresh_period_rows",
+        return_value=(merged_rows, {}, refresh_diag),
+    ), patch(
+        "src.deal_analyzer.cli._collect_call_pool_debug",
+        side_effect=_fake_collect_call_pool_debug,
+    ):
+        _run_analyze_period(
+            _cfg(),
+            output_dir,
+            payload,
+            "period.json",
+            True,
+            logger,
+            period_mode="custom_range",
+            date_from="2026-04-20",
+            date_to="2026-04-24",
+            limit=1,
+        )
+
+
+def test_input_filename_period_mismatch_sets_warning() -> None:
+    output_dir = _fresh_output_dir("period_batch_input_name_mismatch")
+    payload = {
+        "normalized_deals": [
+            {
+                "deal_id": 1,
+                "deal_name": "Deal one",
+                "responsible_user_name": "Илья",
+                "status_name": "В работе",
+                "pipeline_name": "P",
+            }
+        ]
+    }
+    logger = _Logger()
+    with patch(
+        "src.deal_analyzer.cli._collect_call_pool_debug",
+        return_value={
+            "generated_at": "2026-04-24T12:00:00+00:00",
+            "deals_total_before_limit": 1,
+            "deals_with_any_calls": 0,
+            "deals_with_recordings": 0,
+            "deals_with_long_calls": 0,
+            "deals_with_only_short_calls": 0,
+            "deals_with_autoanswer_pattern": 0,
+            "deals_with_redial_pattern": 0,
+            "call_ledger_all": [],
+            "call_ledger_audit": {},
+            "call_collection_audit": {},
+            "rows_from_call_deals": [],
+            "items": [],
+        },
+    ):
+        _run_analyze_period(
+            _cfg(),
+            output_dir,
+            payload,
+            "collect_period_2026-04-01_2026-04-07_latest.json",
+            True,
+            logger,
+            period_mode="current_week_to_date",
+            date_from=None,
+            date_to=None,
+            limit=1,
+        )
+    run_dir = next((output_dir / "period_runs").iterdir())
+    summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    mismatch = summary.get("input_filename_period_mismatch", {})
+    assert isinstance(mismatch, dict)
+    assert mismatch.get("warning") is True
+    assert summary.get("input_source_name") == "collect_period_2026-04-01_2026-04-07_latest.json"
+
+
+def test_pipeline_summary_written_on_llm_failure() -> None:
+    output_dir = _fresh_output_dir("period_batch_pipeline_summary_on_llm_failure")
+    payload = {
+        "normalized_deals": [
+            {
+                "deal_id": 1,
+                "deal_name": "Deal one",
+                "responsible_user_name": "Илья",
+                "status_name": "В работе",
+                "pipeline_name": "P",
+            }
+        ]
+    }
+    logger = _Logger()
+
+    def _fake_snapshot(*, normalized_deal, config, logger, raw_bundle, selected_call_ids=None, transcription_selection_reason=""):
+        return {
+            "snapshot_generated_at": "2026-04-24T12:00:00+00:00",
+            "crm": dict(normalized_deal),
+            "warnings": [],
+            "call_evidence": {"items": [], "summary": {"calls_total": 0}},
+            "transcripts": [],
+            "roks_context": {"ok": True},
+        }
+
+    def _fake_analyze(normalized, cfg, logger, *, deal_hint, backend_override):
+        return _analysis_for_deal(1, backend_used="rules", score=60)
+
+    with patch("src.deal_analyzer.cli.build_deal_snapshot", side_effect=_fake_snapshot), patch(
+        "src.deal_analyzer.cli._analyze_one_with_isolation",
+        side_effect=_fake_analyze,
+    ), patch(
+        "src.deal_analyzer.cli._prepare_call_review_llm_fields",
+        side_effect=RuntimeError("Remote end closed connection without response"),
+    ), patch(
+        "src.deal_analyzer.cli._collect_call_pool_debug",
+        return_value={
+            "generated_at": "2026-04-24T12:00:00+00:00",
+            "deals_total_before_limit": 1,
+            "deals_with_any_calls": 1,
+            "deals_with_recordings": 1,
+            "deals_with_long_calls": 1,
+            "deals_with_only_short_calls": 0,
+            "deals_with_autoanswer_pattern": 0,
+            "deals_with_redial_pattern": 0,
+            "call_ledger_all": [
+                {
+                    "deal_id": "1",
+                    "deal_name": "Deal one",
+                    "call_id": "c1",
+                    "call_duration_seconds": 300,
+                    "call_datetime_utc": "2026-04-24T09:00:00+00:00",
+                    "call_datetime_msk": "2026-04-24T12:00:00+03:00",
+                    "direction": "outbound",
+                    "recording_available": True,
+                }
+            ],
+            "call_ledger_audit": {},
+            "call_collection_audit": {},
+            "rows_from_call_deals": [],
+            "items": [
+                {
+                    "deal_id": "1",
+                    "deal_name": "Deal one",
+                    "owner_name": "Илья",
+                    "pool_type": "conversation_pool",
+                    "call_case_type": "lpr_conversation",
+                    "pool_priority_score": 80,
+                    "calls_total": 1,
+                    "recording_url_count": 1,
+                    "long_calls_61_plus_count": 1,
+                    "short_calls_0_20_count": 0,
+                    "repeated_dead_redial_count": 0,
+                    "call_items": [
+                        {
+                            "call_id": "c1",
+                            "timestamp": "2026-04-24T09:00:00+00:00",
+                            "duration_seconds": 300,
+                            "direction": "outbound",
+                            "recording_url": "https://rec/1.mp3",
+                            "audio_path": "",
+                            "phone": "+79990001122",
+                            "status": "",
+                            "result": "",
+                            "disposition": "",
+                            "quality_flags": [],
+                            "source_location": "amocrm_api:notes",
+                            "manager_name": "Илья",
+                            "manager_id": "11",
+                            "business_bucket_date": "2026-04-24",
+                        }
+                    ],
+                }
+            ],
+        },
+    ):
+        _run_analyze_period(
+            _cfg(),
+            output_dir,
+            payload,
+            "period.json",
+            True,
+            logger,
+            period_mode="custom_range",
+            date_from="2026-04-20",
+            date_to="2026-04-24",
+            limit=1,
+        )
+    run_dir = next((output_dir / "period_runs").iterdir())
+    pipeline_summary = json.loads(
+        (run_dir / "call_review_v3" / "pipeline_summary.json").read_text(encoding="utf-8")
+    )
+    assert pipeline_summary.get("abort_stage") == "llm_generation"
+    assert "Remote end closed connection" in str(pipeline_summary.get("abort_error") or "")
+    assert isinstance(pipeline_summary.get("artifacts_written"), list)
 
 
 def test_daily_factual_payload_includes_reference_stack_and_disabled_external_retrieval() -> None:

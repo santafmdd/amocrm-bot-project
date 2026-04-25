@@ -66,6 +66,27 @@ class AmoCollectorClient:
         payload = self._get("/api/v4/leads", params=params)
         return _embedded_list(payload, "leads")
 
+    def get_leads_by_updated_period(
+        self,
+        *,
+        date_from_unix: int,
+        date_to_unix: int,
+        page: int,
+        limit: int = 250,
+        pipeline_ids: list[int] | None = None,
+    ) -> list[dict[str, Any]]:
+        safe_limit = max(1, min(int(limit), 250))
+        params: dict[str, Any] = {
+            "limit": safe_limit,
+            "page": max(1, int(page)),
+            "filter[updated_at][from]": int(date_from_unix),
+            "filter[updated_at][to]": int(date_to_unix),
+        }
+        if pipeline_ids:
+            params["filter[pipeline_id]"] = [int(x) for x in pipeline_ids]
+        payload = self._get("/api/v4/leads", params=params)
+        return _embedded_list(payload, "leads")
+
     def get_lead(self, lead_id: int) -> dict[str, Any]:
         return self._get(f"/api/v4/leads/{int(lead_id)}")
 
@@ -82,6 +103,24 @@ class AmoCollectorClient:
             primary_params=None,
             fallback_params=[{"limit": max(1, min(int(limit), 100))}, {}],
         )
+
+    def get_leads_notes_page(
+        self,
+        *,
+        params: dict[str, Any] | None = None,
+    ) -> tuple[list[dict[str, Any]], ApiResponseMeta, str]:
+        path = "/api/v4/leads/notes"
+        payload, meta = self._get_with_meta(path, params=params)
+        return _embedded_list(payload, "notes"), meta, self._build_request_path(path, params=params)
+
+    def get_events_page(
+        self,
+        *,
+        params: dict[str, Any] | None = None,
+    ) -> tuple[list[dict[str, Any]], ApiResponseMeta, str]:
+        path = "/api/v4/events"
+        payload, meta = self._get_with_meta(path, params=params)
+        return _embedded_list(payload, "events"), meta, self._build_request_path(path, params=params)
 
     def get_tasks_by_lead(self, lead_id: int, limit: int = 250) -> list[dict[str, Any]]:
         path = "/api/v4/tasks"

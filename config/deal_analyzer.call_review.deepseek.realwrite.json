@@ -1,0 +1,29 @@
+﻿{
+  "output_dir": "workspace/deal_analyzer",
+  "analyzer_backend": "hybrid",
+  "ollama_base_url": "http://127.0.0.1:11434",
+  "ollama_model": "deepseek-v3.1:671b-cloud",
+  "ollama_timeout_seconds": 900,
+  "ollama_preflight_timeout_seconds": 120,
+  "ollama_fallback_enabled": true,
+  "ollama_fallback_base_url": "http://127.0.0.1:11434",
+  "ollama_fallback_model": "deepseek-v3.1:671b-cloud",
+  "ollama_fallback_timeout_seconds": 900,
+  "ollama_fallback_preflight_timeout_seconds": 120,
+  "call_review_gemma_route_max_transcript_chars": 12000,
+  "local_gemma_preflight_timeout_sec": 60,
+  "local_gemma_generation_timeout_sec": 240,
+  "local_gemma_structured_timeout_sec": 240,
+  "call_review_json_repair_timeout_seconds": 300,
+  "call_review_style_json_timeout_seconds": 300,
+  "call_review_row_hard_timeout_seconds": 1200,
+  "deal_analyzer_write_enabled": true,
+  "deal_analyzer_spreadsheet_id": "1snOH42aIRUtxS3AU9PJPHSrk1vDyFQdiIJNJRhasxX0",
+  "deal_analyzer_call_review_sheet_name": "Разбор звонков",
+  "deal_analyzer_call_review_start_cell": "A2",
+  "daily_manager_allowlist": [
+    "Рустам Хомидов",
+    "Илья Бочков"
+  ],
+  "period_mode": "current_week_to_date"
+}

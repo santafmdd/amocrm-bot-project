@@ -12,7 +12,7 @@
 ## Analytics Runtime: Golden Commands
 
 - Dry-run batch DSL:
-  `python -m src.run_profile_analytics --report-id analytics_tag_layout_example --browser-backend openclaw_cdp --tag-selection-mode script --writer-layout-api-batch-from-sheet-dsl --writer-layout-api-batch-from-sheet-dsl-dry-run`
+  `python -m src.run_profile_analytics --report-id analytics_tag_layout_example --browser-backend openclaw_cdp --tag-selection-mode script --writer-layout-api-batch-from-sheet-dsl-dry-run`
 - Live-run batch DSL:
   `python -m src.run_profile_analytics --report-id analytics_tag_layout_example --browser-backend openclaw_cdp --tag-selection-mode script --writer-layout-api-batch-from-sheet-dsl`
 - Narrow duplicate-tag debug run:
@@ -137,6 +137,18 @@ New pre-limit aggregates are also stored in `summary.json`:
 - `deals_with_only_short_calls`
 - `deals_with_autoanswer_pattern`
 - `deals_with_redial_pattern`
+
+## Update (2026-04-25): Call Review LLM Profiles
+
+- Stable call-review real-write profile uses `deepseek-v3.1:671b-cloud` as `ollama_model`.
+- `gemma4:26b` is experimental and dry-run only:
+  - config: `workspace/tmp_tests/deal_analyzer/deal_analyzer.llm_gemma4_26b_experimental.json`
+  - `deal_analyzer_write_enabled=false`
+  - do not use this profile for battle write.
+- For local gemma tests:
+  - if `transcript_length_chars > 12000`, runtime routes directly to deepseek
+  - local gemma uses fast timeouts (`preflight=60s`, `generation=240s`, `structured=240s`)
+  - on gemma timeout runtime performs immediate fallback (`fallback_reason=main_timeout`).
 
 
 ## Update (2026-04-11): DSL Encoding + Date Normalization
