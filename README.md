@@ -852,3 +852,32 @@ CLI:
   - `retention_days_screenshots` (default 14)
   - `keep_last_screenshots` (default 200)
   - `retention_days_tmp_dirs` (default 3)
+
+## Update 2026-04-26: Daily Control LLM-First Path
+
+Daily control active path is now organized as a dedicated pipeline package:
+- `src/deal_analyzer/daily_control/cli.py` (discover/build/write orchestration),
+- `source_reader.py`, `day_grouper.py`, `roks_oap_resolver.py`, `roks_oap_parser.py`,
+- `daily_analyzer.py` (LLM-first manager-day analytics),
+- `idempotency.py`, `writer_plan.py`, `sheets_writer.py`,
+- `validation/*` and `style/*` as separate technical layers.
+
+Design contract:
+- code builds facts/context and writes safely,
+- LLM generates management narrative fields,
+- no hardcoded scripted analytics templates in active daily path,
+- deterministic fallback only produces explicit `"не сформировано: llm_json_invalid"` markers if both main and fallback LLM JSON are invalid.
+
+ROKS OAP month selection for period ending 2026-04-24:
+- current month: `РОКС ОАП-апрель 2026`,
+- previous month: `РОКС ОАП-март 2026`.
+
+Main commands:
+- discover:
+  - `python -m src.deal_analyzer.daily_control.cli discover --config <config> --workbook "РОКС 2026" --daily-sheet "Дневной контроль"`
+- build dry-run:
+  - `python -m src.deal_analyzer.daily_control.cli build --config <config> --period-start YYYY-MM-DD --period-end YYYY-MM-DD --source-sheet "Разбор звонков" --daily-sheet "Дневной контроль" --dry-run`
+- write dry-run:
+  - `python -m src.deal_analyzer.daily_control.cli write --config <config> --run-dir <run_dir> --daily-sheet "Дневной контроль" --dry-run --strict-preflight`
+
+Real write must be run only as an explicit separate command after dry-run artifact review.

@@ -52,12 +52,14 @@ from src.deal_analyzer.call_review_v3_builder import (
     _apply_payload_style_normalization,
     _evaluate_transcript_usability_for_case,
     _repair_final_payload_broken_quotes,
+    replay_call_review_payload_preflight,
     _resolve_llm_case_unready_reason,
     _run_semantic_preflight,
     _sanitize_user_text,
     _transcript_skip_reason_detail,
     build_call_review_v3_payload,
 )
+from src.deal_analyzer.call_review_payload_replay import _cleanup_replay_payload_rows
 from src.deal_analyzer.daily_case_modes import classify_daily_case, get_role_scope_policy
 from src.deal_analyzer.config import DealAnalyzerConfig
 from src.deal_analyzer.prompt_builder import build_daily_table_messages
@@ -4756,7 +4758,64 @@ def test_call_review_sanitizer_removes_not_relevant_phrase() -> None:
     assert "не актуально" not in clean.lower()
 
 
-def test_call_review_semantic_preflight_detects_repeated_better_phrase_across_payload() -> None:
+def test_replay_cleanup_normalizes_requested_phrases() -> None:
+    rows = [
+        {
+            "Deal ID": "77701",
+            "Сделка": "Как есть",
+            "База / тег": "Tilda",
+            "Комментарий по этапу (лпр)": (
+                "как действовать открытых вопросов; "
+                "как действовать фиксации фактов; "
+                "Базовый как действовать квалификации; "
+                "Вместо нужно: -; Лучше: -; 1) 1.; "
+                "Нужна четкая фраза для старта."
+            ),
+            "Что исправить": "как действовать квалификации",
+        }
+    ]
+    cleaned_rows, counters = _cleanup_replay_payload_rows(rows)
+    assert cleaned_rows
+    row = cleaned_rows[0]
+    text = " ".join(
+        [
+            str(row.get("Комментарий по этапу (лпр)") or ""),
+            str(row.get("Что исправить") or ""),
+        ]
+    ).lower()
+    assert "как действовать " not in text
+    assert "базовый как" not in text
+    assert "вместо нужно:" not in text
+    assert "лучше: -" not in text
+    assert "1) 1." not in text
+    assert "базовая схема квалификации" in text
+    assert "как отрабатывать" in text
+    assert "готовая формулировка" in text
+    assert int(counters.get("rows_processed", 0) or 0) == 1
+    assert int(counters.get("specific_kak_deystvovat", 0) or 0) >= 2
+    assert int(counters.get("vmesto_nuzhno_dash_removed", 0) or 0) >= 1
+    assert int(counters.get("double_list_marker", 0) or 0) >= 1
+
+
+def test_replay_cleanup_does_not_touch_non_narrative_columns() -> None:
+    rows = [
+        {
+            "Deal ID": "77702",
+            "Сделка": "как действовать не трогать в названии",
+            "База / тег": "Базовый как действовать квалификации",
+            "Ссылка на сделку": "https://example.test/leads/detail/1?note=Лучше:-",
+            "Комментарий по этапу (лпр)": "как действовать фиксации фактов",
+        }
+    ]
+    cleaned_rows, _ = _cleanup_replay_payload_rows(rows)
+    row = cleaned_rows[0]
+    assert str(row.get("Сделка") or "") == "как действовать не трогать в названии"
+    assert str(row.get("База / тег") or "") == "Базовый как действовать квалификации"
+    assert str(row.get("Ссылка на сделку") or "") == "https://example.test/leads/detail/1?note=Лучше:-"
+    assert "как действовать" not in str(row.get("Комментарий по этапу (лпр)") or "").lower()
+
+
+def test_call_review_semantic_preflight_repeated_better_phrase_is_warning_not_blocker() -> None:
     repeated = 'Провисли по фиксации. Лучше сказать: "Давайте не оставлять это в воздухе: вторник 11:00 или среда 15:00 удобнее?"'
     rows = []
     row_entries = []
@@ -4782,11 +4841,17 @@ def test_call_review_semantic_preflight_detects_repeated_better_phrase_across_pa
         rows.append(row)
         row_entries.append({"row": row, "semantic_debug": semantic})
     result = _run_semantic_preflight(rows=rows, row_entries=row_entries)
-    assert result["passed"] is False
-    assert int(result.get("repeated_better_phrase_count", 0) or 0) > 0
+    assert result["passed"] is True
+    assert int(result.get("repeated_better_phrase_marker_count", 0) or 0) == 4
+    assert int(result.get("repeated_better_phrase_actual_duplicate_count", 0) or 0) == 3
+    assert bool(result.get("repeated_better_phrase_blocking")) is False
+    failed_rules = result.get("failed_rules", [])
+    assert isinstance(failed_rules, list)
+    assert all(str(item.get("rule") or "") != "repeated_better_phrase_count_gt_0" for item in failed_rules if isinstance(item, dict))
+    warning_rules = result.get("warning_rules", [])
     assert any(
-        str(item.get("rule") or "") == "repeated_better_phrase_count_gt_0"
-        for item in result.get("failed_rules", [])
+        str(item.get("rule") or "") == "repeated_better_phrase_actual_duplicates_present"
+        for item in warning_rules
         if isinstance(item, dict)
     )
 
@@ -4815,7 +4880,77 @@ def test_call_review_payload_style_normalization_rewrites_repeated_better_phrase
     usage = result.get("better_phrase_usage", {})
     target = "согласен, возражение важное. давайте уточним детали и проверим, что сняли риск."
     assert int(usage.get(target, 0) or 0) <= 2
-    assert int(result.get("repeated_better_phrase_count", 0) or 0) == 0
+    assert result["passed"] is True
+    assert bool(result.get("repeated_better_phrase_blocking")) is False
+
+
+def test_call_review_semantic_preflight_reports_actual_duplicate_examples() -> None:
+    phrase = "Понял. Давайте уточним детали и закроем риск."
+    rows = [
+        {
+            "Deal ID": "8811",
+            "Тип кейса": "разговор с лпр",
+            "Комментарий по этапу (отработка возражений)": f'Возражение приняли. Лучше сказать: "{phrase}"',
+        },
+        {
+            "Deal ID": "8812",
+            "Тип кейса": "разговор с лпр",
+            "Комментарий по этапу (отработка возражений)": f'Нужно докрутить. Лучше сказать: "{phrase}"',
+        },
+        {
+            "Deal ID": "8813",
+            "Тип кейса": "разговор с лпр",
+            "Комментарий по этапу (отработка возражений)": f'Шаг не закрепили. Лучше сказать: "{phrase}"',
+        },
+    ]
+    row_entries = [{"row": dict(row), "semantic_debug": {}} for row in rows]
+    result = _run_semantic_preflight(rows=rows, row_entries=row_entries)
+    assert int(result.get("repeated_better_phrase_marker_count", 0) or 0) == 3
+    assert int(result.get("repeated_better_phrase_actual_duplicate_count", 0) or 0) == 2
+    examples = [x for x in result.get("repeated_better_phrase_actual_duplicates", []) if isinstance(x, dict)]
+    assert examples
+    assert int(examples[0].get("count", 0) or 0) >= 3
+    assert result["passed"] is True
+
+
+def test_replay_call_review_payload_preflight_reuses_existing_payload_rows() -> None:
+    payload = {
+        "mode": "call_review_sheet",
+        "schema_version": "v3",
+        "sheet_name": "Разбор звонков",
+        "start_cell": "A2",
+        "columns": ["Deal ID", "Тип кейса", "Комментарий по этапу (лпр)"],
+        "rows": [
+            {
+                "Deal ID": "99001",
+                "Тип кейса": "разговор с лпр",
+                "Комментарий по этапу (лпр)": 'Слабое начало. Лучше сказать: "Подскажите, вы сами принимаете решение?"',
+            }
+        ],
+        "rows_count": 1,
+    }
+    debug_payload = {
+        "selection_debug": {
+            "details": [
+                {
+                    "deal_id": "99001",
+                    "semantic_debug": {
+                        "stage_relevance": {
+                            "lpr": {"relevant": True, "cross_stage_evidence": False},
+                        }
+                    },
+                }
+            ]
+        }
+    }
+    replay = replay_call_review_payload_preflight(payload=payload, debug_payload=debug_payload)
+    out_payload = replay.get("payload_for_writer", {})
+    semantic = replay.get("semantic_preflight", {})
+    assert isinstance(out_payload, dict)
+    assert int(out_payload.get("rows_count", 0) or 0) == 1
+    assert isinstance(out_payload.get("rows"), list) and out_payload.get("rows")
+    assert isinstance(semantic, dict)
+    assert "failed_rules" in semantic
 
 
 def test_call_review_payload_style_normalization_compacts_long_stage_comment() -> None:

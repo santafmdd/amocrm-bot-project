@@ -412,6 +412,7 @@ FINAL_PAYLOAD_TRUNCATED_PATTERNS: tuple[re.Pattern[str], ...] = (
 
 GENERIC_BETTER_PHRASE = "давайте сразу зафиксируем конкретный следующий шаг и время"
 BETTER_PHRASE_RE = re.compile(r'Лучше сказать:\s*"([^"]+)"', re.IGNORECASE)
+BETTER_PHRASE_MARKER_RE = re.compile(r"Лучше\s+сказать\s*:", re.IGNORECASE)
 
 BETTER_PHRASE_VARIANTS: dict[str, tuple[str, ...]] = {
     "test": (
@@ -1396,6 +1397,9 @@ def _run_semantic_preflight(
     max_same_quote_usage_per_row = 0
     generic_better_phrase_count = 0
     repeated_better_phrase_count = 0
+    repeated_better_phrase_marker_count = 0
+    repeated_better_phrase_actual_duplicate_count = 0
+    repeated_better_phrase_blocking = False
     comments_with_not_relevant_text_count = 0
     stage_comments_without_distinct_evidence_count = 0
     truncated_text_count = 0
@@ -1426,11 +1430,13 @@ def _run_semantic_preflight(
         if isinstance(x, dict)
     ][:5]
     failed_rules: list[dict[str, Any]] = []
+    warning_rules: list[dict[str, Any]] = []
     rows_debug: list[dict[str, Any]] = []
     repeated_quotes_debug: list[dict[str, Any]] = []
     stage_comments_without_stage_evidence_debug: list[dict[str, Any]] = []
     comments_cleared_due_to_irrelevant_stage_debug: list[dict[str, Any]] = []
     repeated_better_phrases_debug: list[dict[str, Any]] = []
+    repeated_better_phrase_actual_duplicates: list[dict[str, Any]] = []
     style_lint_by_row: list[dict[str, Any]] = []
     better_phrase_usage: dict[str, int] = {}
 
@@ -1629,10 +1635,20 @@ def _run_semantic_preflight(
         )
 
     better_phrase_usage = _collect_payload_better_phrase_usage(rows=rows)
-    for phrase, count in better_phrase_usage.items():
-        if int(count or 0) > 2:
-            repeated_better_phrase_count += int(count or 0) - 2
-            repeated_better_phrases_debug.append({"phrase": phrase, "count": int(count or 0)})
+    repeated_better_phrase_marker_count = _collect_payload_better_phrase_marker_count(rows=rows)
+    (
+        repeated_better_phrase_actual_duplicate_count,
+        repeated_better_phrase_actual_duplicates,
+    ) = _collect_better_phrase_actual_duplicates(usage=better_phrase_usage)
+    repeated_better_phrase_count = repeated_better_phrase_actual_duplicate_count
+    repeated_better_phrases_debug = repeated_better_phrase_actual_duplicates[:]
+    if repeated_better_phrase_actual_duplicate_count > 0:
+        warning_rules.append(
+            {
+                "rule": "repeated_better_phrase_actual_duplicates_present",
+                "count": repeated_better_phrase_actual_duplicate_count,
+            }
+        )
 
     post_repair_broken_quotes: list[dict[str, Any]] = []
     for row_idx, row in enumerate(rows, start=1):
@@ -1743,8 +1759,13 @@ def _run_semantic_preflight(
         failed_rules.append({"rule": "technical_terms_present", "count": technical_terms_count})
     if generic_better_phrase_count > 2:
         failed_rules.append({"rule": "generic_better_phrase_count_gt_2", "count": generic_better_phrase_count})
-    if repeated_better_phrase_count > 0:
-        failed_rules.append({"rule": "repeated_better_phrase_count_gt_0", "count": repeated_better_phrase_count})
+    if repeated_better_phrase_blocking and repeated_better_phrase_actual_duplicate_count > 0:
+        failed_rules.append(
+            {
+                "rule": "repeated_better_phrase_actual_duplicate_count_gt_0",
+                "count": repeated_better_phrase_actual_duplicate_count,
+            }
+        )
 
     return {
         "passed": len(failed_rules) == 0,
@@ -1756,6 +1777,10 @@ def _run_semantic_preflight(
         "training_jargon_count": training_jargon_count,
         "generic_better_phrase_count": generic_better_phrase_count,
         "repeated_better_phrase_count": repeated_better_phrase_count,
+        "repeated_better_phrase_marker_count": repeated_better_phrase_marker_count,
+        "repeated_better_phrase_actual_duplicate_count": repeated_better_phrase_actual_duplicate_count,
+        "repeated_better_phrase_actual_duplicates": repeated_better_phrase_actual_duplicates[:20],
+        "repeated_better_phrase_blocking": repeated_better_phrase_blocking,
         "crm_uppercase_count": crm_uppercase_count,
         "lpu_typo_count": lpu_typo_count,
         "technical_terms_count": technical_terms_count,
@@ -1795,8 +1820,80 @@ def _run_semantic_preflight(
             else {}
         ),
         "failed_rules": failed_rules,
+        "warning_rules": warning_rules,
         "rows_debug": rows_debug,
     }
+
+
+def replay_call_review_payload_preflight(
+    *,
+    payload: dict[str, Any],
+    debug_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    rows = payload.get("rows", []) if isinstance(payload.get("rows"), list) else []
+    rows_dict = [dict(item) for item in rows if isinstance(item, dict)]
+    row_entries = _build_row_entries_for_replay(
+        rows=rows_dict,
+        debug_payload=debug_payload if isinstance(debug_payload, dict) else {},
+    )
+    style_payload_normalization = _apply_payload_style_normalization(row_entries=row_entries)
+    normalized_rows = [x.get("row", {}) for x in row_entries if isinstance(x.get("row"), dict)]
+    final_payload_quote_repair = _repair_final_payload_broken_quotes(rows=normalized_rows)
+    if isinstance(style_payload_normalization, dict):
+        style_payload_normalization["final_payload_quote_repair"] = final_payload_quote_repair
+    semantic_preflight = _run_semantic_preflight(
+        rows=normalized_rows,
+        row_entries=row_entries,
+        style_payload_normalization=style_payload_normalization,
+        final_payload_quote_repair=final_payload_quote_repair,
+    )
+    payload_for_writer = {
+        "mode": str(payload.get("mode") or "call_review_sheet"),
+        "schema_version": str(payload.get("schema_version") or "v3"),
+        "sheet_name": str(payload.get("sheet_name") or "Разбор звонков"),
+        "start_cell": str(payload.get("start_cell") or "A2"),
+        "columns": (
+            payload.get("columns", [])
+            if isinstance(payload.get("columns"), list)
+            else list(CALL_REVIEW_V3_COLUMNS)
+        ),
+        "rows": normalized_rows,
+        "rows_count": len(normalized_rows),
+    }
+    return {
+        "payload_for_writer": payload_for_writer,
+        "semantic_preflight": semantic_preflight,
+        "style_payload_normalization": style_payload_normalization,
+        "final_payload_quote_repair": final_payload_quote_repair,
+        "row_entries": row_entries,
+    }
+
+
+def _build_row_entries_for_replay(*, rows: list[dict[str, Any]], debug_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    selection_debug = (
+        debug_payload.get("selection_debug", {})
+        if isinstance(debug_payload.get("selection_debug"), dict)
+        else {}
+    )
+    details = selection_debug.get("details", []) if isinstance(selection_debug.get("details"), list) else []
+    semantic_by_deal: dict[str, list[dict[str, Any]]] = {}
+    for detail in details:
+        if not isinstance(detail, dict):
+            continue
+        semantic_debug = detail.get("semantic_debug")
+        if not isinstance(semantic_debug, dict):
+            continue
+        deal_id = str(detail.get("deal_id") or "").strip()
+        if not deal_id:
+            continue
+        semantic_by_deal.setdefault(deal_id, []).append(dict(semantic_debug))
+    row_entries: list[dict[str, Any]] = []
+    for row in rows:
+        deal_id = str(row.get("Deal ID") or "").strip()
+        semantic_list = semantic_by_deal.get(deal_id, [])
+        semantic_debug = semantic_list.pop(0) if semantic_list else {}
+        row_entries.append({"row": row, "semantic_debug": semantic_debug})
+    return row_entries
 
 
 def _count_regex_hits(text: str, patterns: tuple[re.Pattern[str], ...]) -> int:
@@ -1894,6 +1991,32 @@ def _collect_payload_better_phrase_usage(*, rows: list[dict[str, Any]]) -> dict[
                     continue
                 usage[key] = int(usage.get(key, 0) or 0) + 1
     return usage
+
+
+def _collect_payload_better_phrase_marker_count(*, rows: list[dict[str, Any]]) -> int:
+    total = 0
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        for col in NARRATIVE_USER_FACING_COLUMNS:
+            value = str(row.get(col) or "")
+            if not value.strip():
+                continue
+            total += len(BETTER_PHRASE_MARKER_RE.findall(value))
+    return total
+
+
+def _collect_better_phrase_actual_duplicates(*, usage: dict[str, int]) -> tuple[int, list[dict[str, Any]]]:
+    duplicate_count = 0
+    examples: list[dict[str, Any]] = []
+    for phrase, count_raw in usage.items():
+        count = int(count_raw or 0)
+        if count <= 1:
+            continue
+        duplicate_count += count - 1
+        examples.append({"phrase": str(phrase or ""), "count": count})
+    examples.sort(key=lambda item: int(item.get("count", 0) or 0), reverse=True)
+    return duplicate_count, examples
 
 
 def _apply_payload_style_normalization(*, row_entries: list[dict[str, Any]]) -> dict[str, Any]:
