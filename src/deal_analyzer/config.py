@@ -15,6 +15,7 @@ PERIOD_MODES = {
     "previous_calendar_week",
     "previous_workweek",
     "custom_range",
+    "control_day_window",
 }
 
 PERIOD_LABEL_MODES = {"period_only", "period_and_as_of"}
@@ -549,6 +550,7 @@ def resolve_period(
     requested_mode: str | None = None,
     cli_date_from: str | None = None,
     cli_date_to: str | None = None,
+    cli_control_date: str | None = None,
     today: date | None = None,
 ) -> ResolvedPeriod:
     as_of = today or datetime.now().date()
@@ -587,6 +589,13 @@ def resolve_period(
         if end < start:
             raise RuntimeError("custom_range date_to must be >= date_from")
         return ResolvedPeriod(mode, resolved_mode, start, end, as_of)
+
+    if resolved_mode == "control_day_window":
+        control_raw = cli_control_date or cli_date_from or config.custom_date_from
+        if not control_raw:
+            raise RuntimeError("control_day_window requires control_date (YYYY-MM-DD)")
+        control_day = _parse_date(control_raw, "control_date")
+        return ResolvedPeriod(mode, resolved_mode, control_day, control_day, as_of)
 
     raise RuntimeError(f"Unsupported resolved period mode={resolved_mode!r}")
 

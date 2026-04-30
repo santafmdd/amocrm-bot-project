@@ -34,8 +34,10 @@ SOURCE_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
 }
 
 DAILY_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
-    "period_start": ("начало периода", "period_start", "неделя с", "период с"),
-    "period_end": ("конец периода", "period_end", "неделя по", "период по"),
+    "period_start": ("начало периода", "period_start", "период с"),
+    "period_end": ("конец периода", "period_end", "период по"),
+    "week_start": ("неделя с", "week_start"),
+    "week_end": ("неделя по", "week_end"),
     "control_day_date": ("дата", "день контроля", "дата контроля", "control_day_date"),
     "day_label": ("день", "день недели", "day_label"),
     "manager_name": ("менеджер", "сотрудник", "manager_name"),

@@ -39,7 +39,11 @@ def _read_token_scopes(token_file: Path) -> list[str]:
 
 
 def _scopes_match(expected: list[str], actual: list[str]) -> bool:
-    return set(expected) == set(actual)
+    expected_set = {str(item).strip() for item in expected if str(item).strip()}
+    actual_set = {str(item).strip() for item in actual if str(item).strip()}
+    if not expected_set:
+        return True
+    return expected_set.issubset(actual_set)
 
 
 def _normalize_auth_mode(raw: str | None) -> str:
@@ -68,10 +72,25 @@ def _split_range_tab(range_a1: str) -> tuple[str, str]:
 class GoogleSheetsApiClient:
     """Small read-oriented wrapper around Google Sheets API v4."""
 
-    def __init__(self, project_root: Path, logger: logging.Logger | None = None) -> None:
+    def __init__(
+        self,
+        project_root: Path,
+        logger: logging.Logger | None = None,
+        *,
+        scopes: list[str] | None = None,
+        auth_mode: str | None = None,
+    ) -> None:
         self.project_root = project_root
         self.logger = logger or logging.getLogger("project")
-        self.scopes = [SPREADSHEETS_SCOPE]
+        configured_scopes = [str(item).strip() for item in (scopes or [SPREADSHEETS_SCOPE]) if str(item).strip()]
+        unique_scopes: list[str] = []
+        seen_scopes: set[str] = set()
+        for scope in configured_scopes:
+            if scope in seen_scopes:
+                continue
+            seen_scopes.add(scope)
+            unique_scopes.append(scope)
+        self.scopes = unique_scopes or [SPREADSHEETS_SCOPE]
 
         credentials_path = os.getenv("GOOGLE_API_CREDENTIALS_FILE", "").strip()
         token_path = os.getenv("GOOGLE_API_TOKEN_FILE", "").strip()
@@ -79,7 +98,7 @@ class GoogleSheetsApiClient:
         self.credentials_file = Path(credentials_path) if credentials_path else (project_root / "credentials.json")
         self.token_file = Path(token_path) if token_path else (project_root / "token.json")
 
-        mode_env = os.getenv("GOOGLE_API_AUTH_MODE", AUTH_MODE_AUTO)
+        mode_env = str(auth_mode).strip() if auth_mode is not None else os.getenv("GOOGLE_API_AUTH_MODE", AUTH_MODE_AUTO)
         self.auth_mode = _normalize_auth_mode(mode_env)
         self._service = None
         self._spreadsheet_meta_cache: dict[str, dict[str, Any]] = {}
@@ -120,7 +139,7 @@ class GoogleSheetsApiClient:
                 token_scope_mismatch = True
                 self.logger.warning(
                     "Token scopes mismatch detected. token_file=%s cached_scopes=%s requested_scopes=%s. "
-                    "Re-issuing OAuth token is required.",
+                    "Re-issuing OAuth token is required. Удалите token.json и пройдите OAuth заново.",
                     self.token_file,
                     cached_scopes,
                     self.scopes,
@@ -161,7 +180,8 @@ class GoogleSheetsApiClient:
             if self.auth_mode == AUTH_MODE_CACHE_ONLY:
                 raise RuntimeError(
                     "Google auth cache_only: token missing/invalid. Interactive OAuth is forbidden in this mode. "
-                    "Run one explicit bootstrap with --google-auth-mode interactive_bootstrap."
+                    "Run one explicit bootstrap with --google-auth-mode interactive_bootstrap. "
+                    "Если причина в scopes mismatch: удалите token.json и пройдите OAuth заново."
                 )
             raise RuntimeError(
                 "Google Sheets API token is missing/invalid and interactive OAuth is disabled. "
@@ -181,7 +201,8 @@ class GoogleSheetsApiClient:
         except Exception as exc:
             hint = (
                 f"OAuth authorization failed for scopes={self.scopes}. "
-                f"If you recently changed scopes, remove token cache file: {self.token_file}"
+                f"If you recently changed scopes, remove token cache file: {self.token_file}. "
+                "Удалите token.json и пройдите OAuth заново."
             )
             raise RuntimeError(hint) from exc
 

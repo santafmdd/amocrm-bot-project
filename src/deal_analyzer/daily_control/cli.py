@@ -24,6 +24,14 @@ from src.deal_analyzer.daily_control.style.deterministic_cleaner import NARRATIV
 from src.deal_analyzer.daily_control.style.llm_rewriter import rewrite_rows_with_llm
 from src.deal_analyzer.daily_control.style.rewrite_guard import validate_rewrite_row
 from src.deal_analyzer.daily_control.style.style_metrics import build_style_metrics
+from src.deal_analyzer.daily_control.validation.language_repair import (
+    build_language_repair_markdown,
+    repair_language_rows,
+)
+from src.deal_analyzer.daily_control.validation.payload_validator import (
+    payload_has_blockers,
+    validate_daily_payload_rows,
+)
 from src.deal_analyzer.daily_control.validation.text_lint import lint_daily_text_rows
 
 
@@ -61,6 +69,12 @@ def _parse_args() -> argparse.Namespace:
     build.add_argument("--dry-run", action="store_true")
     build.add_argument("--main-model", default="", help="Override daily-control main model")
     build.add_argument("--fallback-model", default="", help="Override daily-control fallback model")
+    build.add_argument("--fallback2-model", default="", help="Optional second fallback model")
+    build.add_argument("--fallback-timeout", type=int, default=0, help="Fallback timeout seconds override")
+    build.add_argument("--no-retry-on-rate-limit", action="store_true", help="Do not retry the same model after HTTP429 usage-limit errors")
+    build.add_argument("--llm-max-attempts", type=int, default=9, help="Max LLM attempts per manager-day")
+    build.add_argument("--limit", type=int, default=0, help="Limit manager-day groups for bounded dry-run (0 = all)")
+    build.add_argument("--retry-from-run-dir", default="", help="Reuse daily_control_input_groups.json from existing run dir and retry quarantined rows")
     build.add_argument("--style-editor-llm", action="store_true")
     build.add_argument("--style-editor-model", default="")
     build.add_argument("--style-editor-limit", type=int, default=0)
@@ -73,6 +87,11 @@ def _parse_args() -> argparse.Namespace:
     write.add_argument("--dry-run", action="store_true", help="Plan write only (default)")
     write.add_argument("--write", action="store_true", help="Execute real write")
     write.add_argument("--strict-preflight", action="store_true", help="Block write when conflicts are detected")
+    write.add_argument("--allow-partial-write", dest="allow_partial_write", action="store_true", help="Allow writing rows without blockers while quarantining bad rows")
+    write.add_argument("--no-allow-partial-write", dest="allow_partial_write", action="store_false", help="Block whole batch when any row has blockers")
+    write.add_argument("--quarantine-unrepaired", dest="quarantine_unrepaired", action="store_true", help="Quarantine unrepaired rows instead of batch blocking")
+    write.add_argument("--no-quarantine-unrepaired", dest="quarantine_unrepaired", action="store_false", help="Do not quarantine unrepaired rows")
+    write.set_defaults(allow_partial_write=True, quarantine_unrepaired=True)
 
     return parser.parse_args()
 
@@ -250,18 +269,78 @@ def _build_quality_review(rows: list[dict[str, Any]], *, limit: int = 10) -> dic
     }
 
 
+def _payload_row_validation_rejections(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    valid_rows: list[dict[str, Any]] = []
+    rejected_rows: list[dict[str, Any]] = []
+    for idx, row in enumerate(rows):
+        validation = validate_daily_payload_rows([row])
+        if payload_has_blockers(validation):
+            missing_examples = (
+                validation.get("missing_required_examples", [])
+                if isinstance(validation.get("missing_required_examples"), list)
+                else []
+            )
+            missing_fields = (
+                missing_examples[0].get("missing", [])
+                if missing_examples and isinstance(missing_examples[0], dict)
+                else []
+            )
+            reason_parts: list[str] = []
+            if missing_fields:
+                reason_parts.append(f"missing_required:{','.join(str(x) for x in missing_fields)}")
+            if int(validation.get("invalid_date_count", 0) or 0) > 0:
+                reason_parts.append("invalid_date")
+            if int(validation.get("invalid_score_count", 0) or 0) > 0:
+                reason_parts.append("invalid_score")
+            if int(validation.get("invalid_criticality_count", 0) or 0) > 0:
+                reason_parts.append("invalid_criticality")
+            if int(validation.get("duplicate_key_count", 0) or 0) > 0:
+                reason_parts.append("duplicate_key")
+            rejected_rows.append(
+                {
+                    "row_index": idx,
+                    "manager_name": str(row.get("manager_name") or ""),
+                    "control_day_date": str(row.get("control_day_date") or ""),
+                    "reason": "payload_validator_blocker" + (f":{'|'.join(reason_parts)}" if reason_parts else ""),
+                    "payload_validator": validation,
+                    "row": row,
+                }
+            )
+            continue
+        valid_rows.append(row)
+    return valid_rows, rejected_rows
+
+
 def _summary_markdown_lines(summary: dict[str, Any]) -> list[str]:
     lines = [
+        f"groups_count: {summary.get('groups_count', 0)}",
+        f"rows_after_llm_analyzer: {summary.get('rows_after_llm_analyzer', 0)}",
+        f"rows_after_language_repair: {summary.get('rows_after_language_repair', 0)}",
+        f"rows_after_payload_validator: {summary.get('rows_after_payload_validator', 0)}",
         f"rows_prepared: {summary.get('rows_prepared', 0)}",
+        f"rows_in_writer_payload: {summary.get('rows_in_writer_payload', summary.get('rows_prepared', 0))}",
+        f"rows_quarantined: {summary.get('rows_quarantined', 0)}",
         f"rows_to_insert: {summary.get('rows_to_insert', 0)}",
+        f"rows_to_update: {summary.get('rows_to_update', 0)}",
         f"rows_skipped_existing: {summary.get('rows_skipped_existing', 0)}",
+        f"rows_skipped_stale: {summary.get('rows_skipped_stale', 0)}",
         f"conflicts_count: {summary.get('conflicts_count', 0)}",
         f"llm_main_model: {summary.get('llm_main_model', '')}",
         f"llm_fallback_model: {summary.get('llm_fallback_model', '')}",
+        f"llm_fallback2_model: {summary.get('llm_fallback2_model', '')}",
+        f"llm_attempts_total: {summary.get('llm_attempts_total', 0)}",
         f"llm_success_main: {summary.get('llm_success_main', 0)}",
+        f"llm_success_main_repair: {summary.get('llm_success_main_repair', 0)}",
+        f"llm_success_main_compact_retry: {summary.get('llm_success_main_compact_retry', 0)}",
         f"llm_success_fallback: {summary.get('llm_success_fallback', 0)}",
+        f"llm_success_fallback_repair: {summary.get('llm_success_fallback_repair', 0)}",
+        f"llm_success_fallback_compact_retry: {summary.get('llm_success_fallback_compact_retry', 0)}",
+        f"llm_success_fallback2: {summary.get('llm_success_fallback2', 0)}",
+        f"llm_success_fallback2_repair: {summary.get('llm_success_fallback2_repair', 0)}",
+        f"llm_success_fallback2_compact_retry: {summary.get('llm_success_fallback2_compact_retry', 0)}",
         f"llm_json_repair_count: {summary.get('llm_json_repair_count', 0)}",
         f"llm_failed_count: {summary.get('llm_failed_count', 0)}",
+        f"fallback_used_count: {summary.get('fallback_used_count', 0)}",
         f"roks_oap_snapshot_status: {summary.get('roks_oap_snapshot_status', '')}",
         f"selected_current_month_sheet: {summary.get('selected_current_month_sheet', '')}",
         f"selected_previous_month_sheet: {summary.get('selected_previous_month_sheet', '')}",
@@ -277,6 +356,104 @@ def _summary_markdown_lines(summary: dict[str, Any]) -> list[str]:
         for item in limitations[:5]:
             lines.append(f"- {item}")
     return lines
+
+
+def _load_json_dict(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _group_from_payload(item: dict[str, Any]) -> Any:
+    from src.deal_analyzer.daily_control.models import DailyControlInputGroup
+
+    return DailyControlInputGroup(
+        period_start=str(item.get("period_start") or ""),
+        period_end=str(item.get("period_end") or ""),
+        week_start=str(item.get("week_start") or ""),
+        week_end=str(item.get("week_end") or ""),
+        control_day_date=str(item.get("control_day_date") or ""),
+        day_label=str(item.get("day_label") or ""),
+        manager_name=str(item.get("manager_name") or ""),
+        manager_role_profile=str(item.get("manager_role_profile") or ""),
+        source_rows=(item.get("source_rows") if isinstance(item.get("source_rows"), list) else []),
+        sample_size=int(item.get("sample_size") or 0),
+        deals_count=int(item.get("deals_count") or 0),
+        calls_count=int(item.get("calls_count") or 0),
+        deal_ids=[str(x) for x in (item.get("deal_ids") or [])],
+        deal_names=[str(x) for x in (item.get("deal_names") or [])],
+        deal_links=[str(x) for x in (item.get("deal_links") or [])],
+        product_mix=str(item.get("product_mix") or ""),
+        base_mix=str(item.get("base_mix") or ""),
+        insights=(item.get("insights") if isinstance(item.get("insights"), dict) else {}),
+        discipline_signals=(item.get("discipline_signals") if isinstance(item.get("discipline_signals"), dict) else {}),
+    )
+
+
+def _load_retry_groups(
+    *,
+    retry_from_run_dir: Path,
+    logger: Any,
+) -> tuple[list[Any], dict[str, Any], dict[str, Any], str]:
+    input_groups_payload = _load_json_dict(retry_from_run_dir / "daily_control_input_groups.json")
+    groups_raw = (
+        input_groups_payload.get("groups")
+        if isinstance(input_groups_payload.get("groups"), list)
+        else []
+    )
+    all_groups = [_group_from_payload(item) for item in groups_raw if isinstance(item, dict)]
+
+    quarantine_payload = _load_json_dict(retry_from_run_dir / "daily_control_quarantine.json")
+    quarantined_rows = (
+        quarantine_payload.get("rows")
+        if isinstance(quarantine_payload.get("rows"), list)
+        else []
+    )
+    quarantine_keys = {
+        f"{str(item.get('control_day_date') or '')}|{str(item.get('manager_name') or '')}"
+        for item in quarantined_rows
+        if isinstance(item, dict)
+    }
+    if quarantine_keys:
+        groups = [g for g in all_groups if f"{g.control_day_date}|{g.manager_name}" in quarantine_keys]
+    else:
+        groups = list(all_groups)
+
+    grouping_diag = (
+        input_groups_payload.get("grouping_diagnostics")
+        if isinstance(input_groups_payload.get("grouping_diagnostics"), dict)
+        else {}
+    )
+    grouping_diag = dict(grouping_diag)
+    grouping_diag["retry_source_run_id"] = retry_from_run_dir.name
+    grouping_diag["retry_source_groups_total"] = len(all_groups)
+    grouping_diag["retry_source_quarantine_keys_total"] = len(quarantine_keys)
+    grouping_diag["retry_groups_selected_total"] = len(groups)
+
+    roks_snapshot = _load_json_dict(retry_from_run_dir / "roks_oap_snapshot.json")
+    if not roks_snapshot:
+        roks_snapshot = {
+            "status": "sheets_not_found",
+            "parse_status": "sheets_not_found",
+            "warnings": ["retry_run_roks_snapshot_missing"],
+            "manager_metrics": {},
+            "parsed_metrics_by_manager": {},
+        }
+    payload = _load_json_dict(retry_from_run_dir / "daily_control_payload.json")
+    source_sheet_name = str(payload.get("source_sheet") or "Разбор звонков")
+    if logger is not None:
+        logger.info(
+            "daily_control retry-from-run loaded source_run=%s groups=%s quarantine_keys=%s selected=%s",
+            retry_from_run_dir.name,
+            len(all_groups),
+            len(quarantine_keys),
+            len(groups),
+        )
+    return groups, grouping_diag, roks_snapshot, source_sheet_name
 
 
 def _run_discover(args: argparse.Namespace) -> None:
@@ -312,73 +489,112 @@ def _run_build(args: argparse.Namespace) -> None:
     if period_end < period_start:
         raise RuntimeError("period_end must be >= period_start")
 
-    discovery = discover_daily_control_sheet(
-        cfg=cfg,
-        workbook_name="РОКС 2026",
-        daily_sheet_name=str(args.daily_sheet or cfg.deal_analyzer_daily_sheet_name or "Дневной контроль"),
-        source_sheet_name=str(args.source_sheet or cfg.deal_analyzer_call_review_sheet_name or "Разбор звонков"),
-        logger=logger,
-    )
-    write_json(run_dir / "daily_control_sheet_discovery.json", discovery)
-    write_markdown(
-        run_dir / "daily_control_sheet_discovery.md",
-        title="Daily Control Discovery",
-        lines=build_discovery_markdown(discovery),
-    )
-
-    spreadsheet_id = str(discovery.get("spreadsheet_id") or "")
-    source_sheet_name = (
-        (discovery.get("source_sheet", {}) if isinstance(discovery.get("source_sheet"), dict) else {}).get("title")
-        or str(args.source_sheet or cfg.deal_analyzer_call_review_sheet_name or "Разбор звонков")
-    )
-
-    source_snapshot = read_call_review_source(
-        cfg=cfg,
-        spreadsheet_id=spreadsheet_id,
-        source_sheet_name=source_sheet_name,
-        logger=logger,
-    )
-
+    retry_from_run_dir = Path(str(args.retry_from_run_dir or "")).resolve() if str(args.retry_from_run_dir or "").strip() else None
     managers = _manager_allowlist(cfg, args.managers)
-    groups, grouping_diag = group_by_manager_day(
-        headers=source_snapshot.headers,
-        rows=source_snapshot.rows,
-        cfg=cfg,
-        period_start=period_start,
-        period_end=period_end,
-        manager_allowlist=managers,
-    )
 
-    app_root = Path(cfg.config_path).resolve().parents[1]
-    sheet_client = None
-    try:
-        from src.integrations.google_sheets_api_client import GoogleSheetsApiClient
-
-        sheet_client = GoogleSheetsApiClient(project_root=app_root, logger=logger)
-    except Exception:
-        sheet_client = None
-
-    if sheet_client is None:
-        roks_snapshot = {
-            "status": "access_error",
-            "parse_status": "access_error",
-            "warnings": ["google_sheets_client_init_failed"],
-            "selected_current_month_sheet": "",
-            "selected_previous_month_sheet": "",
-            "manager_metrics": {},
-            "parsed_metrics_by_manager": {},
-        }
+    if retry_from_run_dir is not None:
+        groups, grouping_diag, roks_snapshot, source_sheet_name = _load_retry_groups(
+            retry_from_run_dir=retry_from_run_dir,
+            logger=logger,
+        )
+        groups_all_count = len(groups)
+        if int(args.limit or 0) > 0:
+            groups = groups[: int(args.limit)]
+        grouping_diag = dict(grouping_diag or {})
+        grouping_diag["groups_total_before_limit"] = int(groups_all_count)
+        grouping_diag["groups_total_after_limit"] = int(len(groups))
+        grouping_diag["groups_limit_applied"] = int(args.limit or 0)
+        write_json(
+            run_dir / "daily_control_sheet_discovery.json",
+            {
+                "status": "retry_from_run_dir",
+                "retry_source_run_id": retry_from_run_dir.name,
+                "source_sheet_name": source_sheet_name,
+            },
+        )
+        write_markdown(
+            run_dir / "daily_control_sheet_discovery.md",
+            title="Daily Control Discovery",
+            lines=[
+                "status: retry_from_run_dir",
+                f"retry_source_run_id: {retry_from_run_dir.name}",
+                f"source_sheet_name: {source_sheet_name}",
+            ],
+        )
     else:
-        roks_snapshot = parse_roks_oap_snapshot(
-            client=sheet_client,
+        discovery = discover_daily_control_sheet(
+            cfg=cfg,
+            workbook_name="РОКС 2026",
+            daily_sheet_name=str(args.daily_sheet or cfg.deal_analyzer_daily_sheet_name or "Дневной контроль"),
+            source_sheet_name=str(args.source_sheet or cfg.deal_analyzer_call_review_sheet_name or "Разбор звонков"),
+            logger=logger,
+        )
+        write_json(run_dir / "daily_control_sheet_discovery.json", discovery)
+        write_markdown(
+            run_dir / "daily_control_sheet_discovery.md",
+            title="Daily Control Discovery",
+            lines=build_discovery_markdown(discovery),
+        )
+
+        spreadsheet_id = str(discovery.get("spreadsheet_id") or "")
+        source_sheet_name = (
+            (discovery.get("source_sheet", {}) if isinstance(discovery.get("source_sheet"), dict) else {}).get("title")
+            or str(args.source_sheet or cfg.deal_analyzer_call_review_sheet_name or "Разбор звонков")
+        )
+
+        source_snapshot = read_call_review_source(
+            cfg=cfg,
             spreadsheet_id=spreadsheet_id,
+            source_sheet_name=source_sheet_name,
+            logger=logger,
+        )
+
+        groups, grouping_diag = group_by_manager_day(
+            headers=source_snapshot.headers,
+            rows=source_snapshot.rows,
+            cfg=cfg,
+            period_start=period_start,
             period_end=period_end,
             manager_allowlist=managers,
         )
+        groups_all_count = len(groups)
+        if int(args.limit or 0) > 0:
+            groups = groups[: int(args.limit)]
+        grouping_diag = dict(grouping_diag or {})
+        grouping_diag["groups_total_before_limit"] = int(groups_all_count)
+        grouping_diag["groups_total_after_limit"] = int(len(groups))
+        grouping_diag["groups_limit_applied"] = int(args.limit or 0)
+
+        app_root = Path(cfg.config_path).resolve().parents[1]
+        sheet_client = None
+        try:
+            from src.integrations.google_sheets_api_client import GoogleSheetsApiClient
+
+            sheet_client = GoogleSheetsApiClient(project_root=app_root, logger=logger)
+        except Exception:
+            sheet_client = None
+
+        if sheet_client is None:
+            roks_snapshot = {
+                "status": "access_error",
+                "parse_status": "access_error",
+                "warnings": ["google_sheets_client_init_failed"],
+                "selected_current_month_sheet": "",
+                "selected_previous_month_sheet": "",
+                "manager_metrics": {},
+                "parsed_metrics_by_manager": {},
+            }
+        else:
+            roks_snapshot = parse_roks_oap_snapshot(
+                client=sheet_client,
+                spreadsheet_id=spreadsheet_id,
+                period_end=period_end,
+                manager_allowlist=managers,
+            )
 
     llm_runtime = {
         "main": {
-            "model": str(args.main_model or "").strip() or "gemma4:31b-cloud",
+            "model": str(args.main_model or "").strip() or "qwen3.5:397b-cloud",
             "base_url": str(cfg.ollama_base_url or "http://127.0.0.1:11434"),
             "timeout_seconds": int(cfg.ollama_timeout_seconds or 120),
             "preflight_timeout_seconds": int(cfg.ollama_preflight_timeout_seconds or 20),
@@ -387,8 +603,15 @@ def _run_build(args: argparse.Namespace) -> None:
             "enabled": True,
             "model": str(args.fallback_model or "").strip() or "deepseek-v3.1:671b-cloud",
             "base_url": str(cfg.ollama_fallback_base_url or cfg.ollama_base_url or "http://127.0.0.1:11434"),
-            "timeout_seconds": int(cfg.ollama_fallback_timeout_seconds or cfg.ollama_timeout_seconds or 120),
+            "timeout_seconds": int(args.fallback_timeout or 0) if int(args.fallback_timeout or 0) > 0 else int(cfg.ollama_fallback_timeout_seconds or cfg.ollama_timeout_seconds or 120),
         },
+        "fallback2": {
+            "enabled": bool(str(args.fallback2_model or "").strip()),
+            "model": str(args.fallback2_model or "").strip() or "",
+            "base_url": str(cfg.ollama_fallback_base_url or cfg.ollama_base_url or "http://127.0.0.1:11434"),
+            "timeout_seconds": int(args.fallback_timeout or 0) if int(args.fallback_timeout or 0) > 0 else int(cfg.ollama_fallback_timeout_seconds or cfg.ollama_timeout_seconds or 120),
+        },
+        "no_retry_on_rate_limit": bool(args.no_retry_on_rate_limit),
     }
 
     rows, llm_diag = analyze_daily_packages(
@@ -400,7 +623,18 @@ def _run_build(args: argparse.Namespace) -> None:
         source_run_id=run_dir.name,
         main_model_override=str(args.main_model or "").strip() or None,
         fallback_model_override=str(args.fallback_model or "").strip() or None,
+        fallback2_model_override=str(args.fallback2_model or "").strip() or None,
+        fallback_timeout_seconds=(int(args.fallback_timeout or 0) if int(args.fallback_timeout or 0) > 0 else None),
+        no_retry_on_rate_limit=bool(args.no_retry_on_rate_limit),
+        llm_max_attempts=int(args.llm_max_attempts or 3),
     )
+    llm_runtime_status = llm_diag.get("llm_runtime", {}) if isinstance(llm_diag.get("llm_runtime"), dict) else {}
+    fallback_node = llm_runtime_status.get("fallback", {}) if isinstance(llm_runtime_status.get("fallback"), dict) else {}
+    preflight = llm_runtime_status.get("preflight", {}) if isinstance(llm_runtime_status.get("preflight"), dict) else {}
+    fallback_preflight = preflight.get("fallback", {}) if isinstance(preflight.get("fallback"), dict) else {}
+    fallback_model_name = str(fallback_node.get("model") or "")
+    if "gpt-oss:20b" in fallback_model_name.lower() and not bool(fallback_preflight.get("ok", False)):
+        logger.warning("local fallback gpt-oss:20b unavailable; run: ollama pull gpt-oss:20b")
 
     styled_rows, style_debug = _run_style_editor(
         rows=rows,
@@ -414,13 +648,32 @@ def _run_build(args: argparse.Namespace) -> None:
         logger=logger,
     )
 
+    language_repair = repair_language_rows(
+        rows=styled_rows,
+        cfg=cfg,
+        llm_runtime=(llm_diag.get("llm_runtime", {}) if isinstance(llm_diag.get("llm_runtime"), dict) else {}),
+        logger=logger,
+        max_attempts=max(1, int(args.llm_max_attempts or 3)),
+        enable_llm_repair=True,
+    )
+    rows_after_language_repair = language_repair.get("rows", []) if isinstance(language_repair.get("rows"), list) else []
+    language_quarantined_rows = (
+        language_repair.get("quarantined_rows", [])
+        if isinstance(language_repair.get("quarantined_rows"), list)
+        else []
+    )
+    writer_rows, payload_validator_rejected_rows = _payload_row_validation_rejections(rows_after_language_repair)
+    quarantined_rows = [*language_quarantined_rows, *payload_validator_rejected_rows]
+
     payload = {
         "mode": "daily_control",
         "period_start": period_start.isoformat(),
         "period_end": period_end.isoformat(),
         "source_sheet": source_sheet_name,
-        "rows": styled_rows,
-        "rows_count": len(styled_rows),
+        "rows": writer_rows,
+        "rows_count": len(writer_rows),
+        "rows_prepared": len(styled_rows),
+        "rows_quarantined": len(quarantined_rows),
         "llm_runtime": llm_diag.get("llm_runtime", {}),
     }
 
@@ -432,15 +685,94 @@ def _run_build(args: argparse.Namespace) -> None:
         "grouping_diagnostics": grouping_diag,
     }
 
-    quality_review = _build_quality_review(styled_rows, limit=10)
+    quality_review = _build_quality_review(writer_rows, limit=10)
+
+    llm_quarantined_rows = (
+        llm_diag.get("quarantined_rows", []) if isinstance(llm_diag.get("quarantined_rows"), list) else []
+    )
+    row_flow_filtered: list[dict[str, Any]] = []
+    for item in llm_quarantined_rows:
+        if isinstance(item, dict):
+            row_flow_filtered.append(
+                {
+                    "stage": "llm_analyzer",
+                    "row_index": item.get("row_index"),
+                    "manager_name": item.get("manager_name", ""),
+                    "control_day_date": item.get("control_day_date", ""),
+                    "reason": item.get("reason", "llm_failed"),
+                    "error_type": item.get("error_type", ""),
+                    "failed_model": item.get("failed_model", ""),
+                    "failed_base_url": item.get("failed_base_url", ""),
+                    "fallback_reason": item.get("fallback_reason", ""),
+                    "failure_stage": item.get("failure_stage", ""),
+                    "prompt_size_chars": item.get("prompt_size_chars", 0),
+                    "raw_response_preview": item.get("raw_response_preview", ""),
+                    "models_attempted": item.get("models_attempted", []),
+                    "errors_by_attempt": item.get("errors_by_attempt", []),
+                }
+            )
+    for item in language_quarantined_rows:
+        if isinstance(item, dict):
+            row_flow_filtered.append(
+                {
+                    "stage": "language_repair",
+                    "row_index": item.get("row_index"),
+                    "manager_name": item.get("manager_name", ""),
+                    "control_day_date": item.get("control_day_date", ""),
+                    "reason": item.get("reason", "language_blocker_unrepaired"),
+                    "repair_trace": item.get("repair_trace", []),
+                }
+            )
+    for item in payload_validator_rejected_rows:
+        if isinstance(item, dict):
+            row_flow_filtered.append(
+                {
+                    "stage": "payload_validator",
+                    "row_index": item.get("row_index"),
+                    "manager_name": item.get("manager_name", ""),
+                    "control_day_date": item.get("control_day_date", ""),
+                    "reason": item.get("reason", "payload_validator_blocker"),
+                }
+            )
+
+    row_flow_debug = {
+        "groups_count": len(groups),
+        "rows_after_llm_analyzer": len(rows),
+        "rows_after_style_editor": len(styled_rows),
+        "rows_after_language_repair": len(rows_after_language_repair),
+        "rows_after_payload_validator": len(writer_rows),
+        "rows_in_daily_control_payload": len(writer_rows),
+        "rows_in_writer_payload": len(writer_rows),
+        "quarantine_count": len(quarantined_rows),
+        "rejected_rows_count": len(row_flow_filtered),
+        "filtered_rows": row_flow_filtered,
+    }
 
     write_json(run_dir / "daily_control_input_groups.json", input_groups_payload)
     write_json(run_dir / "daily_control_llm_requests.json", llm_diag.get("llm_requests", []))
     write_json(run_dir / "daily_control_llm_responses.json", llm_diag.get("llm_responses", []))
+    write_json(run_dir / "daily_control_llm_runtime_status.json", llm_runtime_status)
     write_json(run_dir / "daily_control_payload.json", payload)
+    write_json(run_dir / "daily_control_row_flow_debug.json", row_flow_debug)
+    write_json(run_dir / "daily_control_language_repair.json", language_repair)
+    write_markdown(
+        run_dir / "daily_control_language_repair.md",
+        title="Daily Control Language Repair",
+        lines=build_language_repair_markdown(language_repair),
+    )
+    write_json(
+        run_dir / "daily_control_quarantine.json",
+        {"rows_quarantined": len(quarantined_rows), "rows": quarantined_rows},
+    )
     write_json(run_dir / "daily_control_quality_review.json", quality_review)
     write_json(run_dir / "roks_oap_snapshot.json", roks_snapshot)
     write_json(run_dir / "daily_control_style_editor.json", style_debug)
+
+    llm_runtime_payload = llm_diag.get("llm_runtime", {}) if isinstance(llm_diag.get("llm_runtime"), dict) else {}
+    llm_preflight_payload = llm_runtime_payload.get("preflight", {}) if isinstance(llm_runtime_payload.get("preflight"), dict) else {}
+    preflight_main_status = llm_preflight_payload.get("main", {}) if isinstance(llm_preflight_payload.get("main"), dict) else {}
+    preflight_fallback_status = llm_preflight_payload.get("fallback", {}) if isinstance(llm_preflight_payload.get("fallback"), dict) else {}
+    preflight_fallback2_status = llm_preflight_payload.get("fallback2", {}) if isinstance(llm_preflight_payload.get("fallback2"), dict) else {}
 
     summary = {
         "run_id": run_dir.name,
@@ -449,21 +781,47 @@ def _run_build(args: argparse.Namespace) -> None:
         "source_sheet": source_sheet_name,
         "daily_sheet": str(args.daily_sheet or cfg.deal_analyzer_daily_sheet_name or "Дневной контроль"),
         "rows_prepared": len(styled_rows),
+        "groups_count": len(groups),
+        "groups_total_before_limit": groups_all_count,
+        "groups_total_after_limit": len(groups),
+        "rows_after_llm_analyzer": len(rows),
+        "rows_after_language_repair": len(rows_after_language_repair),
+        "rows_after_payload_validator": len(writer_rows),
+        "rows_in_writer_payload": len(writer_rows),
+        "rows_quarantined": len(quarantined_rows),
         "rows_to_insert": 0,
+        "rows_to_update": 0,
         "rows_skipped_existing": 0,
+        "rows_skipped_stale": 0,
         "conflicts_count": 0,
         "llm_main_model": (llm_diag.get("llm_runtime", {}).get("main", {}) if isinstance(llm_diag.get("llm_runtime", {}).get("main", {}), dict) else {}).get("model", ""),
         "llm_fallback_model": (llm_diag.get("llm_runtime", {}).get("fallback", {}) if isinstance(llm_diag.get("llm_runtime", {}).get("fallback", {}), dict) else {}).get("model", ""),
+        "llm_fallback2_model": (llm_diag.get("llm_runtime", {}).get("fallback2", {}) if isinstance(llm_diag.get("llm_runtime", {}).get("fallback2", {}), dict) else {}).get("model", ""),
+        "llm_attempts_total": llm_diag.get("llm_attempts_total", 0),
         "llm_success_main": llm_diag.get("llm_success_main", 0),
+        "llm_success_main_repair": llm_diag.get("llm_success_main_repair", 0),
+        "llm_success_main_compact_retry": llm_diag.get("llm_success_main_compact_retry", 0),
         "llm_success_fallback": llm_diag.get("llm_success_fallback", 0),
+        "llm_success_fallback_repair": llm_diag.get("llm_success_fallback_repair", 0),
+        "llm_success_fallback_compact_retry": llm_diag.get("llm_success_fallback_compact_retry", 0),
+        "llm_success_fallback2": llm_diag.get("llm_success_fallback2", 0),
+        "llm_success_fallback2_repair": llm_diag.get("llm_success_fallback2_repair", 0),
+        "llm_success_fallback2_compact_retry": llm_diag.get("llm_success_fallback2_compact_retry", 0),
         "llm_json_repair_count": llm_diag.get("llm_json_repair_count", 0),
         "llm_failed_count": llm_diag.get("llm_failed_count", 0),
+        "fallback_used_count": llm_diag.get("fallback_used_count", 0),
+        "rows_recovered_by_local_fallback": llm_diag.get("rows_recovered_by_local_fallback", 0),
+        "max_prompt_size_chars_seen": llm_diag.get("max_prompt_size_chars_seen", 0),
+        "preflight_main_status": preflight_main_status,
+        "preflight_fallback_status": preflight_fallback_status,
+        "preflight_fallback2_status": preflight_fallback2_status,
         "roks_oap_snapshot_status": roks_snapshot.get("status", ""),
         "selected_current_month_sheet": roks_snapshot.get("selected_current_month_sheet", ""),
         "selected_previous_month_sheet": roks_snapshot.get("selected_previous_month_sheet", ""),
         "writer_mode": "dry_run",
         "write_allowed": False,
         "block_reason": "dry_run_build_only",
+        "retry_source_run_id": grouping_diag.get("retry_source_run_id", ""),
         "top_data_limitations": llm_diag.get("top_data_limitations", []),
         "style_editor": style_debug.get("metrics", {}),
         "quality_review": {
@@ -492,6 +850,8 @@ def _run_write(args: argparse.Namespace) -> None:
         daily_sheet_name=str(args.daily_sheet or cfg.deal_analyzer_daily_sheet_name or "Дневной контроль"),
         dry_run=dry_run,
         strict_preflight=bool(args.strict_preflight),
+        allow_partial_write=bool(args.allow_partial_write),
+        quarantine_unrepaired=bool(args.quarantine_unrepaired),
         logger=logger,
     )
 
@@ -510,9 +870,14 @@ def _run_write(args: argparse.Namespace) -> None:
     summary.update(
         {
             "writer_mode": status.get("mode", "dry_run"),
+            "write_strategy": status.get("write_strategy", "values_only"),
             "rows_to_insert": status.get("rows_to_insert", 0),
+            "rows_to_update": status.get("rows_to_update", 0),
             "rows_skipped_existing": status.get("rows_skipped_existing", 0),
+            "rows_skipped_stale": status.get("rows_skipped_stale", 0),
+            "rows_quarantined": status.get("rows_quarantined", 0),
             "conflicts_count": status.get("conflicts_count", 0),
+            "structural_changes_required": status.get("structural_changes_required", False),
             "write_allowed": status.get("write_allowed", False),
             "block_reason": status.get("block_reason", ""),
         }

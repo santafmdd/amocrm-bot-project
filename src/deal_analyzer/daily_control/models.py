@@ -6,8 +6,8 @@ from typing import Any
 
 @dataclass(frozen=True)
 class IdempotencyKey:
-    period_start: str
-    period_end: str
+    week_start: str
+    week_end: str
     control_day_date: str
     manager_name: str
     source_deals_count: int
@@ -16,8 +16,8 @@ class IdempotencyKey:
     def as_string(self) -> str:
         return "|".join(
             [
-                str(self.period_start or "").strip(),
-                str(self.period_end or "").strip(),
+                str(self.week_start or "").strip(),
+                str(self.week_end or "").strip(),
                 str(self.control_day_date or "").strip(),
                 str(self.manager_name or "").strip(),
                 str(int(self.source_deals_count or 0)),
@@ -30,6 +30,8 @@ class IdempotencyKey:
 class DailyControlInputGroup:
     period_start: str
     period_end: str
+    week_start: str
+    week_end: str
     control_day_date: str
     day_label: str
     manager_name: str

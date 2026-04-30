@@ -94,6 +94,10 @@ class AmoCollectorClient:
         payload = self._get(f"/api/v4/leads/{int(lead_id)}/links")
         return _embedded_list(payload, "links")
 
+    def get_contact_links(self, contact_id: int) -> list[dict[str, Any]]:
+        payload = self._get(f"/api/v4/contacts/{int(contact_id)}/links")
+        return _embedded_list(payload, "links")
+
     def get_notes_by_lead(self, lead_id: int, limit: int = 250) -> list[dict[str, Any]]:
         path = f"/api/v4/leads/{int(lead_id)}/notes"
         return self._collect_embedded_items_with_retries(
@@ -110,6 +114,15 @@ class AmoCollectorClient:
         params: dict[str, Any] | None = None,
     ) -> tuple[list[dict[str, Any]], ApiResponseMeta, str]:
         path = "/api/v4/leads/notes"
+        payload, meta = self._get_with_meta(path, params=params)
+        return _embedded_list(payload, "notes"), meta, self._build_request_path(path, params=params)
+
+    def get_contacts_notes_page(
+        self,
+        *,
+        params: dict[str, Any] | None = None,
+    ) -> tuple[list[dict[str, Any]], ApiResponseMeta, str]:
+        path = "/api/v4/contacts/notes"
         payload, meta = self._get_with_meta(path, params=params)
         return _embedded_list(payload, "notes"), meta, self._build_request_path(path, params=params)
 

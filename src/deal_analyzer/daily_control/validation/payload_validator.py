@@ -7,6 +7,8 @@ from ..idempotency import build_idempotency_key
 
 
 REQUIRED_FIELDS: tuple[str, ...] = (
+    "week_start",
+    "week_end",
     "period_start",
     "period_end",
     "control_day_date",
@@ -24,7 +26,17 @@ REQUIRED_FIELDS: tuple[str, ...] = (
     "criticality",
 )
 
-ALLOWED_CRITICALITY = {"low", "medium", "high"}
+ALLOWED_CRITICALITY = {
+    "low",
+    "medium",
+    "high",
+    "critical",
+    "низкая",
+    "средняя",
+    "высокая",
+    "критичная",
+    "критическая",
+}
 
 
 def _parse_iso(value: Any) -> date | None:
@@ -71,7 +83,13 @@ def validate_daily_payload_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
             if len(missing_required_examples) < 10:
                 missing_required_examples.append({"row_index": idx, "missing": missing})
 
-        if _parse_iso(row.get("period_start")) is None or _parse_iso(row.get("period_end")) is None or _parse_iso(row.get("control_day_date")) is None:
+        if (
+            _parse_iso(row.get("period_start")) is None
+            or _parse_iso(row.get("period_end")) is None
+            or _parse_iso(row.get("week_start")) is None
+            or _parse_iso(row.get("week_end")) is None
+            or _parse_iso(row.get("control_day_date")) is None
+        ):
             invalid_date_count += 1
 
         score = row.get("score_0_100")

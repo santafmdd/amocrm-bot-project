@@ -8,7 +8,10 @@ from pathlib import Path
 from typing import Any
 
 from .base_mix import resolve_base_mix
+from .call_downloader import CallDownloader
+from .call_evidence import CallEvidence
 from .call_review_v3_row_schema import CALL_REVIEW_V3_COLUMNS
+from .transcription import transcribe_call_evidence
 
 MSK_TZ = timezone(timedelta(hours=3))
 
@@ -22,6 +25,7 @@ CASE_MODE_DISPLAY_MAP = {
     "test_analysis": "работа с тестом",
     "dozhim_analysis": "дожим",
     "redial_discipline_analysis": "недозвоны / дисциплина дозвонов",
+    "unknown_call_case": "неопределенный кейс по звонку",
 }
 
 ROLE_DISPLAY_MAP = {
@@ -403,16 +407,110 @@ FINAL_PAYLOAD_TRUNCATED_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r":\s*$"),
     re.compile(r"\bЛучше\s*$", re.IGNORECASE),
     re.compile(r"Лучше\s+Лучше\s+сказать", re.IGNORECASE),
+    re.compile(r"\bИспользуй:\s*$", re.IGNORECASE),
+    re.compile(r"\bЧто исправить:\s*$", re.IGNORECASE),
     re.compile(r"\bнеч\s*тко\b", re.IGNORECASE),
     re.compile(r"\bч\s*тко\b", re.IGNORECASE),
     re.compile(r'Лучше сказать:\s*"?[^"]*$', re.IGNORECASE),
+    re.compile(r'Используй:\s*"?[^"]*$', re.IGNORECASE),
     re.compile(r"нужно\s+ч\s*тко", re.IGNORECASE),
     re.compile(r"\bсразу\s+спраши(?![а-я])", re.IGNORECASE),
 )
 
 GENERIC_BETTER_PHRASE = "давайте сразу зафиксируем конкретный следующий шаг и время"
-BETTER_PHRASE_RE = re.compile(r'Лучше сказать:\s*"([^"]+)"', re.IGNORECASE)
-BETTER_PHRASE_MARKER_RE = re.compile(r"Лучше\s+сказать\s*:", re.IGNORECASE)
+BETTER_PHRASE_RE = re.compile(r'(?:Лучше сказать|Используй):\s*"([^"]+)"', re.IGNORECASE)
+BETTER_PHRASE_MARKER_RE = re.compile(r"(?:Лучше\s+сказать|Используй)\s*:", re.IGNORECASE)
+
+CRM_STAGE_MISMATCH_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?:в\s*(?:црм|crm)\s*(?:стадия|этап|сделка)[^.!\n]*по\s+факту[^.!\n]*)", re.IGNORECASE),
+    re.compile(r"(?:в\s*(?:црм|crm)[^.!\n]*по\s+факту[^.!\n]*)", re.IGNORECASE),
+    re.compile(r"(?:по\s*(?:црм|crm)[^.!\n]*по\s+факту[^.!\n]*)", re.IGNORECASE),
+    re.compile(r"(?:стади[яи]\s*(?:в\s*)?(?:црм|crm)[^.!\n]*не\s*соответ[^.!\n]*)", re.IGNORECASE),
+    re.compile(r"(?:стади[яи]\s*(?:в\s*)?(?:црм|crm)[^.!\n]*расход[^.!\n]*)", re.IGNORECASE),
+    re.compile(r"(?:по\s+этапу\s*(?:црм|crm)[^.!\n]*)", re.IGNORECASE),
+    re.compile(r"(?:(?:црм|crm)\s*не\s*отража[е-я]*\s*реальност[ьи][^.!\n]*)", re.IGNORECASE),
+)
+
+BAD_PHRASE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bкак\s+действовать\s+(?:копания|управления|выявления)\b", re.IGNORECASE),
+    re.compile(
+        r"\bкак\s+действовать\s+(?:квалификаци[а-я]*|выявлени[а-я]*|фиксаци[а-я]*|работ[а-я]*|презентаци[а-я]*|отработк[а-я]*)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\b(?:пройти|разобрать|отработать)\s+как\s+действовать\s+[а-яё][а-яё\s-]{2,}\b", re.IGNORECASE),
+    re.compile(r"\bкак\s+действовать\s+[а-яё-]+(?:ии|ения|ания|ости|ции|ки|ства|ого|его)\b", re.IGNORECASE),
+    re.compile(r"\bтренировать\s+четк(?:ая|ую)\s+фраз(?:а|у)\b", re.IGNORECASE),
+    re.compile(r"\bотработать\s+быстрого\b", re.IGNORECASE),
+    re.compile(r"\bотработать\s+глубиннн?ого\b", re.IGNORECASE),
+    re.compile(r"\bкак\s+действовать\b", re.IGNORECASE),
+    re.compile(r"\bлучше\s+лучше\s+сказать\b", re.IGNORECASE),
+    re.compile(r"\bнеч\s*тко\b", re.IGNORECASE),
+    re.compile(r"(?<!не)\bч\s*тко\b", re.IGNORECASE),
+    re.compile(r"Лучше\s*:\s*-\s*", re.IGNORECASE),
+    re.compile(r"Вместо\s+нужно\s*:\s*-\s*", re.IGNORECASE),
+    re.compile(r"\b1\)\s*1\.", re.IGNORECASE),
+)
+
+EMPTY_SPEECH_MODULE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r'(?:Используй|Лучше сказать)\s*:\s*(?:""|«»)\s*', re.IGNORECASE),
+    re.compile(r'(?:Используй|Лучше сказать)\s*:\s*(?=$|[.,;:!?])', re.IGNORECASE),
+)
+
+AUTOANSWER_SKIP_REASONS: set[str] = {
+    "autoanswer_no_meaningful_conversation",
+    "short_no_meaningful_conversation",
+    "no_human_dialogue",
+}
+
+AUTOANSWER_TRANSCRIPT_MARKERS: tuple[str, ...] = (
+    "абонент недоступен",
+    "абонент не может ответить",
+    "оставьте сообщение",
+    "после сигнала",
+    "голосовая почта",
+    "автоответчик",
+    "автоответ",
+    "voicemail",
+    "соединение установлено",
+)
+
+DIALOGUE_TRANSCRIPT_MARKERS: tuple[str, ...] = (
+    "лпр",
+    "директор",
+    "закуп",
+    "встреч",
+    "демо",
+    "тест",
+    "кп",
+    "договор",
+    "счет",
+    "следующий шаг",
+    "договорились",
+)
+
+IVR_TRANSCRIPT_MARKERS: tuple[str, ...] = (
+    "вас приветствует",
+    "нажмите",
+    "тональном режиме",
+    "добавочный номер",
+    "введите добавочный",
+    "для связи с",
+    "если вы знаете внутренний номер",
+)
+
+HUMAN_DIALOGUE_AFTER_NOISE_MARKERS: tuple[str, ...] = (
+    "это рустам",
+    "компания айсток",
+    "не отвлек",
+    "по какому вопросу звоню",
+    "по какому вопросу",
+    "хотел предложить",
+    "могу предложить",
+    "показать",
+    "потестировать",
+    "отправьте на почту",
+    "давайте после",
+)
 
 BETTER_PHRASE_VARIANTS: dict[str, tuple[str, ...]] = {
     "test": (
@@ -526,6 +624,292 @@ CASE_MODE_CROSS_STAGE_ALLOWED: dict[str, set[str]] = {
 }
 
 
+class _NoopLogger:
+    def info(self, *args, **kwargs) -> None:
+        _ = args, kwargs
+
+    def warning(self, *args, **kwargs) -> None:
+        _ = args, kwargs
+
+
+def _contact_only_transcript_failure_reason(*, recording_url: str, status: str, error: str, audio_path: str) -> str:
+    if not recording_url:
+        return "missing_recording_url"
+    if not audio_path and status in {"missing_audio_file", "download_failed", "missing_audio"}:
+        return "download_failed"
+    if status in {"backend_unavailable", "backend_error", "not_configured", "disabled"}:
+        return "stt_backend_error"
+    if status in {"empty_transcript_after_stt", "empty_transcript"}:
+        return "empty_transcript_after_stt"
+    if error:
+        return _sanitize_user_text(error)[:180]
+    return "stt_backend_error"
+
+
+def _run_contact_only_stt(
+    *,
+    cfg: Any | None,
+    logger: Any | None,
+    deal_id: str,
+    call_item: dict[str, Any],
+) -> dict[str, Any]:
+    recording_url = str(call_item.get("recording_url") or "").strip()
+    call_id = str(call_item.get("call_id") or "").strip()
+    duration_seconds = int(call_item.get("call_duration_seconds", 0) or 0)
+    manager_name = _sanitize_person_name(str(call_item.get("manager_name_from_call_author") or ""))
+
+    if not recording_url:
+        return {
+            "transcript_text": "",
+            "transcript_chars": 0,
+            "transcript_status": "missing_recording_url",
+            "transcript_error": "missing_recording_url",
+            "transcript_source": "",
+            "audio_path": "",
+            "audio_download_status": "missing_url",
+        }
+    if cfg is None:
+        return {
+            "transcript_text": "",
+            "transcript_chars": 0,
+            "transcript_status": "stt_backend_error",
+            "transcript_error": "stt_config_unavailable_for_contact_only",
+            "transcript_source": "",
+            "audio_path": "",
+            "audio_download_status": "not_attempted",
+        }
+
+    run_logger = logger if logger is not None else _NoopLogger()
+    downloader = CallDownloader(config=cfg, logger=run_logger)
+    call_evidence = CallEvidence(
+        call_id=call_id or f"contact_call_{deal_id}",
+        deal_id=deal_id,
+        manager_id=str(call_item.get("manager_id_from_call_author") or ""),
+        manager_name=manager_name,
+        timestamp=str(call_item.get("call_datetime_utc") or ""),
+        duration_seconds=max(0, int(duration_seconds)),
+        direction=str(call_item.get("direction") or ""),
+        source_location=str(call_item.get("source_location") or "contact_only_fallback"),
+        recording_url=recording_url,
+        recording_ref=call_id or "",
+        quality_flags=[],
+        missing_recording=False,
+        audio_path=str(call_item.get("audio_path") or ""),
+        entity_type=str(call_item.get("entity_type") or "contact_only"),
+        contact_id=str(call_item.get("contact_id") or ""),
+        contact_url=str(call_item.get("contact_url") or ""),
+        phone=str(call_item.get("phone_raw") or ""),
+        resolution_reason=str(call_item.get("resolution_reason") or ""),
+    )
+    resolved_call = downloader._resolve_call_audio(call_evidence, audio_call_ids={call_evidence.call_id})
+    call_payload = {
+        "call_id": resolved_call.call_id,
+        "deal_id": resolved_call.deal_id,
+        "recording_url": resolved_call.recording_url,
+        "audio_path": resolved_call.audio_path,
+        "duration_seconds": resolved_call.duration_seconds,
+    }
+    transcript_items = transcribe_call_evidence(calls=[call_payload], config=cfg, logger=run_logger)
+    transcript_item = transcript_items[0] if transcript_items else {}
+    transcript_text = _sanitize_user_text(str(transcript_item.get("transcript_text") or ""))
+    transcript_chars = int(transcript_item.get("transcript_chars", 0) or len(transcript_text))
+    transcript_status = str(transcript_item.get("transcript_status") or "").strip()
+    transcript_error = str(transcript_item.get("transcript_error") or "").strip()
+    transcript_source = str(transcript_item.get("transcript_source") or "").strip()
+    return {
+        "transcript_text": transcript_text,
+        "transcript_chars": transcript_chars,
+        "transcript_status": transcript_status,
+        "transcript_error": transcript_error,
+        "transcript_source": transcript_source,
+        "audio_path": str(resolved_call.audio_path or ""),
+        "audio_download_status": str(resolved_call.audio_download_status or ""),
+    }
+
+
+def _build_contact_only_stub_llm_fields(*, manager_name: str) -> dict[str, str]:
+    manager = _sanitize_person_name(manager_name) or "менеджер"
+    return {
+        "primary_case_type": "разговор с лпр",
+        "relevant_stage_groups": "[\"lpr\",\"need\",\"presentation_meeting\",\"closing\",\"objections\",\"speech\",\"crm\"]",
+        "key_takeaway": "В разбор попал звонок из карточки контакта без привязанной сделки. Нужна фиксация следующего шага и перенос в управляемую воронку.",
+        "strong_sides": f"{manager} удержал разговор и довел диалог до содержательного контакта.",
+        "growth_zones": "Не хватает прозрачной привязки к сделке и формальной фиксации следующего шага в рабочем контуре.",
+        "why_important": "Без привязки к сделке и конкретного next step разговор не превращается в управляемый результат.",
+        "reinforce": "Закрепить короткий заход, уточнение роли собеседника и явную фиксацию даты следующего шага.",
+        "fix_action": "Сразу после звонка привязать контакт к сделке и зафиксировать следующий шаг с датой и ответственным.",
+        "coaching_list": "1) Звонок найден в карточке контакта.\n2) Добавляем дисциплину привязки к сделке.\n3) Контролируем следующий шаг в карточке.",
+        "expected_quantity": "Рост доли звонков, которые доводятся до управляемого следующего шага.",
+        "expected_quality": "Снижение потерь на контактах без привязки и лучшее качество фиксации в црм.",
+        "stage_lpr_comment": "Разговор был с содержательным контактом, но нужно жестче фиксировать роль собеседника и переход к следующему шагу.",
+        "stage_need_comment": "Нужно глубже проверять контекст задачи клиента и переводить диалог в конкретный шаг по сроку.",
+        "stage_presentation_comment": "Ценность лучше связывать с задачей клиента и завершать разговор конкретной договоренностью.",
+        "stage_closing_comment": "Фиксация следующего шага должна быть с датой и временем, без размытых формулировок.",
+        "stage_objections_comment": "При возражениях держать структуру: присоединение, уточнение, конкретный следующий шаг.",
+        "stage_speech_comment": "Речь держать короткой и управляемой, без длинных вводных.",
+        "stage_crm_comment": "После звонка фиксировать итог и привязку контакта к сделке, чтобы не терять управление.",
+    }
+
+
+def _build_contact_only_case_from_ledger_fallback(
+    *,
+    candidate: dict[str, Any],
+    deal_id: str,
+    call_ledger_all: list[dict[str, Any]],
+    base_domain: str,
+    allowlist: list[str],
+    manager_role_registry: dict[str, str],
+    cfg: Any | None,
+    logger: Any | None,
+) -> dict[str, Any] | None:
+    if not str(deal_id or "").startswith("contact_"):
+        return None
+
+    selected_call_ids = _selected_call_ids(candidate=candidate, record={})
+    selected_call_id = _selected_call_id_for_readiness(candidate=candidate, record={})
+    contact_call_items = []
+    for raw in call_ledger_all:
+        if not isinstance(raw, dict):
+            continue
+        if str(raw.get("deal_id") or "").strip() != str(deal_id):
+            continue
+        contact_call_items.append(raw)
+    if not contact_call_items:
+        return None
+
+    anchor_call: dict[str, Any] | None = None
+    if selected_call_id:
+        for item in contact_call_items:
+            if str(item.get("call_id") or "").strip() == selected_call_id:
+                anchor_call = item
+                break
+    if anchor_call is None and selected_call_ids:
+        for item in contact_call_items:
+            if str(item.get("call_id") or "").strip() in selected_call_ids:
+                anchor_call = item
+                break
+    if anchor_call is None:
+        anchor_call = sorted(
+            contact_call_items,
+            key=lambda x: (
+                -int(x.get("call_duration_seconds", 0) or 0),
+                str(x.get("call_datetime_utc") or ""),
+                str(x.get("call_id") or ""),
+            ),
+        )[0]
+
+    anchor_duration = int(anchor_call.get("call_duration_seconds", 0) or 0)
+    if anchor_duration < 25:
+        return None
+    recording_url = str(anchor_call.get("recording_url") or "").strip()
+    if not recording_url:
+        return None
+
+    manager_name = _sanitize_person_name(
+        str(anchor_call.get("manager_name_from_call_author") or candidate.get("anchor_manager_name") or "")
+    )
+    if allowlist and not _is_manager_allowed(manager_name=manager_name, allowlist=allowlist):
+        return None
+    manager_role_internal = _resolve_manager_role(manager_name=manager_name, registry=manager_role_registry)
+    manager_role_display = ROLE_DISPLAY_MAP.get(manager_role_internal, "менеджер по продажам")
+
+    anchor_ts = _parse_ts(anchor_call.get("call_datetime_utc") or candidate.get("anchor_call_timestamp"))
+    analysis_date = _choose_analysis_date(candidate=candidate, anchor_ts=anchor_ts)
+    case_date = _choose_case_date(anchor_ts=anchor_ts)
+    contact_id = str(anchor_call.get("contact_id") or "").strip() or str(deal_id).replace("contact_", "", 1)
+    deal_url = str(anchor_call.get("contact_url") or "").strip()
+    if not deal_url and contact_id and base_domain:
+        deal_url = f"{base_domain.rstrip('/')}/contacts/detail/{contact_id}"
+    deal_name = _sanitize_user_text(str(anchor_call.get("deal_name") or "").strip())
+    if not deal_name:
+        deal_name = f"Контакт #{contact_id}" if contact_id else "Контакт без привязанной сделки"
+
+    stt_payload = _run_contact_only_stt(
+        cfg=cfg,
+        logger=logger,
+        deal_id=str(deal_id),
+        call_item=anchor_call,
+    )
+    transcript_text = _sanitize_user_text(str(stt_payload.get("transcript_text") or ""))
+    transcript_chars = int(stt_payload.get("transcript_chars", 0) or len(transcript_text))
+    transcript_status = str(stt_payload.get("transcript_status") or "").strip().lower()
+    transcript_error = str(stt_payload.get("transcript_error") or "").strip()
+    transcript_source = str(stt_payload.get("transcript_source") or "").strip()
+    anchor_audio_path = str(stt_payload.get("audio_path") or "").strip()
+    audio_download_status = str(stt_payload.get("audio_download_status") or "").strip()
+    noise_profile = _noise_dialogue_profile(
+        transcript_text=transcript_text,
+        transcript_chars=int(transcript_chars or 0),
+        call_duration_seconds=anchor_duration,
+    )
+    llm_fields = _build_contact_only_stub_llm_fields(manager_name=manager_name)
+    usability_reason = ""
+    if transcript_chars < 20:
+        usability_reason = _contact_only_transcript_failure_reason(
+            recording_url=recording_url,
+            status=transcript_status,
+            error=transcript_error,
+            audio_path=anchor_audio_path,
+        )
+
+    return {
+        "deal_id": str(deal_id),
+        "deal_url": deal_url,
+        "deal_name": deal_name,
+        "company_name": "",
+        "manager_name": manager_name,
+        "manager_role_internal": manager_role_internal,
+        "manager_role_display": manager_role_display,
+        "analysis_date": analysis_date,
+        "case_date": case_date,
+        "case_mode": "negotiation_lpr_analysis",
+        "case_type_display": "звонок на контакте без привязанной сделки",
+        "product_focus": _sanitize_user_text(str(anchor_call.get("product_focus") or "контакт без привязки к сделке")),
+        "base_mix": _sanitize_user_text(str(anchor_call.get("base_tag") or "контакт")),
+        "listened_calls": "1",
+        "llm_fields": llm_fields,
+        "quote_text": "",
+        "score": 60,
+        "score_source": "contact_only_fallback",
+        "score_reason": "contact_call_without_linked_deal",
+        "score_components": {"base": 60},
+        "criticality": _criticality_from_score(60),
+        "anchor_call_id": str(anchor_call.get("call_id") or ""),
+        "anchor_call_timestamp": str(anchor_call.get("call_datetime_utc") or candidate.get("anchor_call_timestamp") or ""),
+        "anchor_call_duration_seconds": anchor_duration,
+        "selected_call_count": 1,
+        "selected_call_ids": [str(anchor_call.get("call_id") or "")],
+        "llm_source": "contact_only_fallback",
+        "transcript_length_chars": transcript_chars,
+        "transcript_segments_count": 0,
+        "transcript_longest_segment_sec": 0.0,
+        "transcript_usability_label": "usable" if transcript_chars >= 20 else "unknown",
+        "transcript_usability_reason": usability_reason,
+        "initial_noise_detected": bool(noise_profile.get("initial_noise_detected")),
+        "human_dialogue_after_noise_detected": bool(noise_profile.get("human_dialogue_after_noise_detected")),
+        "noise_classification": str(noise_profile.get("noise_classification") or "contact_only_fallback"),
+        "final_noise_decision": str(
+            noise_profile.get("final_noise_decision")
+            or ("sent_to_llm_contact_only" if transcript_chars >= 20 else "skip_noise_only")
+        ),
+        "llm_allowed": True,
+        "case_type_source": "contact_only_fallback",
+        "case_type_reason": "contact_notes_call_without_period_deal_record",
+        "case_type_evidence_used": ["contacts_notes_fallback", "contact_only_case"],
+        "call_review_llm_provenance": {
+            "source": "contact_only_fallback",
+            "source_of_truth": "contact_ledger",
+            "runtime_metrics": {},
+        },
+        "anchor_audio_path": anchor_audio_path,
+        "anchor_recording_url": recording_url,
+        "transcript_source": transcript_source or "contact_only_stt",
+        "transcript_status": transcript_status,
+        "transcript_error": transcript_error,
+        "audio_download_status": audio_download_status,
+    }
+
+
 def build_call_review_v3_payload(
     *,
     summary: dict[str, Any],
@@ -542,6 +926,8 @@ def build_call_review_v3_payload(
     abort_stage: str = "",
     abort_error: str = "",
     artifacts_written: list[str] | None = None,
+    cfg: Any | None = None,
+    logger: Any | None = None,
 ) -> dict[str, Any]:
     records_by_deal = {
         str(item.get("deal_id") or "").strip(): item
@@ -557,6 +943,7 @@ def build_call_review_v3_payload(
 
     ledger: list[dict[str, Any]] = []
     cases_debug: list[dict[str, Any]] = []
+    transcript_readiness_entries: list[dict[str, Any]] = []
     rows: list[dict[str, Any]] = []
     row_entries: list[dict[str, Any]] = []
     skipped_reasons: dict[str, int] = {}
@@ -570,8 +957,125 @@ def build_call_review_v3_payload(
             continue
         record = records_by_deal.get(deal_id)
         if not isinstance(record, dict):
+            contact_case = _build_contact_only_case_from_ledger_fallback(
+                candidate=candidate,
+                deal_id=deal_id,
+                call_ledger_all=call_ledger_all or [],
+                base_domain=base_domain,
+                allowlist=allowlist,
+                manager_role_registry=manager_role_registry or {},
+                cfg=cfg,
+                logger=logger,
+            )
+            if isinstance(contact_case, dict):
+                row, row_semantic_debug = _build_row_from_case(case=contact_case)
+                row["Тип кейса"] = "звонок на контакте без привязанной сделки"
+                row["Ссылка на сделку"] = str(contact_case.get("deal_url") or row.get("Ссылка на сделку") or "")
+                row["Сделка"] = str(contact_case.get("deal_name") or row.get("Сделка") or "")
+                row["Ключевой вывод"] = (
+                    "Звонок найден в карточке контакта, сделка не привязана. "
+                    + str(row.get("Ключевой вывод") or "")
+                ).strip()
+                row["Что донести сотруднику"] = (
+                    "Звонок найден в карточке контакта, сделка не привязана. "
+                    + str(row.get("Что донести сотруднику") or "")
+                ).strip()
+                row_entries.append(
+                    {
+                        "row": row,
+                        "semantic_debug": row_semantic_debug,
+                    }
+                )
+                cases_debug.append(
+                    {
+                        "order": order,
+                        "deal_id": deal_id,
+                        "pool_type": str(candidate.get("pool_type") or ""),
+                        "call_case_type": str(candidate.get("call_case_type") or ""),
+                        "shortlist_reason": str(candidate.get("shortlist_reason") or ""),
+                        "selected_for_transcription": bool(candidate.get("selected_for_transcription")),
+                        "selected_call_count": int(candidate.get("selected_call_count", 0) or 0),
+                        "analysis_shortlist_rank_group": int(candidate.get("rank_group", 0) or 0),
+                        "anchor_manager_name": str(candidate.get("anchor_manager_name") or candidate.get("manager_name_from_call_author") or ""),
+                        "skipped": False,
+                        "manager_name": str(contact_case.get("manager_name") or ""),
+                        "role": str(contact_case.get("manager_role_display") or ""),
+                        "case_mode": str(contact_case.get("case_mode") or ""),
+                        "case_type_display": "звонок на контакте без привязанной сделки",
+                        "anchor_call_id": str(contact_case.get("anchor_call_id") or ""),
+                        "anchor_call_timestamp": str(contact_case.get("anchor_call_timestamp") or ""),
+                        "anchor_call_duration_seconds": int(contact_case.get("anchor_call_duration_seconds", 0) or 0),
+                        "llm_source": str(contact_case.get("llm_source") or "contact_only_fallback"),
+                        "llm_ready": True,
+                        "score": int(contact_case.get("score", 0) or 0),
+                        "score_source": str(contact_case.get("score_source") or ""),
+                        "score_reason": str(contact_case.get("score_reason") or ""),
+                        "score_components": contact_case.get("score_components", {}) if isinstance(contact_case.get("score_components"), dict) else {},
+                        "transcript_length_chars": int(contact_case.get("transcript_length_chars", 0) or 0),
+                        "transcript_segments_count": int(contact_case.get("transcript_segments_count", 0) or 0),
+                        "transcript_longest_segment_sec": float(contact_case.get("transcript_longest_segment_sec", 0.0) or 0.0),
+                        "transcript_usability_label": str(contact_case.get("transcript_usability_label") or ""),
+                        "transcript_usability_reason": str(contact_case.get("transcript_usability_reason") or ""),
+                        "initial_noise_detected": bool(contact_case.get("initial_noise_detected")),
+                        "human_dialogue_after_noise_detected": bool(contact_case.get("human_dialogue_after_noise_detected")),
+                        "noise_classification": str(contact_case.get("noise_classification") or "contact_only_fallback"),
+                        "final_noise_decision": str(contact_case.get("final_noise_decision") or ""),
+                        "llm_allowed": True,
+                        "case_type_source": "contact_only_fallback",
+                        "case_type_reason": "deal_not_found_in_period_records_but_contact_call_present",
+                        "evidence_used": ["contacts_notes_fallback", "contact_without_linked_deal"],
+                        "semantic_debug": row_semantic_debug,
+                        "contact_only": True,
+                        "contact_url": str(contact_case.get("deal_url") or ""),
+                    }
+                )
+                transcript_readiness_entries.append(
+                    {
+                        "deal_id": deal_id,
+                        "selected_call_id": str(contact_case.get("anchor_call_id") or _selected_call_id_for_readiness(candidate=candidate, record={})),
+                        "audio_path_exists": bool(str(contact_case.get("anchor_audio_path") or "").strip()),
+                        "audio_source": str(contact_case.get("audio_download_status") or "contact_only_recording_url"),
+                        "transcript_source": str(contact_case.get("transcript_source") or "contact_only_fallback"),
+                        "transcript_chars": int(contact_case.get("transcript_length_chars", 0) or 0),
+                        "transcript_excerpt_chars": int(contact_case.get("transcript_length_chars", 0) or 0),
+                        "transcript_usable": bool(int(contact_case.get("transcript_length_chars", 0) or 0) >= 20),
+                        "stt_status": str(contact_case.get("transcript_status") or ""),
+                        "stt_error": ""
+                        if int(contact_case.get("transcript_length_chars", 0) or 0) >= 20
+                        else str(
+                            contact_case.get("transcript_error")
+                            or contact_case.get("transcript_usability_reason")
+                            or "stt_backend_error"
+                        ),
+                        "skip_reason_before_llm": "",
+                        "final_decision": "sent_to_llm_contact_only",
+                        "initial_noise_detected": bool(contact_case.get("initial_noise_detected")),
+                        "human_dialogue_after_noise_detected": bool(contact_case.get("human_dialogue_after_noise_detected")),
+                        "noise_classification": str(contact_case.get("noise_classification") or "contact_only_fallback"),
+                        "final_noise_decision": str(contact_case.get("final_noise_decision") or "sent_to_llm_contact_only"),
+                    }
+                )
+                continue
+
             _bump(skipped_reasons, "deal_not_found_in_period_records")
+            transcript_readiness_entries.append(
+                {
+                    "deal_id": deal_id,
+                    "selected_call_id": _selected_call_id_for_readiness(candidate=candidate, record={}),
+                    "audio_path_exists": False,
+                    "audio_source": "",
+                    "transcript_source": "",
+                    "transcript_chars": 0,
+                    "transcript_excerpt_chars": 0,
+                    "transcript_usable": False,
+                    "stt_status": "",
+                    "stt_error": "",
+                    "skip_reason_before_llm": "deal_not_found_in_period_records",
+                    "final_decision": "skipped_deal_not_found_in_period_records",
+                }
+            )
             continue
+        readiness_entry = _build_transcript_readiness_entry(candidate=candidate, record=record)
         case = _build_case(
             candidate=candidate,
             record=record,
@@ -590,12 +1094,33 @@ def build_call_review_v3_payload(
             "selected_call_count": int(candidate.get("selected_call_count", 0) or 0),
             "analysis_shortlist_rank_group": int(candidate.get("rank_group", 0) or 0),
             "anchor_manager_name": str(candidate.get("anchor_manager_name") or candidate.get("manager_name_from_call_author") or ""),
+            "initial_noise_detected": bool(readiness_entry.get("initial_noise_detected")),
+            "human_dialogue_after_noise_detected": bool(readiness_entry.get("human_dialogue_after_noise_detected")),
+            "noise_classification": str(readiness_entry.get("noise_classification") or ""),
+            "final_noise_decision": str(readiness_entry.get("final_noise_decision") or ""),
         }
         if not isinstance(case, dict):
             reason = str(case) if isinstance(case, str) else "case_build_failed"
             _bump(skipped_reasons, reason)
             case_debug["skipped"] = True
             case_debug["skip_reason"] = reason
+            case_debug["final_noise_decision"] = (
+                reason
+                if reason in {
+                    "autoanswer_no_meaningful_conversation",
+                    "short_no_meaningful_conversation",
+                    "no_human_dialogue",
+                    "transcript_not_usable_for_battle_write",
+                    "telemarketer_case_out_of_scope",
+                }
+                else str(case_debug.get("final_noise_decision") or "")
+            )
+            readiness_entry["final_decision"] = _map_readiness_final_decision(skip_reason=reason)
+            if not str(readiness_entry.get("skip_reason_before_llm") or "").strip():
+                readiness_entry["skip_reason_before_llm"] = reason
+            if reason in {"autoanswer_no_meaningful_conversation", "short_no_meaningful_conversation", "no_human_dialogue"}:
+                readiness_entry["final_noise_decision"] = reason
+            transcript_readiness_entries.append(readiness_entry)
             if reason == "transcript_not_usable_for_battle_write":
                 case_debug["skip_reason_detail"] = _transcript_skip_reason_detail(
                     candidate=candidate,
@@ -648,6 +1173,10 @@ def build_call_review_v3_payload(
         case_debug["transcript_longest_segment_sec"] = float(case.get("transcript_longest_segment_sec", 0.0) or 0.0)
         case_debug["transcript_usability_label"] = str(case.get("transcript_usability_label") or "")
         case_debug["transcript_usability_reason"] = str(case.get("transcript_usability_reason") or "")
+        case_debug["initial_noise_detected"] = bool(case.get("initial_noise_detected"))
+        case_debug["human_dialogue_after_noise_detected"] = bool(case.get("human_dialogue_after_noise_detected"))
+        case_debug["noise_classification"] = str(case.get("noise_classification") or "")
+        case_debug["final_noise_decision"] = str(case.get("final_noise_decision") or "")
         case_debug["llm_allowed"] = bool(case.get("llm_allowed"))
         case_debug["case_type_source"] = str(case.get("case_type_source") or "")
         case_debug["case_type_reason"] = str(case.get("case_type_reason") or "")
@@ -663,6 +1192,9 @@ def build_call_review_v3_payload(
         )
         case_debug["semantic_debug"] = row_semantic_debug
         cases_debug.append(case_debug)
+        readiness_entry["final_decision"] = "sent_to_llm"
+        readiness_entry["final_noise_decision"] = "sent_to_llm"
+        transcript_readiness_entries.append(readiness_entry)
 
     row_entries.sort(
         key=lambda x: (
@@ -675,6 +1207,7 @@ def build_call_review_v3_payload(
     style_payload_normalization = _apply_payload_style_normalization(row_entries=row_entries)
     rows = [x.get("row", {}) for x in row_entries if isinstance(x.get("row"), dict)]
     final_payload_quote_repair = _repair_final_payload_broken_quotes(rows=rows)
+    autoanswer_stats = _collect_autoanswer_skip_stats(cases_debug=cases_debug)
     if isinstance(style_payload_normalization, dict):
         style_payload_normalization["final_payload_quote_repair"] = final_payload_quote_repair
     semantic_preflight = _run_semantic_preflight(
@@ -682,16 +1215,23 @@ def build_call_review_v3_payload(
         row_entries=row_entries,
         style_payload_normalization=style_payload_normalization,
         final_payload_quote_repair=final_payload_quote_repair,
+        autoanswer_stats=autoanswer_stats,
     )
 
     artifacts = _write_debug_artifacts(
         run_dir=run_dir,
+        summary=summary,
         ledger=ledger,
         call_ledger_all=call_ledger_all,
         call_ledger_audit=call_ledger_audit,
         anchor_shortlist=anchor_shortlist,
-        selected_anchor_cases=selected_anchor_cases,
+        selected_anchor_cases=(
+            [x for x in selected_anchor_cases if isinstance(x, dict)]
+            if isinstance(selected_anchor_cases, list)
+            else [x for x in shortlist_items if isinstance(x, dict)]
+        ),
         cases_debug=cases_debug,
+        transcript_readiness_debug=transcript_readiness_entries,
         rows=rows,
         skipped_reasons=skipped_reasons,
         abort_stage=abort_stage,
@@ -734,14 +1274,25 @@ def _build_case(
     if not bool(candidate.get("selected_for_transcription")):
         return "not_selected_for_transcription"
 
-    case_mode = _resolve_case_mode(candidate=candidate, record=record)
-    if case_mode in DISALLOWED_CASES_FOR_ACTIVE_WRITE:
-        return f"disallowed_case_mode:{case_mode}"
+    non_meaningful_reason = _resolve_non_meaningful_skip_reason(candidate=candidate, record=record)
+    if non_meaningful_reason:
+        return non_meaningful_reason
+
+    case_mode_hint = _resolve_case_mode(candidate=candidate, record=record)
+    if case_mode_hint in DISALLOWED_CASES_FOR_ACTIVE_WRITE:
+        return f"disallowed_case_mode:{case_mode_hint}"
 
     llm_ready = bool(record.get("call_review_llm_ready"))
     llm_fields = record.get("call_review_llm_fields") if isinstance(record.get("call_review_llm_fields"), dict) else {}
     if not llm_ready or not llm_fields:
-        return _resolve_llm_case_unready_reason(record=record)
+        return _resolve_llm_case_unready_reason(record=record, candidate=candidate)
+    case_mode, case_type_source, case_type_reason, case_type_evidence_used = _resolve_case_mode_for_output(
+        case_mode_hint=case_mode_hint,
+        llm_fields=llm_fields,
+        candidate=candidate,
+        record=record,
+    )
+
     llm_validation_error = _validate_llm_fields(case_mode=case_mode, llm_fields=llm_fields)
     if llm_validation_error:
         if "stage_" in llm_validation_error:
@@ -750,22 +1301,31 @@ def _build_case(
 
     snapshot = _load_snapshot(record=record)
     calls = _extract_calls(snapshot=snapshot)
+    transcript_text_by_call_id = _build_transcript_text_by_call_id(snapshot=snapshot)
     selected_ids = _selected_call_ids(candidate=candidate, record=record)
-    anchor_call = _select_anchor_call(calls=calls, selected_call_ids=selected_ids)
+    anchor_call = _select_anchor_call(
+        calls=calls,
+        selected_call_ids=selected_ids,
+        transcript_text_by_call_id=transcript_text_by_call_id,
+    )
     if anchor_call is None:
         return "missing_anchor_call"
 
-    if _call_is_noise(anchor_call):
-        return "anchor_call_noise"
+    if _call_is_noise(
+        anchor_call,
+        transcript_text=_transcript_text_for_call(anchor_call, transcript_text_by_call_id),
+    ):
+        return "autoanswer_no_meaningful_conversation"
 
     anchor_duration = int(anchor_call.get("duration_seconds", 0) or 0)
     if anchor_duration < 25:
-        return "anchor_call_too_short"
+        return "short_no_meaningful_conversation"
 
     related_calls = _select_related_calls(
         calls=calls,
         anchor_call=anchor_call,
         selected_call_ids=selected_ids,
+        transcript_text_by_call_id=transcript_text_by_call_id,
     )
     if not related_calls:
         related_calls = [anchor_call]
@@ -783,14 +1343,25 @@ def _build_case(
     manager_role_internal = _resolve_manager_role(manager_name=manager_name, registry=manager_role_registry)
     manager_role_display = ROLE_DISPLAY_MAP.get(manager_role_internal, "менеджер по продажам")
 
-    if manager_role_internal == "telemarketer" and case_mode in {"presentation_analysis", "test_analysis", "dozhim_analysis"}:
-        return "telemarketer_case_out_of_scope"
-
     transcript_gate = _evaluate_transcript_usability_for_case(
         candidate=candidate,
         record=record,
     )
+    noise_classification = str(transcript_gate.get("noise_classification") or "").strip().lower()
+    if (
+        manager_role_internal == "telemarketer"
+        and case_mode in {"presentation_analysis", "test_analysis", "dozhim_analysis"}
+        and noise_classification != "ivr_then_human_dialogue"
+    ):
+        return "telemarketer_case_out_of_scope"
     if not bool(transcript_gate.get("usable")):
+        detected_noise_reason = str(transcript_gate.get("detected_noise_reason") or "").strip().lower()
+        transcript_len = int(transcript_gate.get("transcript_length_chars", 0) or 0)
+        segments = int(transcript_gate.get("transcript_segments_count", 0) or 0)
+        if "autoanswer" in detected_noise_reason or "system_voice" in detected_noise_reason:
+            return "autoanswer_no_meaningful_conversation"
+        if transcript_len < 120 and segments <= 1:
+            return "short_no_meaningful_conversation"
         return "transcript_not_usable_for_battle_write"
 
     listened_calls = _format_listened_calls(related_calls)
@@ -897,14 +1468,14 @@ def _build_case(
         "transcript_longest_segment_sec": float(transcript_gate.get("longest_segment_sec", 0.0) or 0.0),
         "transcript_usability_label": str(transcript_gate.get("label") or ""),
         "transcript_usability_reason": str(transcript_gate.get("why_not_usable") or "usable"),
+        "initial_noise_detected": bool(transcript_gate.get("initial_noise_detected")),
+        "human_dialogue_after_noise_detected": bool(transcript_gate.get("human_dialogue_after_noise_detected")),
+        "noise_classification": str(transcript_gate.get("noise_classification") or ""),
+        "final_noise_decision": str(transcript_gate.get("final_noise_decision") or ""),
         "llm_allowed": bool(transcript_gate.get("usable")),
-        "case_type_source": str(candidate.get("case_type_source") or ""),
-        "case_type_reason": str(candidate.get("case_type_reason") or ""),
-        "case_type_evidence_used": (
-            [str(x).strip() for x in candidate.get("evidence_used", []) if str(x).strip()]
-            if isinstance(candidate.get("evidence_used"), list)
-            else []
-        ),
+        "case_type_source": case_type_source,
+        "case_type_reason": case_type_reason,
+        "case_type_evidence_used": case_type_evidence_used,
         "call_review_llm_provenance": (
             record.get("call_review_llm_provenance")
             if isinstance(record.get("call_review_llm_provenance"), dict)
@@ -953,18 +1524,45 @@ def _evaluate_transcript_usability_for_case(*, candidate: dict[str, Any], record
     transcript_text = _text(record.get("transcript_text"))
     transcript_excerpt = _text(record.get("transcript_text_excerpt"))
     call_summary = _text(record.get("call_signal_summary_short"))
+    snapshot = _load_snapshot(record=record)
+    snapshot_transcript_texts: list[str] = []
+    for item in snapshot.get("transcripts", []) if isinstance(snapshot.get("transcripts"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        value = _text(item.get("transcript_text"))
+        if value:
+            snapshot_transcript_texts.append(value)
+    snapshot_transcript_text = _text(" ".join(snapshot_transcript_texts))
+    if len(transcript_text) < 80 and snapshot_transcript_text:
+        transcript_text = snapshot_transcript_text
+    anchor_duration = int(
+        candidate.get("anchor_call_duration_seconds", 0)
+        or record.get("call_review_anchor_call_duration_seconds", 0)
+        or record.get("anchor_call_duration_seconds", 0)
+        or 0
+    )
+    combined_text = " ".join([transcript_text, transcript_excerpt, call_summary, snapshot_transcript_text]).strip().lower()
+    effective_len = len(combined_text)
     transcript_length_chars = int(
         record.get("transcript_text_len", 0)
-        or len(transcript_text)
+        or effective_len
         or len(transcript_excerpt)
         or len(call_summary)
+        or len(snapshot_transcript_text)
     )
+    transcript_length_chars = max(transcript_length_chars, effective_len)
     transcript_segments_count = int(record.get("transcript_segments_count", 0) or 0)
     longest_segment_sec = float(record.get("transcript_longest_segment_sec", 0.0) or 0.0)
-    combined_text = " ".join([transcript_text, transcript_excerpt, call_summary]).strip().lower()
+    noise_profile = _noise_dialogue_profile(
+        transcript_text=combined_text,
+        transcript_chars=transcript_length_chars,
+        call_duration_seconds=anchor_duration,
+    )
 
     detected_noise_reason = ""
-    if any(token in combined_text for token in ("абонент", "сигнала", "автоответ", "voicemail", "оставьте сообщение")):
+    if str(noise_profile.get("noise_classification") or "") == "ivr_then_human_dialogue":
+        detected_noise_reason = "ivr_then_human_dialogue"
+    elif any(token in combined_text for token in ("абонент", "сигнала", "автоответ", "voicemail", "оставьте сообщение")):
         detected_noise_reason = "autoanswer_or_system_voice_markers"
     elif transcript_label == "noisy":
         detected_noise_reason = "legacy_label_noisy"
@@ -978,9 +1576,18 @@ def _evaluate_transcript_usability_for_case(*, candidate: dict[str, Any], record
             "transcript_segments_count": transcript_segments_count,
             "longest_segment_sec": longest_segment_sec,
             "detected_noise_reason": detected_noise_reason,
+            "initial_noise_detected": bool(noise_profile.get("initial_noise_detected")),
+            "human_dialogue_after_noise_detected": bool(noise_profile.get("human_dialogue_after_noise_detected")),
+            "noise_classification": str(noise_profile.get("noise_classification") or ""),
+            "final_noise_decision": str(noise_profile.get("final_noise_decision") or "skip_noise_only"),
         }
 
-    if detected_noise_reason and transcript_length_chars < 220 and transcript_segments_count <= 1:
+    if (
+        detected_noise_reason
+        and detected_noise_reason != "ivr_then_human_dialogue"
+        and transcript_length_chars < 220
+        and transcript_segments_count <= 1
+    ):
         return {
             "usable": False,
             "label": "noisy",
@@ -989,6 +1596,10 @@ def _evaluate_transcript_usability_for_case(*, candidate: dict[str, Any], record
             "transcript_segments_count": transcript_segments_count,
             "longest_segment_sec": longest_segment_sec,
             "detected_noise_reason": detected_noise_reason,
+            "initial_noise_detected": bool(noise_profile.get("initial_noise_detected")),
+            "human_dialogue_after_noise_detected": bool(noise_profile.get("human_dialogue_after_noise_detected")),
+            "noise_classification": str(noise_profile.get("noise_classification") or ""),
+            "final_noise_decision": "skip_noise_only",
         }
 
     # Long transcript with dialogue content should pass even if legacy label stayed noisy.
@@ -1004,9 +1615,14 @@ def _evaluate_transcript_usability_for_case(*, candidate: dict[str, Any], record
         "договор",
     )
     has_dialogue_markers = any(token in combined_text for token in dialogue_markers)
+    if bool(noise_profile.get("human_dialogue_after_noise_detected")):
+        has_dialogue_markers = True
     usable_by_length = transcript_length_chars >= 220 or transcript_segments_count >= 3
     usable_by_signal = transcript_score >= 2 or len(call_summary) >= 40 or has_dialogue_markers
     if transcript_length_chars >= 500 and transcript_segments_count >= 2:
+        usable_by_signal = True
+    if str(noise_profile.get("noise_classification") or "") == "ivr_then_human_dialogue" and transcript_length_chars >= 1000:
+        usable_by_length = True
         usable_by_signal = True
     if usable_by_length and usable_by_signal:
         return {
@@ -1017,6 +1633,10 @@ def _evaluate_transcript_usability_for_case(*, candidate: dict[str, Any], record
             "transcript_segments_count": transcript_segments_count,
             "longest_segment_sec": longest_segment_sec,
             "detected_noise_reason": detected_noise_reason,
+            "initial_noise_detected": bool(noise_profile.get("initial_noise_detected")),
+            "human_dialogue_after_noise_detected": bool(noise_profile.get("human_dialogue_after_noise_detected")),
+            "noise_classification": str(noise_profile.get("noise_classification") or ""),
+            "final_noise_decision": str(noise_profile.get("final_noise_decision") or "allow"),
         }
 
     if transcript_label in {"empty"} and transcript_score <= 0 and not has_dialogue_markers and transcript_length_chars < 160:
@@ -1028,16 +1648,27 @@ def _evaluate_transcript_usability_for_case(*, candidate: dict[str, Any], record
             "transcript_segments_count": transcript_segments_count,
             "longest_segment_sec": longest_segment_sec,
             "detected_noise_reason": detected_noise_reason,
+            "initial_noise_detected": bool(noise_profile.get("initial_noise_detected")),
+            "human_dialogue_after_noise_detected": bool(noise_profile.get("human_dialogue_after_noise_detected")),
+            "noise_classification": str(noise_profile.get("noise_classification") or ""),
+            "final_noise_decision": str(noise_profile.get("final_noise_decision") or "skip_noise_only"),
         }
 
+    final_usable = bool(usable_by_signal)
+    if str(noise_profile.get("noise_classification") or "") == "ivr_then_human_dialogue" and transcript_length_chars >= 1000:
+        final_usable = True
     return {
-        "usable": bool(usable_by_signal),
-        "label": "usable" if usable_by_signal else ("weak" if transcript_length_chars >= 80 else (transcript_label or "empty")),
-        "why_not_usable": "" if usable_by_signal else "insufficient_dialogue_signals_or_length",
+        "usable": final_usable,
+        "label": "usable" if final_usable else ("weak" if transcript_length_chars >= 80 else (transcript_label or "empty")),
+        "why_not_usable": "" if final_usable else "insufficient_dialogue_signals_or_length",
         "transcript_length_chars": transcript_length_chars,
         "transcript_segments_count": transcript_segments_count,
         "longest_segment_sec": longest_segment_sec,
         "detected_noise_reason": detected_noise_reason,
+        "initial_noise_detected": bool(noise_profile.get("initial_noise_detected")),
+        "human_dialogue_after_noise_detected": bool(noise_profile.get("human_dialogue_after_noise_detected")),
+        "noise_classification": str(noise_profile.get("noise_classification") or ""),
+        "final_noise_decision": str(noise_profile.get("final_noise_decision") or ("allow" if final_usable else "skip_noise_only")),
     }
 
 
@@ -1052,6 +1683,10 @@ def _transcript_skip_reason_detail(*, candidate: dict[str, Any], record: dict[st
         "llm_allowed": bool(gate.get("usable")),
         "detected_noise_reason": str(gate.get("detected_noise_reason") or ""),
         "why_not_usable": str(gate.get("why_not_usable") or ""),
+        "initial_noise_detected": bool(gate.get("initial_noise_detected")),
+        "human_dialogue_after_noise_detected": bool(gate.get("human_dialogue_after_noise_detected")),
+        "noise_classification": str(gate.get("noise_classification") or ""),
+        "final_noise_decision": str(gate.get("final_noise_decision") or ""),
     }
 
 
@@ -1144,6 +1779,8 @@ def _build_row_from_case(*, case: dict[str, Any]) -> tuple[dict[str, Any], dict[
         "stage_comment_map": stage_comment_map,
         "stage_comments_without_stage_evidence": stage_comments_without_evidence,
         "comments_cleared_due_to_irrelevant_stage": comments_cleared_due_to_irrelevant_stage,
+        "case_type_source": str(case.get("case_type_source") or ""),
+        "case_type_reason": str(case.get("case_type_reason") or ""),
         "quote_usage_count_by_row": quote_usage_count_by_row,
         "repeated_quotes": [q for q, c in quote_usage_count_by_row.items() if c > 1],
         "max_same_quote_usage": max(quote_usage_count_by_row.values(), default=0),
@@ -1390,6 +2027,7 @@ def _run_semantic_preflight(
     row_entries: list[dict[str, Any]],
     style_payload_normalization: dict[str, Any] | None = None,
     final_payload_quote_repair: dict[str, Any] | None = None,
+    autoanswer_stats: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     irrelevant_stage_comment_count = 0
     irrelevant_stage_non_np_count = 0
@@ -1423,6 +2061,48 @@ def _run_semantic_preflight(
     final_payload_training_jargon_count = 0
     final_payload_truncated_text_count = 0
     final_payload_checked_fields_count = 0
+    final_payload_crm_stage_mismatch_mentions_count = int(
+        (style_payload_normalization or {}).get("final_payload_crm_stage_mismatch_mentions_count", 0) or 0
+    )
+    final_payload_crm_stage_mismatch_repaired_count = int(
+        (style_payload_normalization or {}).get("final_payload_crm_stage_mismatch_repaired_count", 0) or 0
+    )
+    final_payload_crm_stage_mismatch_unrepaired_count = int(
+        (style_payload_normalization or {}).get("final_payload_crm_stage_mismatch_unrepaired_count", 0) or 0
+    )
+    final_payload_bad_phrase_count = int(
+        (style_payload_normalization or {}).get("final_payload_bad_phrase_count", 0) or 0
+    )
+    final_payload_bad_phrase_repaired_count = int(
+        (style_payload_normalization or {}).get("final_payload_bad_phrase_repaired_count", 0) or 0
+    )
+    final_payload_bad_phrase_unrepaired_count = int(
+        (style_payload_normalization or {}).get("final_payload_bad_phrase_unrepaired_count", 0) or 0
+    )
+    final_payload_empty_speech_module_count = int(
+        (style_payload_normalization or {}).get("final_payload_empty_speech_module_count", 0) or 0
+    )
+    final_payload_empty_speech_module_repaired_count = int(
+        (style_payload_normalization or {}).get("final_payload_empty_speech_module_repaired_count", 0) or 0
+    )
+    final_payload_empty_speech_module_unrepaired_count = int(
+        (style_payload_normalization or {}).get("final_payload_empty_speech_module_unrepaired_count", 0) or 0
+    )
+    final_payload_crm_stage_mismatch_examples = [
+        x
+        for x in (style_payload_normalization or {}).get("final_payload_crm_stage_mismatch_examples", [])
+        if isinstance(x, dict)
+    ][:5]
+    final_payload_bad_phrase_examples = [
+        x
+        for x in (style_payload_normalization or {}).get("final_payload_bad_phrase_examples", [])
+        if isinstance(x, dict)
+    ][:5]
+    final_payload_empty_speech_module_examples = [
+        x
+        for x in (style_payload_normalization or {}).get("final_payload_empty_speech_module_examples", [])
+        if isinstance(x, dict)
+    ][:5]
     final_payload_truncated_examples: list[dict[str, Any]] = []
     broken_quote_examples = [
         x
@@ -1439,6 +2119,14 @@ def _run_semantic_preflight(
     repeated_better_phrase_actual_duplicates: list[dict[str, Any]] = []
     style_lint_by_row: list[dict[str, Any]] = []
     better_phrase_usage: dict[str, int] = {}
+    case_type_source_counts: dict[str, int] = {}
+    autoanswer_calls_detected = int((autoanswer_stats or {}).get("autoanswer_calls_detected", 0) or 0)
+    autoanswer_deals_skipped = int((autoanswer_stats or {}).get("autoanswer_deals_skipped", 0) or 0)
+    autoanswer_by_manager = (
+        (autoanswer_stats or {}).get("autoanswer_by_manager")
+        if isinstance((autoanswer_stats or {}).get("autoanswer_by_manager"), dict)
+        else {}
+    )
 
     generic_phrase = GENERIC_BETTER_PHRASE
 
@@ -1447,6 +2135,12 @@ def _run_semantic_preflight(
         semantic = entry.get("semantic_debug", {}) if isinstance(entry.get("semantic_debug"), dict) else {}
         deal_id = str(row.get("Deal ID") or "")
         case_type = str(row.get("Тип кейса") or "").strip().lower()
+        case_type_source = str(
+            semantic.get("case_type_source")
+            or semantic.get("case_type_source_effective")
+            or "unknown"
+        ).strip() or "unknown"
+        case_type_source_counts[case_type_source] = int(case_type_source_counts.get(case_type_source, 0) or 0) + 1
         stage_relevance = semantic.get("stage_relevance", {}) if isinstance(semantic.get("stage_relevance"), dict) else {}
         row_quote_usage = (
             semantic.get("quote_usage_count_by_row")
@@ -1651,6 +2345,15 @@ def _run_semantic_preflight(
         )
 
     post_repair_broken_quotes: list[dict[str, Any]] = []
+    style_has_crm_stats = isinstance(style_payload_normalization, dict) and (
+        "final_payload_crm_stage_mismatch_mentions_count" in style_payload_normalization
+    )
+    style_has_bad_phrase_stats = isinstance(style_payload_normalization, dict) and (
+        "final_payload_bad_phrase_count" in style_payload_normalization
+    )
+    style_has_empty_speech_stats = isinstance(style_payload_normalization, dict) and (
+        "final_payload_empty_speech_module_count" in style_payload_normalization
+    )
     for row_idx, row in enumerate(rows, start=1):
         if not isinstance(row, dict):
             continue
@@ -1666,6 +2369,51 @@ def _run_semantic_preflight(
             final_payload_forbidden_terms_count += _count_regex_hits(value, FORBIDDEN_ENGLISH_TERM_PATTERNS)
             final_payload_forbidden_terms_count += _count_regex_hits(value, TECHNICAL_TERMS_PATTERNS)
             final_payload_training_jargon_count += _count_regex_hits(value, TRAINING_JARGON_PATTERNS)
+            crm_hits = _count_regex_hits(value, CRM_STAGE_MISMATCH_PATTERNS)
+            if not style_has_crm_stats and crm_hits > 0:
+                final_payload_crm_stage_mismatch_mentions_count += crm_hits
+                final_payload_crm_stage_mismatch_unrepaired_count += crm_hits
+                if len(final_payload_crm_stage_mismatch_examples) < 5:
+                    final_payload_crm_stage_mismatch_examples.append(
+                        {
+                            "deal_id": deal_id,
+                            "column": str(key or ""),
+                            "before": value,
+                            "after": value,
+                            "repair_status": "unrepaired",
+                            "reason": "crm_stage_mismatch_forbidden_in_user_facing_payload",
+                        }
+                    )
+            bad_hits = _count_bad_phrase_hits(value)
+            if not style_has_bad_phrase_stats and bad_hits > 0:
+                final_payload_bad_phrase_count += bad_hits
+                final_payload_bad_phrase_unrepaired_count += bad_hits
+                if len(final_payload_bad_phrase_examples) < 5:
+                    final_payload_bad_phrase_examples.append(
+                        {
+                            "deal_id": deal_id,
+                            "column": str(key or ""),
+                            "before": value,
+                            "after": value,
+                            "repair_status": "unrepaired",
+                            "reason": "bad_phrase_or_truncated_marker",
+                        }
+                    )
+            empty_speech_hits = _count_empty_speech_module_hits(value)
+            if not style_has_empty_speech_stats and empty_speech_hits > 0:
+                final_payload_empty_speech_module_count += empty_speech_hits
+                final_payload_empty_speech_module_unrepaired_count += empty_speech_hits
+                if len(final_payload_empty_speech_module_examples) < 5:
+                    final_payload_empty_speech_module_examples.append(
+                        {
+                            "deal_id": deal_id,
+                            "column": str(key or ""),
+                            "before": value,
+                            "after": value,
+                            "repair_status": "unrepaired",
+                            "reason": "empty_speech_module_forbidden_in_user_facing_payload",
+                        }
+                    )
             if _has_broken_payload_quotes(text=value):
                 post_repair_broken_quotes.append(
                     {
@@ -1726,6 +2474,27 @@ def _run_semantic_preflight(
 
     if final_payload_forbidden_terms_count > 0:
         failed_rules.append({"rule": "final_payload_forbidden_terms_present", "count": final_payload_forbidden_terms_count})
+    if final_payload_crm_stage_mismatch_unrepaired_count > 0:
+        failed_rules.append(
+            {
+                "rule": "final_payload_crm_stage_mismatch_unrepaired_present",
+                "count": final_payload_crm_stage_mismatch_unrepaired_count,
+            }
+        )
+    if final_payload_bad_phrase_unrepaired_count > 0:
+        failed_rules.append(
+            {
+                "rule": "final_payload_bad_phrase_unrepaired_present",
+                "count": final_payload_bad_phrase_unrepaired_count,
+            }
+        )
+    if final_payload_empty_speech_module_unrepaired_count > 0:
+        failed_rules.append(
+            {
+                "rule": "final_payload_empty_speech_module_unrepaired_present",
+                "count": final_payload_empty_speech_module_unrepaired_count,
+            }
+        )
     if final_payload_broken_quotes_unrepaired_count > 0:
         failed_rules.append(
             {"rule": "final_payload_broken_quotes_present", "count": final_payload_broken_quotes_unrepaired_count}
@@ -1792,6 +2561,18 @@ def _run_semantic_preflight(
         "final_payload_truncated_text_count": final_payload_truncated_text_count,
         "final_payload_truncated_examples": final_payload_truncated_examples,
         "final_payload_checked_fields_count": final_payload_checked_fields_count,
+        "final_payload_crm_stage_mismatch_mentions_count": final_payload_crm_stage_mismatch_mentions_count,
+        "final_payload_crm_stage_mismatch_repaired_count": final_payload_crm_stage_mismatch_repaired_count,
+        "final_payload_crm_stage_mismatch_unrepaired_count": final_payload_crm_stage_mismatch_unrepaired_count,
+        "final_payload_bad_phrase_count": final_payload_bad_phrase_count,
+        "final_payload_bad_phrase_repaired_count": final_payload_bad_phrase_repaired_count,
+        "final_payload_bad_phrase_unrepaired_count": final_payload_bad_phrase_unrepaired_count,
+        "final_payload_empty_speech_module_count": final_payload_empty_speech_module_count,
+        "final_payload_empty_speech_module_repaired_count": final_payload_empty_speech_module_repaired_count,
+        "final_payload_empty_speech_module_unrepaired_count": final_payload_empty_speech_module_unrepaired_count,
+        "final_payload_crm_stage_mismatch_examples": final_payload_crm_stage_mismatch_examples,
+        "final_payload_bad_phrase_examples": final_payload_bad_phrase_examples,
+        "final_payload_empty_speech_module_examples": final_payload_empty_speech_module_examples,
         "broken_quote_examples": broken_quote_examples,
         "comments_with_not_relevant_text_count": comments_with_not_relevant_text_count,
         "stage_comments_without_distinct_evidence_count": stage_comments_without_distinct_evidence_count,
@@ -1822,6 +2603,10 @@ def _run_semantic_preflight(
         "failed_rules": failed_rules,
         "warning_rules": warning_rules,
         "rows_debug": rows_debug,
+        "case_type_source_counts": case_type_source_counts,
+        "autoanswer_calls_detected": autoanswer_calls_detected,
+        "autoanswer_deals_skipped": autoanswer_deals_skipped,
+        "autoanswer_by_manager": autoanswer_by_manager,
     }
 
 
@@ -1924,7 +2709,11 @@ def _has_broken_payload_quotes(*, text: str) -> bool:
     value = str(text or "")
     if not value.strip():
         return False
-    if 'Лучше сказать: "' in value and not re.search(r'Лучше сказать:\s*"[^"]+"', value, flags=re.IGNORECASE):
+    if re.search(r'(?:Лучше сказать|Используй):\s*"', value, flags=re.IGNORECASE) and not re.search(
+        r'(?:Лучше сказать|Используй):\s*"[^"]+"',
+        value,
+        flags=re.IGNORECASE,
+    ):
         return True
     if '""' in value:
         return True
@@ -1957,7 +2746,7 @@ def _truncated_payload_reason(*, text: str) -> str:
         r"(?<!не)\bч\s*тко\b", low, flags=re.IGNORECASE
     ):
         return "broken_word_spacing"
-    if re.search(r'Лучше сказать:\s*"?[^"]*$', value, flags=re.IGNORECASE):
+    if re.search(r'(?:Лучше сказать|Используй):\s*"?[^"]*$', value, flags=re.IGNORECASE):
         return "unfinished_better_phrase"
     if value.count('"') % 2 == 1:
         return "odd_quote_count"
@@ -2083,6 +2872,8 @@ def _apply_payload_style_normalization(*, row_entries: list[dict[str, Any]]) -> 
     repeated_rewrite = _rewrite_payload_repeated_better_phrases(row_entries=row_entries)
     better_phrase_replacements += int(repeated_rewrite.get("replaced", 0) or 0)
     better_phrase_usage = repeated_rewrite.get("usage", {}) if isinstance(repeated_rewrite.get("usage"), dict) else {}
+    final_repairs = _apply_final_narrative_repairs(row_entries=row_entries)
+    better_phrase_replacements += int(final_repairs.get("better_phrase_marker_replacements", 0) or 0)
 
     replacements_top = [
         {"replacement": k, "count": int(v or 0)}
@@ -2096,7 +2887,307 @@ def _apply_payload_style_normalization(*, row_entries: list[dict[str, Any]]) -> 
         "better_phrase_replacements": better_phrase_replacements,
         "better_phrase_usage_after_normalization": better_phrase_usage,
         "better_phrase_rewrite": repeated_rewrite,
+        "final_payload_crm_stage_mismatch_mentions_count": int(
+            final_repairs.get("final_payload_crm_stage_mismatch_mentions_count", 0) or 0
+        ),
+        "final_payload_crm_stage_mismatch_repaired_count": int(
+            final_repairs.get("final_payload_crm_stage_mismatch_repaired_count", 0) or 0
+        ),
+        "final_payload_crm_stage_mismatch_unrepaired_count": int(
+            final_repairs.get("final_payload_crm_stage_mismatch_unrepaired_count", 0) or 0
+        ),
+        "final_payload_bad_phrase_count": int(final_repairs.get("final_payload_bad_phrase_count", 0) or 0),
+        "final_payload_bad_phrase_repaired_count": int(
+            final_repairs.get("final_payload_bad_phrase_repaired_count", 0) or 0
+        ),
+        "final_payload_bad_phrase_unrepaired_count": int(
+            final_repairs.get("final_payload_bad_phrase_unrepaired_count", 0) or 0
+        ),
+        "final_payload_empty_speech_module_count": int(
+            final_repairs.get("final_payload_empty_speech_module_count", 0) or 0
+        ),
+        "final_payload_empty_speech_module_repaired_count": int(
+            final_repairs.get("final_payload_empty_speech_module_repaired_count", 0) or 0
+        ),
+        "final_payload_empty_speech_module_unrepaired_count": int(
+            final_repairs.get("final_payload_empty_speech_module_unrepaired_count", 0) or 0
+        ),
+        "final_payload_crm_stage_mismatch_examples": (
+            final_repairs.get("final_payload_crm_stage_mismatch_examples", [])
+            if isinstance(final_repairs.get("final_payload_crm_stage_mismatch_examples"), list)
+            else []
+        ),
+        "final_payload_bad_phrase_examples": (
+            final_repairs.get("final_payload_bad_phrase_examples", [])
+            if isinstance(final_repairs.get("final_payload_bad_phrase_examples"), list)
+            else []
+        ),
+        "final_payload_empty_speech_module_examples": (
+            final_repairs.get("final_payload_empty_speech_module_examples", [])
+            if isinstance(final_repairs.get("final_payload_empty_speech_module_examples"), list)
+            else []
+        ),
     }
+
+
+def _apply_final_narrative_repairs(*, row_entries: list[dict[str, Any]]) -> dict[str, Any]:
+    crm_mentions_count = 0
+    crm_repaired_count = 0
+    crm_unrepaired_count = 0
+    bad_phrase_count = 0
+    bad_phrase_repaired_count = 0
+    bad_phrase_unrepaired_count = 0
+    empty_speech_module_count = 0
+    empty_speech_module_repaired_count = 0
+    empty_speech_module_unrepaired_count = 0
+    better_phrase_marker_replacements = 0
+    crm_examples: list[dict[str, Any]] = []
+    bad_examples: list[dict[str, Any]] = []
+    empty_speech_examples: list[dict[str, Any]] = []
+    narrative_fields = set(NARRATIVE_USER_FACING_COLUMNS) | {"Эффект количество / неделя"}
+
+    for entry in row_entries:
+        if not isinstance(entry, dict):
+            continue
+        row = entry.get("row")
+        if not isinstance(row, dict):
+            continue
+        deal_id = str(row.get("Deal ID") or "")
+        for col in narrative_fields:
+            before = str(row.get(col) or "")
+            if not before.strip():
+                continue
+            crm_before = _count_regex_hits(before, CRM_STAGE_MISMATCH_PATTERNS)
+            bad_before = _count_bad_phrase_hits(before)
+            empty_speech_before = _count_empty_speech_module_hits(before)
+
+            repaired = _repair_crm_stage_mismatch_and_bad_phrases(before)
+            after = _sanitize_user_text(repaired)
+            row[col] = after
+
+            if "Лучше сказать:" in before and "Используй:" in after:
+                better_phrase_marker_replacements += before.count("Лучше сказать:")
+
+            if crm_before > 0:
+                crm_mentions_count += crm_before
+                crm_after = _count_regex_hits(after, CRM_STAGE_MISMATCH_PATTERNS)
+                repaired_delta = max(0, crm_before - crm_after)
+                crm_repaired_count += repaired_delta
+                crm_unrepaired_count += crm_after
+                if len(crm_examples) < 5:
+                    crm_examples.append(
+                        {
+                            "deal_id": deal_id,
+                            "column": str(col or ""),
+                            "before": before,
+                            "after": after,
+                            "repair_status": "repaired" if crm_after == 0 else "unrepaired",
+                            "reason": "crm_stage_mismatch_forbidden_in_user_facing_payload",
+                        }
+                    )
+
+            if bad_before > 0:
+                bad_phrase_count += bad_before
+                bad_after = _count_bad_phrase_hits(after)
+                repaired_delta = max(0, bad_before - bad_after)
+                bad_phrase_repaired_count += repaired_delta
+                bad_phrase_unrepaired_count += bad_after
+                if len(bad_examples) < 5:
+                    bad_examples.append(
+                        {
+                            "deal_id": deal_id,
+                            "column": str(col or ""),
+                            "before": before,
+                            "after": after,
+                            "repair_status": "repaired" if bad_after == 0 else "unrepaired",
+                            "reason": "bad_phrase_or_truncated_marker",
+                        }
+                    )
+            if empty_speech_before > 0:
+                empty_speech_module_count += empty_speech_before
+                empty_speech_after = _count_empty_speech_module_hits(after)
+                repaired_delta = max(0, empty_speech_before - empty_speech_after)
+                empty_speech_module_repaired_count += repaired_delta
+                empty_speech_module_unrepaired_count += empty_speech_after
+                empty_after_cleanup = not bool(after.strip())
+                if empty_after_cleanup:
+                    empty_speech_module_unrepaired_count += 1
+                if len(empty_speech_examples) < 5:
+                    empty_speech_examples.append(
+                        {
+                            "deal_id": deal_id,
+                            "column": str(col or ""),
+                            "before": before,
+                            "after": after,
+                            "repair_status": (
+                                "repaired"
+                                if empty_speech_after == 0 and not empty_after_cleanup
+                                else "unrepaired"
+                            ),
+                            "reason": (
+                                "empty_field_after_empty_speech_module_removal"
+                                if empty_after_cleanup
+                                else "empty_speech_module_forbidden_in_user_facing_payload"
+                            ),
+                        }
+                    )
+
+    return {
+        "final_payload_crm_stage_mismatch_mentions_count": crm_mentions_count,
+        "final_payload_crm_stage_mismatch_repaired_count": crm_repaired_count,
+        "final_payload_crm_stage_mismatch_unrepaired_count": crm_unrepaired_count,
+        "final_payload_bad_phrase_count": bad_phrase_count,
+        "final_payload_bad_phrase_repaired_count": bad_phrase_repaired_count,
+        "final_payload_bad_phrase_unrepaired_count": bad_phrase_unrepaired_count,
+        "final_payload_empty_speech_module_count": empty_speech_module_count,
+        "final_payload_empty_speech_module_repaired_count": empty_speech_module_repaired_count,
+        "final_payload_empty_speech_module_unrepaired_count": empty_speech_module_unrepaired_count,
+        "final_payload_crm_stage_mismatch_examples": crm_examples,
+        "final_payload_bad_phrase_examples": bad_examples,
+        "final_payload_empty_speech_module_examples": empty_speech_examples,
+        "better_phrase_marker_replacements": better_phrase_marker_replacements,
+    }
+
+
+def _repair_crm_stage_mismatch_and_bad_phrases(text: str) -> str:
+    value = str(text or "")
+    if not value:
+        return ""
+
+    neutral_phrase = (
+        "По звонку не хватает фиксации фактов: с кем говорили, какая боль, какой следующий шаг и дата."
+    )
+    for pattern in CRM_STAGE_MISMATCH_PATTERNS:
+        value = pattern.sub(neutral_phrase, value)
+
+    value = re.sub(
+        r"(?:по\s+этапу\s+должно\s+быть[^.!\n]*)",
+        "В разговоре не зафиксирован следующий управляемый шаг.",
+        value,
+        flags=re.IGNORECASE,
+    )
+    value = re.sub(
+        r"(?:в\s+црм\s+стадия[^.!\n]*а\s+по\s+факту[^.!\n]*)",
+        neutral_phrase,
+        value,
+        flags=re.IGNORECASE,
+    )
+
+    replacements: tuple[tuple[str, str], ...] = (
+        (r"Лучше\s+сказать\s*:", "Используй:"),
+        (r"\bпройти\s+как\s+действовать\s+квалификаци[а-я]*\b", "Разобрать квалификацию клиента"),
+        (r"\bразобрать\s+как\s+действовать\s+квалификаци[а-я]*\b", "Разобрать квалификацию клиента"),
+        (r"\bотработать\s+как\s+действовать\s+квалификаци[а-я]*\b", "Разобрать квалификацию клиента"),
+        (r"\bкак\s+действовать\s+квалификаци[а-я]*\b", "разобрать квалификацию клиента"),
+        (r"\bкак\s+действовать\s+выявлени[яе]\s+потребност[еяй]+\b", "разобрать выявление потребностей"),
+        (r"\bкак\s+действовать\s+фиксаци[ия]\s+следующ[её]го\s+шаг[а-я]*\b", "разобрать фиксацию следующего шага"),
+        (r"\bкак\s+действовать\s+фиксаци[а-я]*\b", "разобрать фиксацию следующего шага"),
+        (r"\bкак\s+действовать\s+выявлени[а-я]*\b", "разобрать выявление потребностей"),
+        (r"\bкак\s+действовать\s+работ[а-я]*\b", "разобрать рабочие действия в звонке"),
+        (r"\bкак\s+действовать\s+презентаци[а-я]*\b", "разобрать презентацию под задачу клиента"),
+        (r"\bкак\s+действовать\s+отработк[а-я]*\b", "разобрать отработку возражений"),
+        (r"\bкак\s+действовать\s+копания\b", "разобрать вопросы клиента глубже"),
+        (r"\bкак\s+действовать\s+управления\b", "как управлять разговором"),
+        (r"\bкак\s+действовать\s+выявления\b", "как выявлять потребность"),
+        (r"\bТренировать\s+четк(?:ая|ую)\s+фраз(?:а|у)\b", "Отработать четкую фразу"),
+        (r"\bотработать\s+быстрого\b", "отработать быстрое"),
+        (r"\bотработать\s+глубиннн?ого\b", "отработать глубинное"),
+        (r"\bВместо\s+нужно\s*:\s*-\s*", ""),
+        (r"\bЛучше\s*:\s*-\s*", ""),
+        (r"\b1\)\s*1\.", "1)"),
+        (r"\bнеч\s*тко\b", "нечетко"),
+        (r"(?<!не)\bч\s*тко\b", "четко"),
+    )
+    for pattern, repl in replacements:
+        value = re.sub(pattern, repl, value, flags=re.IGNORECASE)
+
+    value = re.sub(
+        r"\b(?:пройти|разобрать|отработать)\s+как\s+действовать\s*[\"«]([^\"»]+)[\"»]",
+        lambda m: f"Разобрать {_normalize_kak_deystvovat_topic(str(m.group(1) or '').strip().lower())}",
+        value,
+        flags=re.IGNORECASE,
+    )
+    value = re.sub(
+        r"\bкак\s+действовать\s*[\"«]([^\"»]+)[\"»]",
+        lambda m: f"разобрать {_normalize_kak_deystvovat_topic(str(m.group(1) or '').strip().lower())}",
+        value,
+        flags=re.IGNORECASE,
+    )
+    value = re.sub(
+        r"\b(?:пройти|разобрать|отработать)\s+как\s+действовать\s+[а-яё][а-яё\s-]{2,}\b",
+        "Разобрать этот этап разговора по фактам",
+        value,
+        flags=re.IGNORECASE,
+    )
+    value = re.sub(
+        r"\bкак\s+действовать\s+[а-яё][а-яё\s-]{2,}\b",
+        "разобрать этот этап разговора по фактам",
+        value,
+        flags=re.IGNORECASE,
+    )
+    value = re.sub(
+        r"\b(?:пройти|разобрать|отработать)\s+как\s+действовать\b",
+        "Разобрать этот этап разговора по фактам",
+        value,
+        flags=re.IGNORECASE,
+    )
+    value = re.sub(r"\bкак\s+действовать\b", "разобрать", value, flags=re.IGNORECASE)
+
+    value = _remove_empty_speech_modules(value)
+    value = re.sub(r"(?:Используй|Что исправить)\s*:\s*$", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"(?:Используй)\s*:\s*-\s*", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"-\s*$", "", value)
+    value = re.sub(r"\s{2,}", " ", value).strip(" ,;:-")
+    return value
+
+
+def _normalize_kak_deystvovat_topic(topic: str) -> str:
+    value = str(topic or "").strip().lower()
+    if not value:
+        return "этот этап разговора по фактам"
+    if value.startswith("фиксация "):
+        return "фиксацию " + value[len("фиксация ") :]
+    if value.startswith("квалификация"):
+        return "квалификацию клиента"
+    if value.startswith("выявление"):
+        return "выявление потребностей"
+    return value
+
+
+def _count_bad_phrase_hits(text: str) -> int:
+    value = str(text or "")
+    if not value.strip():
+        return 0
+    total = 0
+    for pattern in BAD_PHRASE_PATTERNS:
+        total += len(pattern.findall(value))
+    if re.search(r"(?:Используй|Лучше сказать|Что исправить)\s*:\s*$", value, flags=re.IGNORECASE):
+        total += 1
+    if re.search(r"-\s*$", value):
+        total += 1
+    if _truncated_payload_reason(text=value):
+        total += 1
+    return total
+
+
+def _count_empty_speech_module_hits(text: str) -> int:
+    value = str(text or "")
+    if not value.strip():
+        return 0
+    total = 0
+    for pattern in EMPTY_SPEECH_MODULE_PATTERNS:
+        total += len(pattern.findall(value))
+    return total
+
+
+def _remove_empty_speech_modules(text: str) -> str:
+    value = str(text or "")
+    if not value.strip():
+        return ""
+    for pattern in EMPTY_SPEECH_MODULE_PATTERNS:
+        value = pattern.sub("", value)
+    value = re.sub(r"\s{2,}", " ", value).strip(" ,;:-")
+    return value
 
 
 def _compact_stage_comment(*, text: str, stage_group: str) -> str:
@@ -2126,7 +3217,7 @@ def _compact_stage_comment(*, text: str, stage_group: str) -> str:
         )
         better = _trim_compact_sentence(_sanitize_user_text(better), 220)
 
-    base = re.sub(r'Лучше сказать:\s*"[^"]*"', "", value, flags=re.IGNORECASE).strip()
+    base = re.sub(r'(?:Лучше сказать|Используй):\s*"[^"]*"', "", value, flags=re.IGNORECASE).strip()
     if quote:
         base = base.replace(f'"{quote}"', " ")
     base = re.sub(r"\s*;\s*", ". ", base)
@@ -2170,7 +3261,11 @@ def _compact_stage_comment(*, text: str, stage_group: str) -> str:
             if out and out[-1] not in ".!?":
                 out = f"{out}."
             out = f'{out} Лучше сказать: "{fallback}"'.strip()
-    if "Лучше сказать:" in out and not re.search(r'Лучше сказать:\s*"[^"]+"', out, flags=re.IGNORECASE):
+    if re.search(r"(?:Лучше сказать|Используй):", out, flags=re.IGNORECASE) and not re.search(
+        r'(?:Лучше сказать|Используй):\s*"[^"]+"',
+        out,
+        flags=re.IGNORECASE,
+    ):
         fallback = _sanitize_user_text(
             _pick_better_phrase_variant(
                 stage_group=stage_group,
@@ -2179,7 +3274,7 @@ def _compact_stage_comment(*, text: str, stage_group: str) -> str:
                 taken={},
             )
         )
-        out = re.sub(r"Лучше сказать:\s*\"?[^\"]*$", "", out, flags=re.IGNORECASE).strip(" ,;:-")
+        out = re.sub(r"(?:Лучше сказать|Используй):\s*\"?[^\"]*$", "", out, flags=re.IGNORECASE).strip(" ,;:-")
         if fallback:
             if out and out[-1] not in ".!?":
                 out = f"{out}."
@@ -2345,11 +3440,11 @@ def _repair_broken_payload_quotes_text(*, text: str) -> tuple[str, str]:
             value = out
             reasons.append("double_quote_wrap")
 
-    better_match = re.search(r"(?is)(.*?)(лучше сказать:\s*)(.*)$", value, flags=re.IGNORECASE)
+    better_match = re.search(r"(?is)(.*?)(?:лучше сказать|используй):\s*(.*)$", value, flags=re.IGNORECASE)
     if better_match:
         prefix = str(better_match.group(1) or "").strip()
-        marker = str(better_match.group(2) or "Лучше сказать: ").strip()
-        phrase = str(better_match.group(3) or "").strip()
+        marker = "Используй:"
+        phrase = str(better_match.group(2) or "").strip()
         phrase = phrase.strip()
         phrase = phrase.strip('"')
         phrase = re.sub(r'"+\s*$', "", phrase).strip()
@@ -2360,9 +3455,9 @@ def _repair_broken_payload_quotes_text(*, text: str) -> tuple[str, str]:
             reasons.append("remove_unmatched_quote_before_better_phrase")
         value = f'{prefix} {marker} "{phrase}"'.strip() if phrase else f"{prefix} {marker}".strip()
         reasons.append("normalize_better_phrase_segment")
-    elif re.search(r'Лучше сказать:\s*"[^"]*$', value, flags=re.IGNORECASE):
+    elif re.search(r'(?:Лучше сказать|Используй):\s*"[^"]*$', value, flags=re.IGNORECASE):
         value = re.sub(
-            r'(Лучше сказать:\s*"[^"]*)$',
+            r'((?:Лучше сказать|Используй):\s*"[^"]*)$',
             r'\1"',
             value,
             flags=re.IGNORECASE,
@@ -2370,7 +3465,7 @@ def _repair_broken_payload_quotes_text(*, text: str) -> tuple[str, str]:
         reasons.append("close_better_phrase_quote")
 
     if value.count('"') % 2 == 1:
-        better_tail = re.search(r'Лучше сказать:\s*"([^"]*)$', value, flags=re.IGNORECASE)
+        better_tail = re.search(r'(?:Лучше сказать|Используй):\s*"([^"]*)$', value, flags=re.IGNORECASE)
         if better_tail:
             value = value + '"'
             reasons.append("append_terminal_quote")
@@ -2386,15 +3481,179 @@ def _repair_broken_payload_quotes_text(*, text: str) -> tuple[str, str]:
     return value, "|".join(reasons)
 
 
+def _selected_call_id_for_readiness(*, candidate: dict[str, Any], record: dict[str, Any]) -> str:
+    for source in (
+        candidate.get("selected_call_ids"),
+        record.get("selected_call_ids"),
+    ):
+        if not isinstance(source, list):
+            continue
+        for raw in source:
+            call_id = str(raw or "").strip()
+            if call_id:
+                return call_id
+    for raw in (
+        candidate.get("anchor_call_id"),
+        record.get("anchor_call_id"),
+        record.get("call_review_anchor_call_id"),
+    ):
+        call_id = str(raw or "").strip()
+        if call_id:
+            return call_id
+    return ""
+
+
+def _build_transcript_readiness_entry(*, candidate: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
+    snapshot = _load_snapshot(record=record)
+    calls = _extract_calls(snapshot=snapshot)
+    transcript_text_by_call_id = _build_transcript_text_by_call_id(snapshot=snapshot)
+    selected_ids = _selected_call_ids(candidate=candidate, record=record)
+    selected_call = _select_anchor_call(
+        calls=calls,
+        selected_call_ids=selected_ids,
+        transcript_text_by_call_id=transcript_text_by_call_id,
+    )
+    selected_call_id = str((selected_call or {}).get("call_id") or "").strip() or _selected_call_id_for_readiness(
+        candidate=candidate,
+        record=record,
+    )
+
+    audio_path = str((selected_call or {}).get("audio_path") or "").strip()
+    audio_path_exists = bool(audio_path and Path(audio_path).exists())
+    audio_status = str((selected_call or {}).get("audio_download_status") or "").strip().lower()
+    audio_source = ""
+    if audio_path:
+        if audio_status in {"cached", "local_exists", "resolved_file_url"}:
+            audio_source = "cached"
+        elif audio_status in {"downloaded", "downloaded_now"}:
+            audio_source = "downloaded"
+        elif audio_status:
+            audio_source = audio_status
+        else:
+            audio_source = "downloaded"
+
+    transcript_item: dict[str, Any] = {}
+    for raw in snapshot.get("transcripts", []) if isinstance(snapshot.get("transcripts"), list) else []:
+        if not isinstance(raw, dict):
+            continue
+        call_id = str(raw.get("call_id") or "").strip()
+        if selected_call_id and call_id and call_id == selected_call_id:
+            transcript_item = raw
+            break
+        if not transcript_item:
+            transcript_item = raw
+
+    transcript_text = str(transcript_item.get("transcript_text") or "").strip()
+    transcript_chars = int(transcript_item.get("transcript_chars", 0) or len(transcript_text))
+    excerpt = str(record.get("transcript_text_excerpt") or "").strip()
+    transcript_preview = " ".join((excerpt or transcript_text)[:280].split()).strip()
+    transcript_excerpt_chars = len(excerpt)
+    transcript_status = str(transcript_item.get("transcript_status") or "").strip().lower()
+    transcript_source = str(transcript_item.get("transcript_source") or record.get("transcript_source") or "").strip()
+    stt_error = str(transcript_item.get("transcript_error") or record.get("transcript_error") or "").strip()
+    transcript_usable = bool(transcript_item.get("transcript_usable"))
+    if not transcript_usable:
+        transcript_usable = bool(
+            transcript_chars >= 20
+            and transcript_status in {"ok", "cached"}
+        )
+    if not transcript_usable:
+        readiness = record.get("call_review_transcript_readiness")
+        if isinstance(readiness, dict):
+            transcript_usable = bool(readiness.get("transcript_usable"))
+    noise_profile = _noise_dialogue_profile(
+        transcript_text=" ".join([transcript_text, excerpt]).strip(),
+        transcript_chars=transcript_chars,
+        call_duration_seconds=int((selected_call or {}).get("duration_seconds", 0) or 0),
+    )
+
+    return {
+        "deal_id": str(candidate.get("deal_id") or record.get("deal_id") or "").strip(),
+        "selected_call_id": selected_call_id,
+        "call_duration_seconds": int((selected_call or {}).get("duration_seconds", 0) or 0),
+        "audio_path_exists": audio_path_exists,
+        "audio_source": audio_source,
+        "audio_path": audio_path,
+        "recording_url": str((selected_call or {}).get("recording_url") or "").strip(),
+        "transcript_source": transcript_source,
+        "transcript_chars": int(transcript_chars),
+        "transcript_excerpt_chars": int(transcript_excerpt_chars),
+        "transcript_preview": transcript_preview,
+        "transcript_usable": bool(transcript_usable),
+        "stt_status": transcript_status,
+        "stt_error": stt_error,
+        "initial_noise_detected": bool(noise_profile.get("initial_noise_detected")),
+        "human_dialogue_after_noise_detected": bool(noise_profile.get("human_dialogue_after_noise_detected")),
+        "noise_classification": str(noise_profile.get("noise_classification") or ""),
+        "final_noise_decision": str(noise_profile.get("final_noise_decision") or ""),
+        "skip_reason_before_llm": "",
+        "final_decision": "",
+    }
+
+
+def _map_readiness_final_decision(*, skip_reason: str) -> str:
+    reason = str(skip_reason or "").strip().lower()
+    if reason in {"empty_transcript_after_stt", "transcript_not_ready"} or reason.startswith("transcript_"):
+        return "skipped_empty_transcript"
+    if reason in {"llm_not_ready", "llm_timeout", "validation_failed", "missing_required_stage_comment"}:
+        return "skipped_after_llm"
+    if reason in AUTOANSWER_SKIP_REASONS:
+        return "skipped_not_meaningful_conversation"
+    if reason.startswith("disallowed_case_mode") or reason in {
+        "pool_not_conversation",
+        "not_selected_for_transcription",
+        "manager_not_in_allowlist",
+        "telemarketer_case_out_of_scope",
+        "anchor_call_noise",
+        "anchor_call_too_short",
+        "listened_calls_empty",
+    }:
+        return "skipped_case_filtered"
+    if reason:
+        return f"skipped_{reason}"
+    return "skipped_unknown"
+
+
+def _collect_autoanswer_skip_stats(*, cases_debug: list[dict[str, Any]]) -> dict[str, Any]:
+    calls_detected = 0
+    deals: set[str] = set()
+    by_manager: dict[str, int] = {}
+    for item in cases_debug:
+        if not isinstance(item, dict):
+            continue
+        if not bool(item.get("skipped")):
+            continue
+        reason = str(item.get("skip_reason") or "").strip().lower()
+        if reason not in AUTOANSWER_SKIP_REASONS:
+            continue
+        deal_id = str(item.get("deal_id") or "").strip()
+        if deal_id:
+            deals.add(deal_id)
+        selected_call_count = int(item.get("selected_call_count", 0) or 0)
+        calls_detected += max(1, selected_call_count)
+        manager = " ".join(
+            str(item.get("manager_name") or item.get("anchor_manager_name") or "").split()
+        ).strip()
+        if manager:
+            by_manager[manager] = int(by_manager.get(manager, 0) or 0) + max(1, selected_call_count)
+    return {
+        "autoanswer_calls_detected": calls_detected,
+        "autoanswer_deals_skipped": len(deals),
+        "autoanswer_by_manager": by_manager,
+    }
+
+
 def _write_debug_artifacts(
     *,
     run_dir: Path | None,
+    summary: dict[str, Any] | None,
     ledger: list[dict[str, Any]],
     call_ledger_all: list[dict[str, Any]] | None,
     call_ledger_audit: dict[str, Any] | None,
     anchor_shortlist: list[dict[str, Any]] | None,
     selected_anchor_cases: list[dict[str, Any] | Any] | None,
     cases_debug: list[dict[str, Any]],
+    transcript_readiness_debug: list[dict[str, Any]],
     rows: list[dict[str, Any]],
     skipped_reasons: dict[str, int],
     abort_stage: str,
@@ -2423,6 +3682,7 @@ def _write_debug_artifacts(
     selected_cases_by_manager: dict[str, int] = {}
     writer_rows_by_manager: dict[str, int] = {}
     skipped_after_llm_by_manager: dict[str, int] = {}
+    autoanswer_stats = _collect_autoanswer_skip_stats(cases_debug=cases_debug)
     llm_skip_reasons = {"llm_not_ready", "llm_timeout", "validation_failed", "missing_required_stage_comment"}
     for selected in selected_items:
         if not isinstance(selected, dict):
@@ -2469,6 +3729,7 @@ def _write_debug_artifacts(
             continue
     score_sources: dict[str, int] = {}
     transcript_labels: dict[str, int] = {}
+    case_type_source_counts: dict[str, int] = {}
     for case_item in cases_debug:
         if not isinstance(case_item, dict):
             continue
@@ -2476,7 +3737,19 @@ def _write_debug_artifacts(
         score_sources[score_source] = int(score_sources.get(score_source, 0) or 0) + 1
         label = str(case_item.get("transcript_usability_label") or "").strip() or "unknown"
         transcript_labels[label] = int(transcript_labels.get(label, 0) or 0) + 1
-    skipped_after_stt = int(sum(1 for x in cases_debug if isinstance(x, dict) and str(x.get("skip_reason") or "").startswith("transcript_")))
+        case_source = str(case_item.get("case_type_source") or "").strip() or "unknown"
+        case_type_source_counts[case_source] = int(case_type_source_counts.get(case_source, 0) or 0) + 1
+    skipped_after_stt = int(
+        sum(
+            1
+            for x in cases_debug
+            if isinstance(x, dict)
+            and (
+                str(x.get("skip_reason") or "").startswith("transcript_")
+                or str(x.get("skip_reason") or "") in {"empty_transcript_after_stt", "transcript_not_ready"}
+            )
+        )
+    )
     skipped_after_llm = int(
         sum(
             1
@@ -2492,6 +3765,8 @@ def _write_debug_artifacts(
     selected_path = root / "selected_anchor_cases.json"
     cases_path = root / "anchor_cases.json"
     rows_path = root / "writer_rows.json"
+    transcript_readiness_path = root / "transcript_readiness_debug.json"
+    row_flow_path = root / "row_flow_debug.json"
     summary_path = root / "pipeline_summary.json"
     case_type_audit_path = root / "case_type_audit.json"
     ledger_path.write_text(json.dumps(ledger_all, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -2503,6 +3778,14 @@ def _write_debug_artifacts(
     selected_path.write_text(json.dumps(selected_items, ensure_ascii=False, indent=2), encoding="utf-8")
     cases_path.write_text(json.dumps(cases_debug, ensure_ascii=False, indent=2), encoding="utf-8")
     rows_path.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+    transcript_readiness_path.write_text(
+        json.dumps(
+            [x for x in transcript_readiness_debug if isinstance(x, dict)],
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
     case_type_audit_path.write_text(
         json.dumps(
             [
@@ -2528,6 +3811,121 @@ def _write_debug_artifacts(
         ),
         encoding="utf-8",
     )
+    summary_payload = summary if isinstance(summary, dict) else {}
+    shortlist_diag = (
+        summary_payload.get("transcription_shortlist_diagnostics", {})
+        if isinstance(summary_payload.get("transcription_shortlist_diagnostics"), dict)
+        else {}
+    )
+    deals_selected_for_analysis = int(
+        shortlist_diag.get("deals_selected_for_analysis", len(selected_items)) or len(selected_items)
+    )
+    llm_skip_reasons = {"llm_not_ready", "llm_timeout", "validation_failed", "missing_required_stage_comment"}
+    transcript_skip_reasons = {"empty_transcript_after_stt", "transcript_not_ready"}
+    readiness_by_deal: dict[str, dict[str, Any]] = {}
+    for entry in transcript_readiness_debug:
+        if not isinstance(entry, dict):
+            continue
+        did = str(entry.get("deal_id") or "").strip()
+        if did and did not in readiness_by_deal:
+            readiness_by_deal[did] = entry
+    case_by_deal: dict[str, dict[str, Any]] = {}
+    for entry in cases_debug:
+        if not isinstance(entry, dict):
+            continue
+        did = str(entry.get("deal_id") or "").strip()
+        if did and did not in case_by_deal:
+            case_by_deal[did] = entry
+    selected_by_deal: dict[str, dict[str, Any]] = {}
+    for entry in selected_items:
+        if not isinstance(entry, dict):
+            continue
+        did = str(entry.get("deal_id") or "").strip()
+        if did and did not in selected_by_deal:
+            selected_by_deal[did] = entry
+    row_flow_entries: list[dict[str, Any]] = []
+    for did in [str(x.get("deal_id") or "").strip() for x in selected_items if isinstance(x, dict)]:
+        if not did:
+            continue
+        selected_item = selected_by_deal.get(did, {})
+        case_debug = case_by_deal.get(did, {})
+        readiness = readiness_by_deal.get(did, {})
+        skip_reason = str(case_debug.get("skip_reason") or readiness.get("skip_reason_before_llm") or "").strip()
+        call_duration = int(
+            case_debug.get("anchor_call_duration_seconds", 0)
+            or selected_item.get("anchor_call_duration_seconds", 0)
+            or readiness.get("call_duration_seconds", 0)
+            or 0
+        )
+        transcript_preview = str(readiness.get("transcript_preview") or "").strip()
+        row_flow_entries.append(
+            {
+                "deal_id": did,
+                "selected_call_id": str(
+                    readiness.get("selected_call_id")
+                    or selected_item.get("anchor_call_id")
+                    or case_debug.get("anchor_call_id")
+                    or ""
+                ).strip(),
+                "call_duration": call_duration,
+                "transcript_chars": int(
+                    readiness.get("transcript_chars", 0)
+                    or case_debug.get("transcript_length_chars", 0)
+                    or 0
+                ),
+                "transcript_preview": transcript_preview,
+                "initial_noise_detected": bool(
+                    case_debug.get("initial_noise_detected")
+                    if "initial_noise_detected" in case_debug
+                    else readiness.get("initial_noise_detected", False)
+                ),
+                "human_dialogue_after_noise_detected": bool(
+                    case_debug.get("human_dialogue_after_noise_detected")
+                    if "human_dialogue_after_noise_detected" in case_debug
+                    else readiness.get("human_dialogue_after_noise_detected", False)
+                ),
+                "noise_classification": str(
+                    case_debug.get("noise_classification")
+                    or readiness.get("noise_classification")
+                    or ""
+                ),
+                "final_noise_decision": str(
+                    case_debug.get("final_noise_decision")
+                    or readiness.get("final_noise_decision")
+                    or ""
+                ),
+                "skip_reason": skip_reason,
+                "final_decision": str(
+                    readiness.get("final_decision")
+                    or ("sent_to_writer" if not bool(case_debug.get("skipped")) else _map_readiness_final_decision(skip_reason=skip_reason))
+                ).strip(),
+            }
+        )
+    rows_after_llm_steps = max(
+        0,
+        len(selected_items)
+        - sum(
+            1
+            for x in row_flow_entries
+            if str(x.get("skip_reason") or "") in llm_skip_reasons
+            or str(x.get("skip_reason") or "") in transcript_skip_reasons
+        ),
+    )
+    row_flow_payload = {
+        "deals_selected_for_analysis": deals_selected_for_analysis,
+        "selected_anchor_cases_total": len(selected_items),
+        "rows_after_llm_steps": int(rows_after_llm_steps),
+        "rows_after_preflight": len(rows),
+        "rows_in_writer_rows": len(rows),
+        "rows_in_sheet_payload": len(rows),
+        "rows_skipped_before_writer": max(0, len(selected_items) - len(rows)),
+        "skip_reasons": dict(skipped_reasons),
+        "rows": row_flow_entries,
+    }
+    row_flow_path.write_text(
+        json.dumps(row_flow_payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     summary_path.write_text(
         json.dumps(
             {
@@ -2541,6 +3939,13 @@ def _write_debug_artifacts(
                 "dropped_by_limit": max(0, len(shortlist_items) - len(selected_items)),
                 "skipped_after_stt": skipped_after_stt,
                 "skipped_after_llm": skipped_after_llm,
+                "autoanswer_calls_detected": int(autoanswer_stats.get("autoanswer_calls_detected", 0) or 0),
+                "autoanswer_deals_skipped": int(autoanswer_stats.get("autoanswer_deals_skipped", 0) or 0),
+                "autoanswer_by_manager": (
+                    autoanswer_stats.get("autoanswer_by_manager")
+                    if isinstance(autoanswer_stats.get("autoanswer_by_manager"), dict)
+                    else {}
+                ),
                 "rows_written": len(rows),
                 "score_distribution": {
                     "min": min(scores) if scores else None,
@@ -2549,6 +3954,7 @@ def _write_debug_artifacts(
                     "unique_scores": sorted(set(scores)),
                 },
                 "score_sources": score_sources,
+                "case_type_source_counts": case_type_source_counts,
                 "transcript_usability_distribution": transcript_labels,
                 "cases_total": len(cases_debug),
                 "skipped_reasons": skipped_reasons,
@@ -2570,14 +3976,90 @@ def _write_debug_artifacts(
         "selected_anchor_cases_json": str(selected_path),
         "anchor_cases_json": str(cases_path),
         "writer_rows_json": str(rows_path),
+        "transcript_readiness_debug_json": str(transcript_readiness_path),
+        "row_flow_debug_json": str(row_flow_path),
         "pipeline_summary_json": str(summary_path),
         "case_type_audit_json": str(case_type_audit_path),
     }
 
 
-def _resolve_llm_case_unready_reason(*, record: dict[str, Any]) -> str:
+def _resolve_non_meaningful_skip_reason(*, candidate: dict[str, Any], record: dict[str, Any]) -> str:
+    raw_case_type = str(candidate.get("call_case_type") or "").strip().lower()
+    if raw_case_type in {"autoanswer_noise", "autoanswer", "answering_machine", "voicemail"}:
+        return "autoanswer_no_meaningful_conversation"
+    if raw_case_type in {"no_human_dialogue", "no_human_conversation"}:
+        return "no_human_dialogue"
+    if raw_case_type in {"short_no_answer", "short_no_answer_autoanswer", "short_noise", "short_no_meaningful"}:
+        return "short_no_meaningful_conversation"
+
+    autoanswer_like = int(candidate.get("autoanswer_like_count", 0) or 0)
+    no_answer_like = int(candidate.get("no_answer_like_count", 0) or 0)
+    selected_call_count = int(candidate.get("selected_call_count", 0) or 0)
+    if selected_call_count <= 1 and autoanswer_like > 0:
+        return "autoanswer_no_meaningful_conversation"
+    if selected_call_count <= 1 and no_answer_like > 0:
+        return "short_no_meaningful_conversation"
+    transcript_summary = " ".join(
+        str(record.get(k) or "").strip().lower()
+        for k in ("call_signal_summary_short", "transcript_text_excerpt", "transcript_text")
+    )
+    transcript_len = int(record.get("transcript_text_len", 0) or len(transcript_summary))
+    duration = int(
+        candidate.get("anchor_call_duration_seconds", 0)
+        or record.get("call_review_anchor_call_duration_seconds", 0)
+        or record.get("anchor_call_duration_seconds", 0)
+        or 0
+    )
+    noise_profile = _noise_dialogue_profile(
+        transcript_text=transcript_summary,
+        transcript_chars=transcript_len,
+        call_duration_seconds=duration,
+    )
+    if str(noise_profile.get("noise_classification") or "") == "ivr_then_human_dialogue":
+        return ""
+    if any(
+        token in transcript_summary
+        for token in (
+            "автоответ",
+            "автоответчик",
+            "оставьте сообщение",
+            "после сигнала",
+            "голосовая почта",
+            "абонент недоступен",
+            "соединение установлено",
+            "voicemail",
+        )
+    ):
+        if any(token in transcript_summary for token in DIALOGUE_TRANSCRIPT_MARKERS):
+            return ""
+        return "autoanswer_no_meaningful_conversation"
+    if any(token in transcript_summary for token in IVR_TRANSCRIPT_MARKERS):
+        if any(token in transcript_summary for token in DIALOGUE_TRANSCRIPT_MARKERS):
+            return ""
+        return "no_human_dialogue"
+    normalized = " ".join(transcript_summary.split()).strip()
+    if normalized in {"алло", "алло алло", "алло?", "да", "слушаю"}:
+        return "no_human_dialogue"
+    return ""
+
+
+def _resolve_llm_case_unready_reason(*, record: dict[str, Any], candidate: dict[str, Any] | None = None) -> str:
     raw = str(record.get("call_review_llm_error") or "").strip().lower()
     category = str(record.get("call_review_llm_error_category") or "").strip().lower()
+    candidate_payload = candidate if isinstance(candidate, dict) else {}
+    non_meaningful_reason = _resolve_non_meaningful_skip_reason(candidate=candidate_payload, record=record)
+    if raw in {"autoanswer_no_meaningful_conversation", "short_no_meaningful_conversation", "no_human_dialogue"}:
+        return raw
+    if raw in {"not_meaningful_conversation_case", "discipline_case_disabled", "skip_no_meaningful_case"}:
+        if non_meaningful_reason:
+            return non_meaningful_reason
+        return "no_human_dialogue"
+    if category == "transcript_not_ready":
+        if raw in {"empty_transcript_after_stt", "transcript_not_ready"}:
+            return raw
+        return "transcript_not_ready"
+    if raw in {"empty_transcript_after_stt", "transcript_not_ready"}:
+        return raw
     if category == "llm_timeout":
         return "llm_timeout"
     if category in {"validation_failed", "missing_required_stage_comment"}:
@@ -2623,6 +4105,176 @@ def _resolve_case_mode(*, candidate: dict[str, Any], record: dict[str, Any]) -> 
         "autoanswer_noise": "redial_discipline_analysis",
     }
     return mapping.get(case_type, "skip_no_meaningful_case")
+
+
+def _resolve_case_mode_for_output(
+    *,
+    case_mode_hint: str,
+    llm_fields: dict[str, Any],
+    candidate: dict[str, Any],
+    record: dict[str, Any],
+) -> tuple[str, str, str, list[str]]:
+    llm_primary_raw = _text(llm_fields.get("primary_case_type"))
+    llm_mode = _map_primary_case_type_to_case_mode(llm_primary_raw)
+    evidence: list[str] = []
+    if llm_primary_raw:
+        evidence.append(f"llm_primary_case_type={llm_primary_raw}")
+
+    if llm_mode:
+        return (
+            llm_mode,
+            "llm_transcript_with_metadata",
+            "primary_case_type_from_llm",
+            evidence,
+        )
+
+    stage_groups = _parse_stage_group_set(str(llm_fields.get("relevant_stage_groups") or ""))
+    if stage_groups:
+        inferred = _infer_case_mode_from_stage_groups(stage_groups)
+        if inferred:
+            evidence.append(f"llm_relevant_stage_groups={sorted(stage_groups)}")
+            return (
+                inferred,
+                "llm_transcript",
+                "relevant_stage_groups_from_llm",
+                evidence,
+            )
+
+    inferred_from_comments = _infer_case_mode_from_llm_stage_comments(llm_fields)
+    if inferred_from_comments:
+        evidence.append("llm_stage_comments_signal")
+        return (
+            inferred_from_comments,
+            "llm_transcript_with_metadata",
+            "stage_comments_signal_from_llm",
+            evidence,
+        )
+
+    # Explicit neutral fallback when LLM did not return valid type.
+    fallback_reason = "llm_primary_case_type_missing_or_invalid"
+    if case_mode_hint and case_mode_hint not in DISALLOWED_CASES_FOR_ACTIVE_WRITE:
+        evidence.append(f"case_mode_hint={case_mode_hint}")
+    if isinstance(candidate.get("evidence_used"), list):
+        evidence.extend(str(x).strip() for x in candidate.get("evidence_used", []) if str(x).strip())
+    if str(record.get("status_name") or "").strip():
+        evidence.append(f"status_name={str(record.get('status_name') or '').strip()}")
+    return (
+        "unknown_call_case",
+        "deterministic_fallback",
+        fallback_reason,
+        evidence[:12],
+    )
+
+
+def _map_primary_case_type_to_case_mode(raw_value: str) -> str:
+    text = " ".join(str(raw_value or "").strip().lower().split())
+    if not text:
+        return ""
+    mapping = {
+        "разговор с лпр": "negotiation_lpr_analysis",
+        "лпр": "negotiation_lpr_analysis",
+        "разговор с секретарем": "secretary_analysis",
+        "секретарь": "secretary_analysis",
+        "входящий от поставщика": "supplier_inbound_analysis",
+        "поставщик": "supplier_inbound_analysis",
+        "теплый входящий": "warm_inbound_analysis",
+        "теплый": "warm_inbound_analysis",
+        "презентация": "presentation_analysis",
+        "демо": "presentation_analysis",
+        "подтверждение презентации": "presentation_analysis",
+        "работа с тестом": "test_analysis",
+        "тест": "test_analysis",
+        "дожим": "dozhim_analysis",
+        "кп": "dozhim_analysis",
+        "недозвоны / дисциплина дозвонов": "redial_discipline_analysis",
+        "недозвоны": "redial_discipline_analysis",
+        "дисциплина дозвонов": "redial_discipline_analysis",
+        "неопределенный кейс по звонку": "unknown_call_case",
+        "unknown": "unknown_call_case",
+    }
+    if text in mapping:
+        return mapping[text]
+    if "секретар" in text:
+        return "secretary_analysis"
+    if "поставщик" in text:
+        return "supplier_inbound_analysis"
+    if "тепл" in text and "вход" in text:
+        return "warm_inbound_analysis"
+    if "презентац" in text or "демо" in text:
+        return "presentation_analysis"
+    if "тест" in text:
+        return "test_analysis"
+    if "дожим" in text or "кп" in text:
+        return "dozhim_analysis"
+    if "лпр" in text:
+        return "negotiation_lpr_analysis"
+    if "недозвон" in text or "дисциплин" in text:
+        return "redial_discipline_analysis"
+    if "неопредел" in text:
+        return "unknown_call_case"
+    return ""
+
+
+def _infer_case_mode_from_stage_groups(stage_groups: set[str]) -> str:
+    if "test" in stage_groups:
+        return "test_analysis"
+    if "demo" in stage_groups or "confirm_demo" in stage_groups:
+        return "presentation_analysis"
+    if "dozhim" in stage_groups:
+        return "dozhim_analysis"
+    if "secretary" in stage_groups:
+        return "secretary_analysis"
+    if "discipline" in stage_groups and len(stage_groups) <= 2:
+        return "redial_discipline_analysis"
+    if "lpr" in stage_groups or "need" in stage_groups:
+        return "negotiation_lpr_analysis"
+    return ""
+
+
+def _infer_case_mode_from_llm_stage_comments(llm_fields: dict[str, Any]) -> str:
+    def _has(*keys: str) -> bool:
+        for key in keys:
+            if _text(llm_fields.get(key)):
+                return True
+        return False
+
+    if _has(
+        "stage_test_launch_comment",
+        "stage_test_criteria_comment",
+        "stage_test_owners_comment",
+        "stage_test_support_comment",
+        "stage_test_feedback_comment",
+        "stage_test_objections_comment",
+        "stage_test_comment",
+    ):
+        return "test_analysis"
+    if _has(
+        "stage_demo_intro_comment",
+        "stage_demo_context_comment",
+        "stage_demo_relevant_comment",
+        "stage_demo_process_comment",
+        "stage_demo_objections_comment",
+        "stage_demo_next_step_comment",
+        "stage_demo_comment",
+        "stage_confirm_demo_comment",
+    ):
+        return "presentation_analysis"
+    if _has(
+        "stage_dozhim_recontact_comment",
+        "stage_dozhim_doubts_comment",
+        "stage_dozhim_terms_comment",
+        "stage_dozhim_decision_comment",
+        "stage_dozhim_flow_comment",
+        "stage_dozhim_comment",
+    ):
+        return "dozhim_analysis"
+    if _has("stage_secretary_comment") and not _has("stage_lpr_comment", "stage_need_comment"):
+        return "secretary_analysis"
+    if _has("stage_discipline_comment") and not _has("stage_lpr_comment", "stage_need_comment"):
+        return "redial_discipline_analysis"
+    if _has("stage_lpr_comment", "stage_need_comment", "stage_presentation_comment", "stage_closing_comment"):
+        return "negotiation_lpr_analysis"
+    return ""
 
 
 def _validate_llm_fields(*, case_mode: str, llm_fields: dict[str, Any]) -> str:
@@ -2687,6 +4339,21 @@ def _extract_calls(*, snapshot: dict[str, Any]) -> list[dict[str, Any]]:
     return [x for x in items if isinstance(x, dict)]
 
 
+def _build_transcript_text_by_call_id(*, snapshot: dict[str, Any]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    transcripts = snapshot.get("transcripts", []) if isinstance(snapshot.get("transcripts"), list) else []
+    for raw in transcripts:
+        if not isinstance(raw, dict):
+            continue
+        call_id = str(raw.get("call_id") or "").strip()
+        if not call_id:
+            continue
+        text = " ".join(str(raw.get("transcript_text") or "").split()).strip()
+        if text:
+            out[call_id] = text
+    return out
+
+
 def _load_snapshot(*, record: dict[str, Any]) -> dict[str, Any]:
     artifact_path = Path(str(record.get("artifact_path") or "").strip())
     if not artifact_path.exists():
@@ -2713,36 +4380,67 @@ def _selected_call_ids(*, candidate: dict[str, Any], record: dict[str, Any]) -> 
     return out
 
 
-def _select_anchor_call(*, calls: list[dict[str, Any]], selected_call_ids: set[str]) -> dict[str, Any] | None:
-    candidates = []
-    for call in calls:
-        if not isinstance(call, dict):
-            continue
+def _select_anchor_call(
+    *,
+    calls: list[dict[str, Any]],
+    selected_call_ids: set[str],
+    transcript_text_by_call_id: dict[str, str] | None = None,
+) -> dict[str, Any] | None:
+    transcript_map = transcript_text_by_call_id if isinstance(transcript_text_by_call_id, dict) else {}
+
+    def _eligible_selected(call: dict[str, Any]) -> bool:
+        if not selected_call_ids:
+            return True
         call_id = str(call.get("call_id") or "").strip()
-        if selected_call_ids and call_id and call_id not in selected_call_ids:
-            continue
+        if not call_id:
+            return True
+        return call_id in selected_call_ids
+
+    selected_candidates = [call for call in calls if isinstance(call, dict) and _eligible_selected(call)]
+    candidate_pool = selected_candidates if selected_candidates else [call for call in calls if isinstance(call, dict)]
+    if not candidate_pool:
+        return None
+
+    meaningful_selected = [
+        call
+        for call in selected_candidates
+        if not _call_is_noise(call, transcript_text=_transcript_text_for_call(call, transcript_map))
+    ]
+    if meaningful_selected:
+        candidate_pool = meaningful_selected
+    else:
+        meaningful_all = [
+            call
+            for call in calls
+            if isinstance(call, dict) and not _call_is_noise(call, transcript_text=_transcript_text_for_call(call, transcript_map))
+        ]
+        if meaningful_all:
+            candidate_pool = meaningful_all
+
+    ranked: list[tuple[int, datetime | None, dict[str, Any]]] = []
+    for call in candidate_pool:
         ts = _parse_ts(call.get("timestamp"))
         duration = int(call.get("duration_seconds", 0) or 0)
         score = duration
         if bool(str(call.get("recording_url") or "").strip()):
             score += 120
-        if not _call_is_noise(call):
+        if not _call_is_noise(call, transcript_text=_transcript_text_for_call(call, transcript_map)):
             score += 80
         if str(call.get("direction") or "").strip().lower() in {"outbound", "inbound"}:
             score += 10
         if ts is not None:
             score += 5
-        candidates.append((score, ts, call))
-    if not candidates:
+        ranked.append((score, ts, call))
+    if not ranked:
         return None
-    candidates.sort(
+    ranked.sort(
         key=lambda x: (
             -int(x[0]),
             str((x[1] or datetime(1970, 1, 1, tzinfo=timezone.utc)).isoformat()),
             str((x[2] or {}).get("call_id") or ""),
         )
     )
-    return candidates[0][2]
+    return ranked[0][2]
 
 
 def _select_related_calls(
@@ -2750,7 +4448,9 @@ def _select_related_calls(
     calls: list[dict[str, Any]],
     anchor_call: dict[str, Any],
     selected_call_ids: set[str],
+    transcript_text_by_call_id: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
+    transcript_map = transcript_text_by_call_id if isinstance(transcript_text_by_call_id, dict) else {}
     anchor_ts = _parse_ts(anchor_call.get("timestamp"))
     anchor_id = str(anchor_call.get("call_id") or "")
     out: list[dict[str, Any]] = [anchor_call]
@@ -2765,7 +4465,7 @@ def _select_related_calls(
         ts = _parse_ts(call.get("timestamp"))
         if anchor_ts is not None and ts is not None and ts > anchor_ts:
             continue
-        if _call_is_noise(call):
+        if _call_is_noise(call, transcript_text=_transcript_text_for_call(call, transcript_map)):
             continue
         out.append(call)
     out.sort(
@@ -2777,7 +4477,14 @@ def _select_related_calls(
     return out[:3]
 
 
-def _call_is_noise(call: dict[str, Any]) -> bool:
+def _transcript_text_for_call(call: dict[str, Any], transcript_text_by_call_id: dict[str, str]) -> str:
+    call_id = str(call.get("call_id") or "").strip()
+    if call_id:
+        return str(transcript_text_by_call_id.get(call_id) or "").strip()
+    return ""
+
+
+def _call_is_noise(call: dict[str, Any], *, transcript_text: str = "") -> bool:
     duration = int(call.get("duration_seconds", 0) or 0)
     if duration <= 20:
         return True
@@ -2795,7 +4502,31 @@ def _call_is_noise(call: dict[str, Any]) -> bool:
         "недозвон",
         "занято",
     )
-    return any(token in blob for token in noise_tokens)
+    status_noise_flag = any(token in blob for token in noise_tokens)
+
+    transcript = " ".join(str(transcript_text or "").split()).strip().lower()
+    if not transcript:
+        return bool(status_noise_flag)
+    noise_profile = _noise_dialogue_profile(
+        transcript_text=transcript,
+        transcript_chars=len(transcript),
+        call_duration_seconds=duration,
+    )
+    noise_classification = str(noise_profile.get("noise_classification") or "")
+    has_dialogue_markers = bool(noise_profile.get("has_dialogue_markers"))
+    if noise_classification == "ivr_then_human_dialogue":
+        return False
+    if status_noise_flag and not has_dialogue_markers:
+        return True
+    if noise_classification == "noise_only_autoanswer_or_ivr":
+        return True
+    if noise_classification == "initial_ivr_noise" and len(transcript) < 350 and duration <= 120:
+        return True
+    if transcript in {"алло", "алло алло", "алло?", "да", "слушаю"}:
+        return True
+    if transcript.startswith("алло") and len(transcript) < 60 and not has_dialogue_markers:
+        return True
+    return False
 
 
 def _choose_analysis_date(*, candidate: dict[str, Any], anchor_ts: datetime | None) -> str:
@@ -3055,15 +4786,15 @@ def _sanitize_user_text(
     )
     text = _apply_style_regex_replacement(
         text=text,
-        pattern=r'Лучше сказать:\s*"([^"]*)$',
-        repl=r'Лучше сказать: "\1"',
+        pattern=r'(?:Лучше сказать|Используй):\s*"([^"]*)$',
+        repl=r'Используй: "\1"',
         audit_key="close_better_phrase_quote",
         replacement_audit=replacement_audit,
         flags=re.IGNORECASE,
     )
     text = _apply_style_regex_replacement(
         text=text,
-        pattern=r"\bЛучше\s*$",
+        pattern=r"(?:\bЛучше\b|\bИспользуй\b)\s*$",
         repl="",
         audit_key="remove_trailing_luchshe_word",
         replacement_audit=replacement_audit,
@@ -3229,6 +4960,70 @@ def _collect_quote_usage_for_row(*, row: dict[str, Any]) -> dict[str, int]:
 def _join_non_empty(*parts: Any) -> str:
     out = [str(x).strip() for x in parts if str(x).strip()]
     return "; ".join(out)
+
+
+def _normalize_noise_text(value: str) -> str:
+    return " ".join(str(value or "").split()).strip().lower()
+
+
+def _noise_dialogue_profile(
+    *,
+    transcript_text: str,
+    transcript_chars: int,
+    call_duration_seconds: int,
+) -> dict[str, Any]:
+    text = _normalize_noise_text(transcript_text)
+    text_chars = max(int(transcript_chars or 0), len(text))
+    head = text[:900]
+    autoanswer_markers = tuple(AUTOANSWER_TRANSCRIPT_MARKERS)
+    ivr_markers = tuple(IVR_TRANSCRIPT_MARKERS)
+    dialogue_markers = tuple(dict.fromkeys((*DIALOGUE_TRANSCRIPT_MARKERS, *HUMAN_DIALOGUE_AFTER_NOISE_MARKERS)))
+    has_autoanswer_markers = any(token in text for token in autoanswer_markers)
+    has_ivr_markers = any(token in text for token in ivr_markers)
+    has_dialogue_markers = any(token in text for token in dialogue_markers)
+    initial_noise_detected = any(token in head for token in autoanswer_markers) or any(token in head for token in ivr_markers)
+    human_dialogue_after_noise_detected = False
+    if initial_noise_detected and text:
+        noise_tail_start = 0
+        for token in (*autoanswer_markers, *ivr_markers):
+            pos = head.find(token)
+            if pos >= 0:
+                noise_tail_start = max(noise_tail_start, pos + len(token))
+        tail = text[noise_tail_start:] if noise_tail_start > 0 else text
+        human_dialogue_after_noise_detected = any(token in tail for token in dialogue_markers)
+    if not human_dialogue_after_noise_detected:
+        human_dialogue_after_noise_detected = bool(
+            has_dialogue_markers and initial_noise_detected and (text_chars >= 1000 or int(call_duration_seconds or 0) >= 120)
+        )
+
+    if initial_noise_detected and human_dialogue_after_noise_detected:
+        noise_classification = "ivr_then_human_dialogue"
+    elif (has_autoanswer_markers or has_ivr_markers) and not has_dialogue_markers:
+        noise_classification = "noise_only_autoanswer_or_ivr"
+    elif initial_noise_detected:
+        noise_classification = "initial_ivr_noise"
+    elif has_dialogue_markers:
+        noise_classification = "human_dialogue"
+    else:
+        noise_classification = "no_noise_markers"
+
+    final_noise_decision = "allow"
+    if noise_classification == "noise_only_autoanswer_or_ivr":
+        final_noise_decision = "skip_noise_only"
+    elif noise_classification == "initial_ivr_noise" and text_chars < 400 and int(call_duration_seconds or 0) <= 120:
+        final_noise_decision = "skip_noise_only"
+    elif noise_classification == "ivr_then_human_dialogue":
+        final_noise_decision = "allow_after_ivr_human_dialogue"
+
+    return {
+        "has_autoanswer_markers": bool(has_autoanswer_markers),
+        "has_ivr_markers": bool(has_ivr_markers),
+        "has_dialogue_markers": bool(has_dialogue_markers),
+        "initial_noise_detected": bool(initial_noise_detected),
+        "human_dialogue_after_noise_detected": bool(human_dialogue_after_noise_detected),
+        "noise_classification": str(noise_classification),
+        "final_noise_decision": str(final_noise_decision),
+    }
 
 
 def _parse_ts(value: Any) -> datetime | None:

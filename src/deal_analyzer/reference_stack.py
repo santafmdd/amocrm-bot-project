@@ -17,6 +17,7 @@ def build_daily_reference_stack(
     cfg: DealAnalyzerConfig | None,
     factual_payload: dict[str, Any],
     logger: Any | None = None,
+    stack_label: str = "reference stack",
 ) -> dict[str, Any]:
     app = load_config()
     query = _build_reference_query(factual_payload=factual_payload, cfg=cfg)
@@ -71,8 +72,10 @@ def build_daily_reference_stack(
     }
 
     if logger is not None:
+        label = str(stack_label or "reference stack").strip() or "reference stack"
         logger.info(
-            "daily reference stack built: snippets=%s internal=%s role=%s product=%s external_used=%s",
+            "%s built: snippets=%s internal=%s role=%s product=%s external_used=%s",
+            label,
             len(prompt_snippets),
             required_layers["internal_references"]["ok"],
             required_layers["role_context"]["ok"],

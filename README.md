@@ -1,4 +1,4 @@
-## Analytics Runtime: Known Failure Classes
+﻿## Analytics Runtime: Known Failure Classes
 
 - `duplicate visible tags / different backend ids`:
   signals: `duplicate_tag_candidates_found=true`, `duplicate_tag_candidates=[...]`, `selected_tag_candidate_id`, `duplicate_retry_attempt`.
@@ -140,7 +140,7 @@ New pre-limit aggregates are also stored in `summary.json`:
 
 ## Update (2026-04-25): Call Review LLM Profiles
 
-- Stable call-review real-write profile uses `deepseek-v3.1:671b-cloud` as `ollama_model`.
+- Stable call-review real-write profile uses `qwen3.5:397b-cloud` as `ollama_model` (fallback: `deepseek-v3.1:671b-cloud`).
 - `gemma4:26b` is experimental and dry-run only:
   - config: `workspace/tmp_tests/deal_analyzer/deal_analyzer.llm_gemma4_26b_experimental.json`
   - `deal_analyzer_write_enabled=false`
@@ -232,154 +232,154 @@ Not production-ready yet:
 - log retention/cleanup
 
 
-Р­С‚РѕС‚ РїСЂРѕРµРєС‚ вЂ” Р±РµР·РѕРїР°СЃРЅС‹Р№ Р»РѕРєР°Р»СЊРЅС‹Р№ РєР°СЂРєР°СЃ РґР»СЏ РїРѕС€Р°РіРѕРІРѕР№ Р°РІС‚РѕРјР°С‚РёР·Р°С†РёРё РЅР° РґРѕРјР°С€РЅРµР№ Windows-РјР°С€РёРЅРµ.
-РўРµРєСѓС‰РёР№ С€Р°Рі РґРѕР±Р°РІР»СЏРµС‚ read-only MVP Р±СЂР°СѓР·РµСЂРЅРѕРіРѕ С‡С‚РµРЅРёСЏ Р°РЅР°Р»РёС‚РёРєРё amoCRM: СЃРєСЂРёРїС‚ РѕС‚РєСЂС‹РІР°РµС‚ РёРЅС‚РµСЂС„РµР№СЃ, С‡РёС‚Р°РµС‚ С‚РµРєСѓС‰РёРµ С†РёС„СЂС‹ Рё СЃРѕС…СЂР°РЅСЏРµС‚ СЂРµР·СѓР»СЊС‚Р°С‚ РІ `exports`.
+Р В­РЎвЂљР С•РЎвЂљ Р С—РЎР‚Р С•Р ВµР С”РЎвЂљ РІР‚вЂќ Р В±Р ВµР В·Р С•Р С—Р В°РЎРѓР Р…РЎвЂ№Р в„– Р В»Р С•Р С”Р В°Р В»РЎРЉР Р…РЎвЂ№Р в„– Р С”Р В°РЎР‚Р С”Р В°РЎРѓ Р Т‘Р В»РЎРЏ Р С—Р С•РЎв‚¬Р В°Р С–Р С•Р Р†Р С•Р в„– Р В°Р Р†РЎвЂљР С•Р СР В°РЎвЂљР С‘Р В·Р В°РЎвЂ Р С‘Р С‘ Р Р…Р В° Р Т‘Р С•Р СР В°РЎв‚¬Р Р…Р ВµР в„– Windows-Р СР В°РЎв‚¬Р С‘Р Р…Р Вµ.
+Р СћР ВµР С”РЎС“РЎвЂ°Р С‘Р в„– РЎв‚¬Р В°Р С– Р Т‘Р С•Р В±Р В°Р Р†Р В»РЎРЏР ВµРЎвЂљ read-only MVP Р В±РЎР‚Р В°РЎС“Р В·Р ВµРЎР‚Р Р…Р С•Р С–Р С• РЎвЂЎРЎвЂљР ВµР Р…Р С‘РЎРЏ Р В°Р Р…Р В°Р В»Р С‘РЎвЂљР С‘Р С”Р С‘ amoCRM: РЎРѓР С”РЎР‚Р С‘Р С—РЎвЂљ Р С•РЎвЂљР С”РЎР‚РЎвЂ№Р Р†Р В°Р ВµРЎвЂљ Р С‘Р Р…РЎвЂљР ВµРЎР‚РЎвЂћР ВµР в„–РЎРѓ, РЎвЂЎР С‘РЎвЂљР В°Р ВµРЎвЂљ РЎвЂљР ВµР С”РЎС“РЎвЂ°Р С‘Р Вµ РЎвЂ Р С‘РЎвЂћРЎР‚РЎвЂ№ Р С‘ РЎРѓР С•РЎвЂ¦РЎР‚Р В°Р Р…РЎРЏР ВµРЎвЂљ РЎР‚Р ВµР В·РЎС“Р В»РЎРЉРЎвЂљР В°РЎвЂљ Р Р† `exports`.
 
-## Р­С‚Р°РїС‹ СЂРµР°Р»РёР·Р°С†РёРё
+## Р В­РЎвЂљР В°Р С—РЎвЂ№ РЎР‚Р ВµР В°Р В»Р С‘Р В·Р В°РЎвЂ Р С‘Р С‘
 
-1. MVP Р·Р°РїРѕР»РЅРµРЅРёСЏ Р»РёСЃС‚Р° "РІРѕСЂРѕРЅРєР° РѕС‚РєР°Р·РѕРІ"
-2. Weekly summary РїРѕ РѕС‚РєР°Р·Р°Рј
-3. РђРЅР°Р»РёР· СЃРґРµР»РѕРє, Р·РІРѕРЅРєРѕРІ Рё РїСЂРµР·РµРЅС‚Р°С†РёР№
+1. MVP Р В·Р В°Р С—Р С•Р В»Р Р…Р ВµР Р…Р С‘РЎРЏ Р В»Р С‘РЎРѓРЎвЂљР В° "Р Р†Р С•РЎР‚Р С•Р Р…Р С”Р В° Р С•РЎвЂљР С”Р В°Р В·Р С•Р Р†"
+2. Weekly summary Р С—Р С• Р С•РЎвЂљР С”Р В°Р В·Р В°Р С
+3. Р С’Р Р…Р В°Р В»Р С‘Р В· РЎРѓР Т‘Р ВµР В»Р С•Р С”, Р В·Р Р†Р С•Р Р…Р С”Р С•Р Р† Р С‘ Р С—РЎР‚Р ВµР В·Р ВµР Р…РЎвЂљР В°РЎвЂ Р С‘Р в„–
 
-## Р§С‚Рѕ СѓР¶Рµ РµСЃС‚СЊ
+## Р В§РЎвЂљР С• РЎС“Р В¶Р Вµ Р ВµРЎРѓРЎвЂљРЎРЉ
 
-- РР·РѕР»РёСЂРѕРІР°РЅРЅР°СЏ СЃС‚СЂСѓРєС‚СѓСЂР° РґРёСЂРµРєС‚РѕСЂРёР№ РІРЅСѓС‚СЂРё `project`
-- Р‘Р°Р·РѕРІР°СЏ РєРѕРЅС„РёРіСѓСЂР°С†РёСЏ С‡РµСЂРµР· `.env`
-- РџСЂРѕРІРµСЂРєРё Р±РµР·РѕРїР°СЃРЅРѕСЃС‚Рё РїСѓС‚РµР№ (Р·Р°РїСЂРµС‚ РІС‹С…РѕРґР° Р·Р° РїСЂРµРґРµР»С‹ РїСЂРѕРµРєС‚Р°)
-- Р›РѕРіРёСЂРѕРІР°РЅРёРµ РІ РєРѕРЅСЃРѕР»СЊ Рё С„Р°Р№Р»
-- Browser read-only MVP РґР»СЏ amoCRM Р°РЅР°Р»РёС‚РёРєРё:
-  - Playwright-СЃРµСЃСЃРёСЏ СЃ `storage state`
-  - Р±РѕР»СЊС€РѕРµ РѕРєРЅРѕ Р±СЂР°СѓР·РµСЂР° РґР»СЏ СЃС‚Р°Р±РёР»СЊРЅРѕРіРѕ layout (`--start-maximized`, `no_viewport=True`)
-  - С‡С‚РµРЅРёРµ С‚РµРєСѓС‰РµРіРѕ СЌРєСЂР°РЅР° Р°РЅР°Р»РёС‚РёРєРё
-  - DOM-debug РґР°РјРїС‹ РґР»СЏ РїРѕРґР±РѕСЂР° СЃРµР»РµРєС‚РѕСЂРѕРІ
-  - СЃРєСЂРёРЅС€РѕС‚ + СЌРєСЃРїРѕСЂС‚ JSON/CSV РІ `exports`
-- РџРѕРґРіРѕС‚РѕРІРёС‚РµР»СЊРЅС‹Р№ config-driven СЃР»РѕР№:
+- Р ВР В·Р С•Р В»Р С‘РЎР‚Р С•Р Р†Р В°Р Р…Р Р…Р В°РЎРЏ РЎРѓРЎвЂљРЎР‚РЎС“Р С”РЎвЂљРЎС“РЎР‚Р В° Р Т‘Р С‘РЎР‚Р ВµР С”РЎвЂљР С•РЎР‚Р С‘Р в„– Р Р†Р Р…РЎС“РЎвЂљРЎР‚Р С‘ `project`
+- Р вЂР В°Р В·Р С•Р Р†Р В°РЎРЏ Р С”Р С•Р Р…РЎвЂћР С‘Р С–РЎС“РЎР‚Р В°РЎвЂ Р С‘РЎРЏ РЎвЂЎР ВµРЎР‚Р ВµР В· `.env`
+- Р СџРЎР‚Р С•Р Р†Р ВµРЎР‚Р С”Р С‘ Р В±Р ВµР В·Р С•Р С—Р В°РЎРѓР Р…Р С•РЎРѓРЎвЂљР С‘ Р С—РЎС“РЎвЂљР ВµР в„– (Р В·Р В°Р С—РЎР‚Р ВµРЎвЂљ Р Р†РЎвЂ№РЎвЂ¦Р С•Р Т‘Р В° Р В·Р В° Р С—РЎР‚Р ВµР Т‘Р ВµР В»РЎвЂ№ Р С—РЎР‚Р С•Р ВµР С”РЎвЂљР В°)
+- Р вЂєР С•Р С–Р С‘РЎР‚Р С•Р Р†Р В°Р Р…Р С‘Р Вµ Р Р† Р С”Р С•Р Р…РЎРѓР С•Р В»РЎРЉ Р С‘ РЎвЂћР В°Р в„–Р В»
+- Browser read-only MVP Р Т‘Р В»РЎРЏ amoCRM Р В°Р Р…Р В°Р В»Р С‘РЎвЂљР С‘Р С”Р С‘:
+  - Playwright-РЎРѓР ВµРЎРѓРЎРѓР С‘РЎРЏ РЎРѓ `storage state`
+  - Р В±Р С•Р В»РЎРЉРЎв‚¬Р С•Р Вµ Р С•Р С”Р Р…Р С• Р В±РЎР‚Р В°РЎС“Р В·Р ВµРЎР‚Р В° Р Т‘Р В»РЎРЏ РЎРѓРЎвЂљР В°Р В±Р С‘Р В»РЎРЉР Р…Р С•Р С–Р С• layout (`--start-maximized`, `no_viewport=True`)
+  - РЎвЂЎРЎвЂљР ВµР Р…Р С‘Р Вµ РЎвЂљР ВµР С”РЎС“РЎвЂ°Р ВµР С–Р С• РЎРЊР С”РЎР‚Р В°Р Р…Р В° Р В°Р Р…Р В°Р В»Р С‘РЎвЂљР С‘Р С”Р С‘
+  - DOM-debug Р Т‘Р В°Р СР С—РЎвЂ№ Р Т‘Р В»РЎРЏ Р С—Р С•Р Т‘Р В±Р С•РЎР‚Р В° РЎРѓР ВµР В»Р ВµР С”РЎвЂљР С•РЎР‚Р С•Р Р†
+  - РЎРѓР С”РЎР‚Р С‘Р Р…РЎв‚¬Р С•РЎвЂљ + РЎРЊР С”РЎРѓР С—Р С•РЎР‚РЎвЂљ JSON/CSV Р Р† `exports`
+- Р СџР С•Р Т‘Р С–Р С•РЎвЂљР С•Р Р†Р С‘РЎвЂљР ВµР В»РЎРЉР Р…РЎвЂ№Р в„– config-driven РЎРѓР В»Р С•Р в„–:
   - `config/page_profiles.yaml`
   - `config/report_profiles.yaml`
   - `config/table_mappings.yaml`
   - `src/config_loader.py`
-- РџРѕСЃС‚РѕСЏРЅРЅС‹Рµ РїСЂР°РІРёР»Р° Р°РіРµРЅС‚РЅРѕР№ СЂР°Р·СЂР°Р±РѕС‚РєРё РІ `AGENTS.md`
+- Р СџР С•РЎРѓРЎвЂљР С•РЎРЏР Р…Р Р…РЎвЂ№Р Вµ Р С—РЎР‚Р В°Р Р†Р С‘Р В»Р В° Р В°Р С–Р ВµР Р…РЎвЂљР Р…Р С•Р в„– РЎР‚Р В°Р В·РЎР‚Р В°Р В±Р С•РЎвЂљР С”Р С‘ Р Р† `AGENTS.md`
 
-## РЈСЃС‚Р°РЅРѕРІРєР°
+## Р Р€РЎРѓРЎвЂљР В°Р Р…Р С•Р Р†Р С”Р В°
 
-1. РЈСЃС‚Р°РЅРѕРІРёС‚СЊ Python 3.11+.
-2. РЎРѕР·РґР°С‚СЊ Рё Р°РєС‚РёРІРёСЂРѕРІР°С‚СЊ РІРёСЂС‚СѓР°Р»СЊРЅРѕРµ РѕРєСЂСѓР¶РµРЅРёРµ.
-3. РЈСЃС‚Р°РЅРѕРІРёС‚СЊ Р·Р°РІРёСЃРёРјРѕСЃС‚Рё:
+1. Р Р€РЎРѓРЎвЂљР В°Р Р…Р С•Р Р†Р С‘РЎвЂљРЎРЉ Python 3.11+.
+2. Р РЋР С•Р В·Р Т‘Р В°РЎвЂљРЎРЉ Р С‘ Р В°Р С”РЎвЂљР С‘Р Р†Р С‘РЎР‚Р С•Р Р†Р В°РЎвЂљРЎРЉ Р Р†Р С‘РЎР‚РЎвЂљРЎС“Р В°Р В»РЎРЉР Р…Р С•Р Вµ Р С•Р С”РЎР‚РЎС“Р В¶Р ВµР Р…Р С‘Р Вµ.
+3. Р Р€РЎРѓРЎвЂљР В°Р Р…Р С•Р Р†Р С‘РЎвЂљРЎРЉ Р В·Р В°Р Р†Р С‘РЎРѓР С‘Р СР С•РЎРѓРЎвЂљР С‘:
    `pip install -r requirements.txt`
-4. РЈСЃС‚Р°РЅРѕРІРёС‚СЊ Р±СЂР°СѓР·РµСЂ РґР»СЏ Playwright:
+4. Р Р€РЎРѓРЎвЂљР В°Р Р…Р С•Р Р†Р С‘РЎвЂљРЎРЉ Р В±РЎР‚Р В°РЎС“Р В·Р ВµРЎР‚ Р Т‘Р В»РЎРЏ Playwright:
    `python -m playwright install chromium`
-5. РЎРєРѕРїРёСЂРѕРІР°С‚СЊ `.env.example` РІ `.env` Рё Р·Р°РїРѕР»РЅРёС‚СЊ Р·РЅР°С‡РµРЅРёСЏ, РѕСЃРѕР±РµРЅРЅРѕ:
+5. Р РЋР С”Р С•Р С—Р С‘РЎР‚Р С•Р Р†Р В°РЎвЂљРЎРЉ `.env.example` Р Р† `.env` Р С‘ Р В·Р В°Р С—Р С•Р В»Р Р…Р С‘РЎвЂљРЎРЉ Р В·Р Р…Р В°РЎвЂЎР ВµР Р…Р С‘РЎРЏ, Р С•РЎРѓР С•Р В±Р ВµР Р…Р Р…Р С•:
    - `AMO_BASE_URL`
    - `AMO_ANALYTICS_URL`
-   - `AMO_VIEWPORT_WIDTH` / `AMO_VIEWPORT_HEIGHT` (РґР»СЏ headless СЂРµР¶РёРјР°)
+   - `AMO_VIEWPORT_WIDTH` / `AMO_VIEWPORT_HEIGHT` (Р Т‘Р В»РЎРЏ headless РЎР‚Р ВµР В¶Р С‘Р СР В°)
 
-## РџРµСЂРІС‹Р№ СЂСѓС‡РЅРѕР№ Р·Р°РїСѓСЃРє
+## Р СџР ВµРЎР‚Р Р†РЎвЂ№Р в„– РЎР‚РЎС“РЎвЂЎР Р…Р С•Р в„– Р В·Р В°Р С—РЎС“РЎРѓР С”
 
-1. Р’ `.env` РїРѕСЃС‚Р°РІРёС‚СЊ `AMO_HEADLESS=false`.
-2. Р—Р°РїСѓСЃС‚РёС‚СЊ reader СЃ СЂСѓС‡РЅРѕР№ РїР°СѓР·РѕР№:
+1. Р вЂ™ `.env` Р С—Р С•РЎРѓРЎвЂљР В°Р Р†Р С‘РЎвЂљРЎРЉ `AMO_HEADLESS=false`.
+2. Р вЂ”Р В°Р С—РЎС“РЎРѓРЎвЂљР С‘РЎвЂљРЎРЉ reader РЎРѓ РЎР‚РЎС“РЎвЂЎР Р…Р С•Р в„– Р С—Р В°РЎС“Р В·Р С•Р в„–:
    `python -m src.run_read_analytics --source-kind tag --filter-id manual --tab-mode all --wait-for-enter`
-3. Р’ РѕРєРЅРµ Р±СЂР°СѓР·РµСЂР° РїСЂРё РЅРµРѕР±С…РѕРґРёРјРѕСЃС‚Рё РІРѕР№С‚Рё РІ amoCRM.
-4. РћС‚РєСЂС‹С‚СЊ РЅСѓР¶РЅС‹Р№ СЌРєСЂР°РЅ Р°РЅР°Р»РёС‚РёРєРё.
-5. Р’С‹СЃС‚Р°РІРёС‚СЊ С„РёР»СЊС‚СЂС‹ Рё РІРєР»Р°РґРєСѓ РІСЂСѓС‡РЅСѓСЋ.
-6. Р’РµСЂРЅСѓС‚СЊСЃСЏ РІ С‚РµСЂРјРёРЅР°Р» Рё РЅР°Р¶Р°С‚СЊ Enter.
-7. Reader СЃС‡РёС‚Р°РµС‚ С‚РµРєСѓС‰РёР№ СЌРєСЂР°РЅ Рё СЃРѕС…СЂР°РЅРёС‚ screenshot + JSON/CSV.
+3. Р вЂ™ Р С•Р С”Р Р…Р Вµ Р В±РЎР‚Р В°РЎС“Р В·Р ВµРЎР‚Р В° Р С—РЎР‚Р С‘ Р Р…Р ВµР С•Р В±РЎвЂ¦Р С•Р Т‘Р С‘Р СР С•РЎРѓРЎвЂљР С‘ Р Р†Р С•Р в„–РЎвЂљР С‘ Р Р† amoCRM.
+4. Р С›РЎвЂљР С”РЎР‚РЎвЂ№РЎвЂљРЎРЉ Р Р…РЎС“Р В¶Р Р…РЎвЂ№Р в„– РЎРЊР С”РЎР‚Р В°Р Р… Р В°Р Р…Р В°Р В»Р С‘РЎвЂљР С‘Р С”Р С‘.
+5. Р вЂ™РЎвЂ№РЎРѓРЎвЂљР В°Р Р†Р С‘РЎвЂљРЎРЉ РЎвЂћР С‘Р В»РЎРЉРЎвЂљРЎР‚РЎвЂ№ Р С‘ Р Р†Р С”Р В»Р В°Р Т‘Р С”РЎС“ Р Р†РЎР‚РЎС“РЎвЂЎР Р…РЎС“РЎР‹.
+6. Р вЂ™Р ВµРЎР‚Р Р…РЎС“РЎвЂљРЎРЉРЎРѓРЎРЏ Р Р† РЎвЂљР ВµРЎР‚Р СР С‘Р Р…Р В°Р В» Р С‘ Р Р…Р В°Р В¶Р В°РЎвЂљРЎРЉ Enter.
+7. Reader РЎРѓРЎвЂЎР С‘РЎвЂљР В°Р ВµРЎвЂљ РЎвЂљР ВµР С”РЎС“РЎвЂ°Р С‘Р в„– РЎРЊР С”РЎР‚Р В°Р Р… Р С‘ РЎРѓР С•РЎвЂ¦РЎР‚Р В°Р Р…Р С‘РЎвЂљ screenshot + JSON/CSV.
 
-## Р СѓС‡РЅРѕР№ Р»РѕРіРёРЅ Рё СЂСѓС‡РЅР°СЏ РїРѕРґРіРѕС‚РѕРІРєР° СЌРєСЂР°РЅР°
+## Р В РЎС“РЎвЂЎР Р…Р С•Р в„– Р В»Р С•Р С–Р С‘Р Р… Р С‘ РЎР‚РЎС“РЎвЂЎР Р…Р В°РЎРЏ Р С—Р С•Р Т‘Р С–Р С•РЎвЂљР С•Р Р†Р С”Р В° РЎРЊР С”РЎР‚Р В°Р Р…Р В°
 
-Р•СЃР»Рё РЅРµ С…РѕС‚РёС‚Рµ, С‡С‚РѕР±С‹ СЃРєСЂРёРїС‚ Р°РІС‚РѕРјР°С‚РёС‡РµСЃРєРё РѕС‚РєСЂС‹РІР°Р» `AMO_ANALYTICS_URL`, РёСЃРїРѕР»СЊР·СѓР№С‚Рµ `--skip-open`:
+Р вЂўРЎРѓР В»Р С‘ Р Р…Р Вµ РЎвЂ¦Р С•РЎвЂљР С‘РЎвЂљР Вµ, РЎвЂЎРЎвЂљР С•Р В±РЎвЂ№ РЎРѓР С”РЎР‚Р С‘Р С—РЎвЂљ Р В°Р Р†РЎвЂљР С•Р СР В°РЎвЂљР С‘РЎвЂЎР ВµРЎРѓР С”Р С‘ Р С•РЎвЂљР С”РЎР‚РЎвЂ№Р Р†Р В°Р В» `AMO_ANALYTICS_URL`, Р С‘РЎРѓР С—Р С•Р В»РЎРЉР В·РЎС“Р в„–РЎвЂљР Вµ `--skip-open`:
 
 `python -m src.run_read_analytics --source-kind tag --filter-id manual --tab-mode all --skip-open --wait-for-enter`
 
-## Р РµРєРѕРјРµРЅРґСѓРµРјС‹Р№ РїСЂР°РєС‚РёС‡РµСЃРєРёР№ СЂРµР¶РёРј (manual all-tab-modes)
+## Р В Р ВµР С”Р С•Р СР ВµР Р…Р Т‘РЎС“Р ВµР СРЎвЂ№Р в„– Р С—РЎР‚Р В°Р С”РЎвЂљР С‘РЎвЂЎР ВµРЎРѓР С”Р С‘Р в„– РЎР‚Р ВµР В¶Р С‘Р С (manual all-tab-modes)
 
-Р”Р»СЏ Р±Р»РёР¶Р°Р№С€РµР№ СЃС‚Р°Р±РёР»СЊРЅРѕР№ СЂР°Р±РѕС‚С‹ РёСЃРїРѕР»СЊР·СѓР№С‚Рµ РїРѕР»СѓР°РІС‚РѕРјР°С‚РёС‡РµСЃРєРёР№ СЂРµР¶РёРј:
+Р вЂќР В»РЎРЏ Р В±Р В»Р С‘Р В¶Р В°Р в„–РЎв‚¬Р ВµР в„– РЎРѓРЎвЂљР В°Р В±Р С‘Р В»РЎРЉР Р…Р С•Р в„– РЎР‚Р В°Р В±Р С•РЎвЂљРЎвЂ№ Р С‘РЎРѓР С—Р С•Р В»РЎРЉР В·РЎС“Р в„–РЎвЂљР Вµ Р С—Р С•Р В»РЎС“Р В°Р Р†РЎвЂљР С•Р СР В°РЎвЂљР С‘РЎвЂЎР ВµРЎРѓР С”Р С‘Р в„– РЎР‚Р ВµР В¶Р С‘Р С:
 
 `python -m src.run_read_analytics --source-kind tag --filter-id manual --skip-open --wait-for-enter --all-tab-modes-manual`
 
-РљР°Рє СЌС‚Рѕ СЂР°Р±РѕС‚Р°РµС‚:
+Р С™Р В°Р С” РЎРЊРЎвЂљР С• РЎР‚Р В°Р В±Р С•РЎвЂљР В°Р ВµРЎвЂљ:
 
-- РїРѕСЃР»Рµ РїРµСЂРІРѕРіРѕ Enter reader С‡РёС‚Р°РµС‚ С‚РµРєСѓС‰РёР№ СЌРєСЂР°РЅ РєР°Рє `all` Рё СЃСЂР°Р·Сѓ СЃРѕС…СЂР°РЅСЏРµС‚ export;
-- Р·Р°С‚РµРј РїСЂРѕСЃРёС‚ РІСЂСѓС‡РЅСѓСЋ РїРµСЂРµРєР»СЋС‡РёС‚СЊ РІРєР»Р°РґРєСѓ РЅР° `РђРљРўРР’РќР«Р•` Рё РЅР°Р¶Р°С‚СЊ Enter;
-- С‡РёС‚Р°РµС‚ `active` Рё СЃСЂР°Р·Сѓ СЃРѕС…СЂР°РЅСЏРµС‚ export;
-- Р·Р°С‚РµРј РїСЂРѕСЃРёС‚ РІСЂСѓС‡РЅСѓСЋ РїРµСЂРµРєР»СЋС‡РёС‚СЊ РІРєР»Р°РґРєСѓ РЅР° `Р—РђРљР Р«РўР«Р•` Рё РЅР°Р¶Р°С‚СЊ Enter;
-- С‡РёС‚Р°РµС‚ `closed` Рё СЃСЂР°Р·Сѓ СЃРѕС…СЂР°РЅСЏРµС‚ export.
+- Р С—Р С•РЎРѓР В»Р Вµ Р С—Р ВµРЎР‚Р Р†Р С•Р С–Р С• Enter reader РЎвЂЎР С‘РЎвЂљР В°Р ВµРЎвЂљ РЎвЂљР ВµР С”РЎС“РЎвЂ°Р С‘Р в„– РЎРЊР С”РЎР‚Р В°Р Р… Р С”Р В°Р С” `all` Р С‘ РЎРѓРЎР‚Р В°Р В·РЎС“ РЎРѓР С•РЎвЂ¦РЎР‚Р В°Р Р…РЎРЏР ВµРЎвЂљ export;
+- Р В·Р В°РЎвЂљР ВµР С Р С—РЎР‚Р С•РЎРѓР С‘РЎвЂљ Р Р†РЎР‚РЎС“РЎвЂЎР Р…РЎС“РЎР‹ Р С—Р ВµРЎР‚Р ВµР С”Р В»РЎР‹РЎвЂЎР С‘РЎвЂљРЎРЉ Р Р†Р С”Р В»Р В°Р Т‘Р С”РЎС“ Р Р…Р В° `Р С’Р С™Р СћР ВР вЂ™Р СњР В«Р вЂў` Р С‘ Р Р…Р В°Р В¶Р В°РЎвЂљРЎРЉ Enter;
+- РЎвЂЎР С‘РЎвЂљР В°Р ВµРЎвЂљ `active` Р С‘ РЎРѓРЎР‚Р В°Р В·РЎС“ РЎРѓР С•РЎвЂ¦РЎР‚Р В°Р Р…РЎРЏР ВµРЎвЂљ export;
+- Р В·Р В°РЎвЂљР ВµР С Р С—РЎР‚Р С•РЎРѓР С‘РЎвЂљ Р Р†РЎР‚РЎС“РЎвЂЎР Р…РЎС“РЎР‹ Р С—Р ВµРЎР‚Р ВµР С”Р В»РЎР‹РЎвЂЎР С‘РЎвЂљРЎРЉ Р Р†Р С”Р В»Р В°Р Т‘Р С”РЎС“ Р Р…Р В° `Р вЂ”Р С’Р С™Р В Р В«Р СћР В«Р вЂў` Р С‘ Р Р…Р В°Р В¶Р В°РЎвЂљРЎРЉ Enter;
+- РЎвЂЎР С‘РЎвЂљР В°Р ВµРЎвЂљ `closed` Р С‘ РЎРѓРЎР‚Р В°Р В·РЎС“ РЎРѓР С•РЎвЂ¦РЎР‚Р В°Р Р…РЎРЏР ВµРЎвЂљ export.
 
-Р’ СЌС‚РѕРј СЂРµР¶РёРјРµ РЅРµС‚ Р°РІС‚РѕРєР»РёРєРѕРІ РїРѕ РІРєР»Р°РґРєР°Рј, РїРѕСЌС‚РѕРјСѓ РѕРЅ РЅР°РґРµР¶РЅРµРµ РєР°Рє workaround, РїРѕРєР° auto-switching РµС‰Рµ РґРѕСЂР°Р±Р°С‚С‹РІР°РµС‚СЃСЏ.
+Р вЂ™ РЎРЊРЎвЂљР С•Р С РЎР‚Р ВµР В¶Р С‘Р СР Вµ Р Р…Р ВµРЎвЂљ Р В°Р Р†РЎвЂљР С•Р С”Р В»Р С‘Р С”Р С•Р Р† Р С—Р С• Р Р†Р С”Р В»Р В°Р Т‘Р С”Р В°Р С, Р С—Р С•РЎРЊРЎвЂљР С•Р СРЎС“ Р С•Р Р… Р Р…Р В°Р Т‘Р ВµР В¶Р Р…Р ВµР Вµ Р С”Р В°Р С” workaround, Р С—Р С•Р С”Р В° auto-switching Р ВµРЎвЂ°Р Вµ Р Т‘Р С•РЎР‚Р В°Р В±Р В°РЎвЂљРЎвЂ№Р Р†Р В°Р ВµРЎвЂљРЎРѓРЎРЏ.
 
-## Profile-driven analytics flow (РЅРѕРІС‹Р№ С€Р°Рі)
+## Profile-driven analytics flow (Р Р…Р С•Р Р†РЎвЂ№Р в„– РЎв‚¬Р В°Р С–)
 
-Р”РѕР±Р°РІР»РµРЅ РїРµСЂРІС‹Р№ profile-driven СЂРµР¶РёРј:
+Р вЂќР С•Р В±Р В°Р Р†Р В»Р ВµР Р… Р С—Р ВµРЎР‚Р Р†РЎвЂ№Р в„– profile-driven РЎР‚Р ВµР В¶Р С‘Р С:
 
 `python -m src.run_profile_analytics --report-id analytics_tag_single_example`
 
-Р§С‚Рѕ РґРµР»Р°РµС‚ СЂРµР¶РёРј:
+Р В§РЎвЂљР С• Р Т‘Р ВµР В»Р В°Р ВµРЎвЂљ РЎР‚Р ВµР В¶Р С‘Р С:
 
-- Р·Р°РіСЂСѓР¶Р°РµС‚ report profile РёР· `config/report_profiles.yaml`;
-- РѕС‚РєСЂС‹РІР°РµС‚ `analytics_sales` СЌРєСЂР°РЅ;
-- РїС‹С‚Р°РµС‚СЃСЏ РѕС‚РєСЂС‹С‚СЊ С„РёР»СЊС‚СЂ Рё РІС‹СЃС‚Р°РІРёС‚СЊ `filter_source` (`tag` РёР»Рё `utm_source`) + `filter_values`;
-- РЅР°Р¶РёРјР°РµС‚ `РџСЂРёРјРµРЅРёС‚СЊ`;
-- Р·Р°РїСѓСЃРєР°РµС‚ capture РІРєР»Р°РґРѕРє РїРѕ URL `deals_type=all/active/closed`;
-- СЃРѕС…СЂР°РЅСЏРµС‚ JSON/CSV РїРѕ РєР°Р¶РґРѕР№ РІРєР»Р°РґРєРµ.
+- Р В·Р В°Р С–РЎР‚РЎС“Р В¶Р В°Р ВµРЎвЂљ report profile Р С‘Р В· `config/report_profiles.yaml`;
+- Р С•РЎвЂљР С”РЎР‚РЎвЂ№Р Р†Р В°Р ВµРЎвЂљ `analytics_sales` РЎРЊР С”РЎР‚Р В°Р Р…;
+- Р С—РЎвЂ№РЎвЂљР В°Р ВµРЎвЂљРЎРѓРЎРЏ Р С•РЎвЂљР С”РЎР‚РЎвЂ№РЎвЂљРЎРЉ РЎвЂћР С‘Р В»РЎРЉРЎвЂљРЎР‚ Р С‘ Р Р†РЎвЂ№РЎРѓРЎвЂљР В°Р Р†Р С‘РЎвЂљРЎРЉ `filter_source` (`tag` Р С‘Р В»Р С‘ `utm_source`) + `filter_values`;
+- Р Р…Р В°Р В¶Р С‘Р СР В°Р ВµРЎвЂљ `Р СџРЎР‚Р С‘Р СР ВµР Р…Р С‘РЎвЂљРЎРЉ`;
+- Р В·Р В°Р С—РЎС“РЎРѓР С”Р В°Р ВµРЎвЂљ capture Р Р†Р С”Р В»Р В°Р Т‘Р С•Р С” Р С—Р С• URL `deals_type=all/active/closed`;
+- РЎРѓР С•РЎвЂ¦РЎР‚Р В°Р Р…РЎРЏР ВµРЎвЂљ JSON/CSV Р С—Р С• Р С”Р В°Р В¶Р Т‘Р С•Р в„– Р Р†Р С”Р В»Р В°Р Т‘Р С”Р Вµ.
 
-РќР° СЌС‚РѕРј СЌС‚Р°РїРµ СЌС‚Рѕ РїРµСЂРІС‹Р№ С€Р°Рі Рє РїРѕР»РЅРѕРјСѓ automation flow: `profile -> filter -> all/active/closed capture`.
-Р•СЃР»Рё automation С„РёР»СЊС‚СЂР° РЅРµ СЃСЂР°Р±РѕС‚Р°Р» РёР·-Р·Р° СЃРµР»РµРєС‚РѕСЂРѕРІ, СЃРјРѕС‚СЂРёС‚Рµ debug screenshots РІ `workspace/screenshots` Рё debug dumps РїР°РЅРµР»Рё С„РёР»СЊС‚СЂР° РІ `exports/debug/` (`*_filter_panel_visible_text_*.txt`, `*_filter_panel_selectors_*.json`).
+Р СњР В° РЎРЊРЎвЂљР С•Р С РЎРЊРЎвЂљР В°Р С—Р Вµ РЎРЊРЎвЂљР С• Р С—Р ВµРЎР‚Р Р†РЎвЂ№Р в„– РЎв‚¬Р В°Р С– Р С” Р С—Р С•Р В»Р Р…Р С•Р СРЎС“ automation flow: `profile -> filter -> all/active/closed capture`.
+Р вЂўРЎРѓР В»Р С‘ automation РЎвЂћР С‘Р В»РЎРЉРЎвЂљРЎР‚Р В° Р Р…Р Вµ РЎРѓРЎР‚Р В°Р В±Р С•РЎвЂљР В°Р В» Р С‘Р В·-Р В·Р В° РЎРѓР ВµР В»Р ВµР С”РЎвЂљР С•РЎР‚Р С•Р Р†, РЎРѓР СР С•РЎвЂљРЎР‚Р С‘РЎвЂљР Вµ debug screenshots Р Р† `workspace/screenshots` Р С‘ debug dumps Р С—Р В°Р Р…Р ВµР В»Р С‘ РЎвЂћР С‘Р В»РЎРЉРЎвЂљРЎР‚Р В° Р Р† `exports/debug/` (`*_filter_panel_visible_text_*.txt`, `*_filter_panel_selectors_*.json`).
 
-Р”РѕРїРѕР»РЅРёС‚РµР»СЊРЅРѕ РІРєР»СЋС‡РµРЅ scroll-debug РїР°РЅРµР»Рё С„РёР»СЊС‚СЂР°: СЃРѕР·РґР°СЋС‚СЃСЏ РїРѕС€Р°РіРѕРІС‹Рµ С„Р°Р№Р»С‹ `*_filter_panel_scroll_step_XX.txt` Рё РѕР±СЉРµРґРёРЅРµРЅРЅС‹Р№ `*_filter_panel_scroll_merged.txt`, С‡С‚РѕР±С‹ СѓРІРёРґРµС‚СЊ РїРѕР»РЅС‹Р№ СЃРїРёСЃРѕРє С„РёР»СЊС‚СЂРѕРІ РїРѕСЃР»Рµ РїСЂРѕРєСЂСѓС‚РєРё.
-## Compile РІРµСЂС…РЅРµРіРѕ Р±Р»РѕРєР° (РїРµСЂРІС‹Р№ writer С€Р°Рі)
+Р вЂќР С•Р С—Р С•Р В»Р Р…Р С‘РЎвЂљР ВµР В»РЎРЉР Р…Р С• Р Р†Р С”Р В»РЎР‹РЎвЂЎР ВµР Р… scroll-debug Р С—Р В°Р Р…Р ВµР В»Р С‘ РЎвЂћР С‘Р В»РЎРЉРЎвЂљРЎР‚Р В°: РЎРѓР С•Р В·Р Т‘Р В°РЎР‹РЎвЂљРЎРѓРЎРЏ Р С—Р С•РЎв‚¬Р В°Р С–Р С•Р Р†РЎвЂ№Р Вµ РЎвЂћР В°Р в„–Р В»РЎвЂ№ `*_filter_panel_scroll_step_XX.txt` Р С‘ Р С•Р В±РЎР‰Р ВµР Т‘Р С‘Р Р…Р ВµР Р…Р Р…РЎвЂ№Р в„– `*_filter_panel_scroll_merged.txt`, РЎвЂЎРЎвЂљР С•Р В±РЎвЂ№ РЎС“Р Р†Р С‘Р Т‘Р ВµРЎвЂљРЎРЉ Р С—Р С•Р В»Р Р…РЎвЂ№Р в„– РЎРѓР С—Р С‘РЎРѓР С•Р С” РЎвЂћР С‘Р В»РЎРЉРЎвЂљРЎР‚Р С•Р Р† Р С—Р С•РЎРѓР В»Р Вµ Р С—РЎР‚Р С•Р С”РЎР‚РЎС“РЎвЂљР С”Р С‘.
+## Compile Р Р†Р ВµРЎР‚РЎвЂ¦Р Р…Р ВµР С–Р С• Р В±Р В»Р С•Р С”Р В° (Р С—Р ВµРЎР‚Р Р†РЎвЂ№Р в„– writer РЎв‚¬Р В°Р С–)
 
-РџРѕСЃР»Рµ СЃР±РѕСЂР° С‚СЂРµС… JSON (`all/active/closed`) РјРѕР¶РЅРѕ СЃРѕР±СЂР°С‚СЊ РіРѕС‚РѕРІС‹Р№ compiled CSV РґР»СЏ РІРµСЂС…РЅРµРіРѕ Р±Р»РѕРєР°:
+Р СџР С•РЎРѓР В»Р Вµ РЎРѓР В±Р С•РЎР‚Р В° РЎвЂљРЎР‚Р ВµРЎвЂ¦ JSON (`all/active/closed`) Р СР С•Р В¶Р Р…Р С• РЎРѓР С•Р В±РЎР‚Р В°РЎвЂљРЎРЉ Р С–Р С•РЎвЂљР С•Р Р†РЎвЂ№Р в„– compiled CSV Р Т‘Р В»РЎРЏ Р Р†Р ВµРЎР‚РЎвЂ¦Р Р…Р ВµР С–Р С• Р В±Р В»Р С•Р С”Р В°:
 
 `python -m src.run_compile_top_block`
 
-Р§С‚Рѕ РґРµР»Р°РµС‚ СЌС‚РѕС‚ С€Р°Рі:
+Р В§РЎвЂљР С• Р Т‘Р ВµР В»Р В°Р ВµРЎвЂљ РЎРЊРЎвЂљР С•РЎвЂљ РЎв‚¬Р В°Р С–:
 
-- С‡РёС‚Р°РµС‚ snapshot JSON РґР»СЏ `all`, `active`, `closed` (Р°РІС‚РѕРјР°С‚РёС‡РµСЃРєРё Р±РµСЂРµС‚ РїРѕСЃР»РµРґРЅРёРµ РёР· `exports/`);
-- РёСЃРїРѕР»СЊР·СѓРµС‚ `top_cards` РєР°Рє РѕСЃРЅРѕРІРЅРѕР№ РёСЃС‚РѕС‡РЅРёРє;
-- С„РѕСЂРјРёСЂСѓРµС‚ РїР»РѕСЃРєРёР№ CSV РІ `exports/compiled/`:
+- РЎвЂЎР С‘РЎвЂљР В°Р ВµРЎвЂљ snapshot JSON Р Т‘Р В»РЎРЏ `all`, `active`, `closed` (Р В°Р Р†РЎвЂљР С•Р СР В°РЎвЂљР С‘РЎвЂЎР ВµРЎРѓР С”Р С‘ Р В±Р ВµРЎР‚Р ВµРЎвЂљ Р С—Р С•РЎРѓР В»Р ВµР Т‘Р Р…Р С‘Р Вµ Р С‘Р В· `exports/`);
+- Р С‘РЎРѓР С—Р С•Р В»РЎРЉР В·РЎС“Р ВµРЎвЂљ `top_cards` Р С”Р В°Р С” Р С•РЎРѓР Р…Р С•Р Р†Р Р…Р С•Р в„– Р С‘РЎРѓРЎвЂљР С•РЎвЂЎР Р…Р С‘Р С”;
+- РЎвЂћР С•РЎР‚Р СР С‘РЎР‚РЎС“Р ВµРЎвЂљ Р С—Р В»Р С•РЎРѓР С”Р С‘Р в„– CSV Р Р† `exports/compiled/`:
   - `stage_name`
   - `all_count`
   - `active_count`
   - `closed_count`
-- РµСЃР»Рё СЌС‚Р°Рї РѕС‚СЃСѓС‚СЃС‚РІСѓРµС‚ РІ РѕРґРЅРѕР№ РёР· РІРєР»Р°РґРѕРє, СЃС‚Р°РІРёС‚ `0`.
+- Р ВµРЎРѓР В»Р С‘ РЎРЊРЎвЂљР В°Р С— Р С•РЎвЂљРЎРѓРЎС“РЎвЂљРЎРѓРЎвЂљР Р†РЎС“Р ВµРЎвЂљ Р Р† Р С•Р Т‘Р Р…Р С•Р в„– Р С‘Р В· Р Р†Р С”Р В»Р В°Р Т‘Р С•Р С”, РЎРѓРЎвЂљР В°Р Р†Р С‘РЎвЂљ `0`.
 
-Р­С‚Рѕ РїСЂРѕРјРµР¶СѓС‚РѕС‡РЅС‹Р№ РїСЂР°РєС‚РёС‡РµСЃРєРёР№ С€Р°Рі РїРµСЂРµРґ Р·Р°РїРёСЃСЊСЋ РІ СЂРµР°Р»СЊРЅСѓСЋ С‚Р°Р±Р»РёС†Сѓ (Google Sheets write РїРѕРєР° РЅРµ РІС‹РїРѕР»РЅСЏРµС‚СЃСЏ).
+Р В­РЎвЂљР С• Р С—РЎР‚Р С•Р СР ВµР В¶РЎС“РЎвЂљР С•РЎвЂЎР Р…РЎвЂ№Р в„– Р С—РЎР‚Р В°Р С”РЎвЂљР С‘РЎвЂЎР ВµРЎРѓР С”Р С‘Р в„– РЎв‚¬Р В°Р С– Р С—Р ВµРЎР‚Р ВµР Т‘ Р В·Р В°Р С—Р С‘РЎРѓРЎРЉРЎР‹ Р Р† РЎР‚Р ВµР В°Р В»РЎРЉР Р…РЎС“РЎР‹ РЎвЂљР В°Р В±Р В»Р С‘РЎвЂ РЎС“ (Google Sheets write Р С—Р С•Р С”Р В° Р Р…Р Вµ Р Р†РЎвЂ№Р С—Р С•Р В»Р Р…РЎРЏР ВµРЎвЂљРЎРѓРЎРЏ).
 
-## РђРІС‚Рѕ-РїСЂРѕРіРѕРЅ РІСЃРµС… РІРєР»Р°РґРѕРє (URL-based)
+## Р С’Р Р†РЎвЂљР С•-Р С—РЎР‚Р С•Р С–Р С•Р Р… Р Р†РЎРѓР ВµРЎвЂ¦ Р Р†Р С”Р В»Р В°Р Т‘Р С•Р С” (URL-based)
 
-РњРѕР¶РЅРѕ РїРѕРґРіРѕС‚РѕРІРёС‚СЊ СЌРєСЂР°РЅ РѕРґРёРЅ СЂР°Р· РІСЂСѓС‡РЅСѓСЋ Рё Р·Р°РїСѓСЃС‚РёС‚СЊ Р°РІС‚РѕРјР°С‚РёС‡РµСЃРєРѕРµ РїРµСЂРµРєР»СЋС‡РµРЅРёРµ РІРєР»Р°РґРѕРє:
+Р СљР С•Р В¶Р Р…Р С• Р С—Р С•Р Т‘Р С–Р С•РЎвЂљР С•Р Р†Р С‘РЎвЂљРЎРЉ РЎРЊР С”РЎР‚Р В°Р Р… Р С•Р Т‘Р С‘Р Р… РЎР‚Р В°Р В· Р Р†РЎР‚РЎС“РЎвЂЎР Р…РЎС“РЎР‹ Р С‘ Р В·Р В°Р С—РЎС“РЎРѓРЎвЂљР С‘РЎвЂљРЎРЉ Р В°Р Р†РЎвЂљР С•Р СР В°РЎвЂљР С‘РЎвЂЎР ВµРЎРѓР С”Р С•Р Вµ Р С—Р ВµРЎР‚Р ВµР С”Р В»РЎР‹РЎвЂЎР ВµР Р…Р С‘Р Вµ Р Р†Р С”Р В»Р В°Р Т‘Р С•Р С”:
 
 `python -m src.run_read_analytics --source-kind tag --filter-id manual --skip-open --wait-for-enter --all-tab-modes`
 
-Р’ СЌС‚РѕРј СЂРµР¶РёРјРµ reader РїРµСЂРµРєР»СЋС‡Р°РµС‚ РІРєР»Р°РґРєРё С‡РµСЂРµР· URL-РїР°СЂР°РјРµС‚СЂ `deals_type`, Р±РµР· UI-РєР»РёРєРѕРІ РїРѕ РІРєР»Р°РґРєР°Рј:
+Р вЂ™ РЎРЊРЎвЂљР С•Р С РЎР‚Р ВµР В¶Р С‘Р СР Вµ reader Р С—Р ВµРЎР‚Р ВµР С”Р В»РЎР‹РЎвЂЎР В°Р ВµРЎвЂљ Р Р†Р С”Р В»Р В°Р Т‘Р С”Р С‘ РЎвЂЎР ВµРЎР‚Р ВµР В· URL-Р С—Р В°РЎР‚Р В°Р СР ВµРЎвЂљРЎР‚ `deals_type`, Р В±Р ВµР В· UI-Р С”Р В»Р С‘Р С”Р С•Р Р† Р С—Р С• Р Р†Р С”Р В»Р В°Р Т‘Р С”Р В°Р С:
 
 - `deals_type=all`
 - `deals_type=active`
 - `deals_type=closed`
 
-РљР°Р¶РґР°СЏ СѓСЃРїРµС€РЅРѕ РїСЂРѕС‡РёС‚Р°РЅРЅР°СЏ РІРєР»Р°РґРєР° СЌРєСЃРїРѕСЂС‚РёСЂСѓРµС‚СЃСЏ СЃСЂР°Р·Сѓ (JSON + CSV).
-Р•СЃР»Рё С‡С‚РµРЅРёРµ СЃР»РµРґСѓСЋС‰РµР№ РІРєР»Р°РґРєРё РЅРµ СѓРґР°Р»РѕСЃСЊ, СѓР¶Рµ СЃРѕС…СЂР°РЅРµРЅРЅС‹Рµ С„Р°Р№Р»С‹ РѕСЃС‚Р°СЋС‚СЃСЏ РІ `exports/` Рё РЅРµ С‚РµСЂСЏСЋС‚СЃСЏ.
+Р С™Р В°Р В¶Р Т‘Р В°РЎРЏ РЎС“РЎРѓР С—Р ВµРЎв‚¬Р Р…Р С• Р С—РЎР‚Р С•РЎвЂЎР С‘РЎвЂљР В°Р Р…Р Р…Р В°РЎРЏ Р Р†Р С”Р В»Р В°Р Т‘Р С”Р В° РЎРЊР С”РЎРѓР С—Р С•РЎР‚РЎвЂљР С‘РЎР‚РЎС“Р ВµРЎвЂљРЎРѓРЎРЏ РЎРѓРЎР‚Р В°Р В·РЎС“ (JSON + CSV).
+Р вЂўРЎРѓР В»Р С‘ РЎвЂЎРЎвЂљР ВµР Р…Р С‘Р Вµ РЎРѓР В»Р ВµР Т‘РЎС“РЎР‹РЎвЂ°Р ВµР в„– Р Р†Р С”Р В»Р В°Р Т‘Р С”Р С‘ Р Р…Р Вµ РЎС“Р Т‘Р В°Р В»Р С•РЎРѓРЎРЉ, РЎС“Р В¶Р Вµ РЎРѓР С•РЎвЂ¦РЎР‚Р В°Р Р…Р ВµР Р…Р Р…РЎвЂ№Р Вµ РЎвЂћР В°Р в„–Р В»РЎвЂ№ Р С•РЎРѓРЎвЂљР В°РЎР‹РЎвЂљРЎРѓРЎРЏ Р Р† `exports/` Р С‘ Р Р…Р Вµ РЎвЂљР ВµРЎР‚РЎРЏРЎР‹РЎвЂљРЎРѓРЎРЏ.
 
-`--all-tab-modes-manual` РѕСЃС‚Р°РµС‚СЃСЏ Р·Р°РїР°СЃРЅС‹Рј СЂРµР¶РёРјРѕРј: РїРѕР»СЊР·РѕРІР°С‚РµР»СЊ РІСЂСѓС‡РЅСѓСЋ РїРµСЂРµРєР»СЋС‡Р°РµС‚ РІРєР»Р°РґРєРё Рё РїРѕРґС‚РІРµСЂР¶РґР°РµС‚ С€Р°РіРё Enter.
+`--all-tab-modes-manual` Р С•РЎРѓРЎвЂљР В°Р ВµРЎвЂљРЎРѓРЎРЏ Р В·Р В°Р С—Р В°РЎРѓР Р…РЎвЂ№Р С РЎР‚Р ВµР В¶Р С‘Р СР С•Р С: Р С—Р С•Р В»РЎРЉР В·Р С•Р Р†Р В°РЎвЂљР ВµР В»РЎРЉ Р Р†РЎР‚РЎС“РЎвЂЎР Р…РЎС“РЎР‹ Р С—Р ВµРЎР‚Р ВµР С”Р В»РЎР‹РЎвЂЎР В°Р ВµРЎвЂљ Р Р†Р С”Р В»Р В°Р Т‘Р С”Р С‘ Р С‘ Р С—Р С•Р Т‘РЎвЂљР Р†Р ВµРЎР‚Р В¶Р Т‘Р В°Р ВµРЎвЂљ РЎв‚¬Р В°Р С–Р С‘ Enter.
 
-## Р Р°СЃС€РёСЂСЏРµРјР°СЏ РєРѕРЅС„РёРіСѓСЂР°С†РёСЏ
+## Р В Р В°РЎРѓРЎв‚¬Р С‘РЎР‚РЎРЏР ВµР СР В°РЎРЏ Р С”Р С•Р Р…РЎвЂћР С‘Р С–РЎС“РЎР‚Р В°РЎвЂ Р С‘РЎРЏ
 
-РРґРµСЏ РїСЂРѕСЃС‚Р°СЏ:
+Р ВР Т‘Р ВµРЎРЏ Р С—РЎР‚Р С•РЎРѓРЎвЂљР В°РЎРЏ:
 
-- РєРѕРґ = РґРІРёР¶РѕРє С‡С‚РµРЅРёСЏ/РѕР±СЂР°Р±РѕС‚РєРё;
-- config = С‡С‚Рѕ РёРјРµРЅРЅРѕ Р·Р°РїСѓСЃРєР°С‚СЊ Рё РєСѓРґР° СЃРєР»Р°РґС‹РІР°С‚СЊ СЂРµР·СѓР»СЊС‚Р°С‚.
+- Р С”Р С•Р Т‘ = Р Т‘Р Р†Р С‘Р В¶Р С•Р С” РЎвЂЎРЎвЂљР ВµР Р…Р С‘РЎРЏ/Р С•Р В±РЎР‚Р В°Р В±Р С•РЎвЂљР С”Р С‘;
+- config = РЎвЂЎРЎвЂљР С• Р С‘Р СР ВµР Р…Р Р…Р С• Р В·Р В°Р С—РЎС“РЎРѓР С”Р В°РЎвЂљРЎРЉ Р С‘ Р С”РЎС“Р Т‘Р В° РЎРѓР С”Р В»Р В°Р Т‘РЎвЂ№Р Р†Р В°РЎвЂљРЎРЉ РЎР‚Р ВµР В·РЎС“Р В»РЎРЉРЎвЂљР В°РЎвЂљ.
 
-Р”Р»СЏ СЂСѓС‡РЅРѕРіРѕ СЂРµРґР°РєС‚РёСЂРѕРІР°РЅРёСЏ РёСЃРїРѕР»СЊР·СѓСЋС‚СЃСЏ YAML-С„Р°Р№Р»С‹ РІ `config/`:
+Р вЂќР В»РЎРЏ РЎР‚РЎС“РЎвЂЎР Р…Р С•Р С–Р С• РЎР‚Р ВµР Т‘Р В°Р С”РЎвЂљР С‘РЎР‚Р С•Р Р†Р В°Р Р…Р С‘РЎРЏ Р С‘РЎРѓР С—Р С•Р В»РЎРЉР В·РЎС“РЎР‹РЎвЂљРЎРѓРЎРЏ YAML-РЎвЂћР В°Р в„–Р В»РЎвЂ№ Р Р† `config/`:
 
-- `page_profiles.yaml` вЂ” РєР°РєРёРµ С‚РёРїС‹ СЃС‚СЂР°РЅРёС† amoCRM РµСЃС‚СЊ РІ РїСЂРѕРµРєС‚Рµ;
-- `report_profiles.yaml` вЂ” РєР°РєРёРµ РѕС‚С‡РµС‚С‹ Р·Р°РїСѓСЃРєР°С‚СЊ, СЃ РєР°РєРёРјРё С„РёР»СЊС‚СЂР°РјРё/РІРєР»Р°РґРєР°РјРё/РёСЃС‚РѕС‡РЅРёРєР°РјРё;
-- `table_mappings.yaml` вЂ” РєСѓРґР° РїРёСЃР°С‚СЊ СЂРµР·СѓР»СЊС‚Р°С‚ (С†РµР»РµРІС‹Рµ Р±Р»РѕРєРё/СЂРµР¶РёРјС‹ Р·Р°РїРёСЃРё) РЅР° СЃР»РµРґСѓСЋС‰РёС… СЌС‚Р°РїР°С….
+- `page_profiles.yaml` РІР‚вЂќ Р С”Р В°Р С”Р С‘Р Вµ РЎвЂљР С‘Р С—РЎвЂ№ РЎРѓРЎвЂљРЎР‚Р В°Р Р…Р С‘РЎвЂ  amoCRM Р ВµРЎРѓРЎвЂљРЎРЉ Р Р† Р С—РЎР‚Р С•Р ВµР С”РЎвЂљР Вµ;
+- `report_profiles.yaml` РІР‚вЂќ Р С”Р В°Р С”Р С‘Р Вµ Р С•РЎвЂљРЎвЂЎР ВµРЎвЂљРЎвЂ№ Р В·Р В°Р С—РЎС“РЎРѓР С”Р В°РЎвЂљРЎРЉ, РЎРѓ Р С”Р В°Р С”Р С‘Р СР С‘ РЎвЂћР С‘Р В»РЎРЉРЎвЂљРЎР‚Р В°Р СР С‘/Р Р†Р С”Р В»Р В°Р Т‘Р С”Р В°Р СР С‘/Р С‘РЎРѓРЎвЂљР С•РЎвЂЎР Р…Р С‘Р С”Р В°Р СР С‘;
+- `table_mappings.yaml` РІР‚вЂќ Р С”РЎС“Р Т‘Р В° Р С—Р С‘РЎРѓР В°РЎвЂљРЎРЉ РЎР‚Р ВµР В·РЎС“Р В»РЎРЉРЎвЂљР В°РЎвЂљ (РЎвЂ Р ВµР В»Р ВµР Р†РЎвЂ№Р Вµ Р В±Р В»Р С•Р С”Р С‘/РЎР‚Р ВµР В¶Р С‘Р СРЎвЂ№ Р В·Р В°Р С—Р С‘РЎРѓР С‘) Р Р…Р В° РЎРѓР В»Р ВµР Т‘РЎС“РЎР‹РЎвЂ°Р С‘РЎвЂ¦ РЎРЊРЎвЂљР В°Р С—Р В°РЎвЂ¦.
 
-Р’ Р±СѓРґСѓС‰РµРј РЅРѕРІС‹Рµ С‚РµРіРё, РЅРѕРІС‹Рµ РѕС‚С‡РµС‚С‹, РЅРѕРІС‹Рµ СЃС‚СЂР°РЅРёС†С‹ amoCRM (`analytics`, `deals`, `events`) РјРѕР¶РЅРѕ Р±СѓРґРµС‚ РґРѕР±Р°РІР»СЏС‚СЊ С‡РµСЂРµР· config Р±РµР· РїРµСЂРµРїРёСЃС‹РІР°РЅРёСЏ СЏРґСЂР°.
+Р вЂ™ Р В±РЎС“Р Т‘РЎС“РЎвЂ°Р ВµР С Р Р…Р С•Р Р†РЎвЂ№Р Вµ РЎвЂљР ВµР С–Р С‘, Р Р…Р С•Р Р†РЎвЂ№Р Вµ Р С•РЎвЂљРЎвЂЎР ВµРЎвЂљРЎвЂ№, Р Р…Р С•Р Р†РЎвЂ№Р Вµ РЎРѓРЎвЂљРЎР‚Р В°Р Р…Р С‘РЎвЂ РЎвЂ№ amoCRM (`analytics`, `deals`, `events`) Р СР С•Р В¶Р Р…Р С• Р В±РЎС“Р Т‘Р ВµРЎвЂљ Р Т‘Р С•Р В±Р В°Р Р†Р В»РЎРЏРЎвЂљРЎРЉ РЎвЂЎР ВµРЎР‚Р ВµР В· config Р В±Р ВµР В· Р С—Р ВµРЎР‚Р ВµР С—Р С‘РЎРѓРЎвЂ№Р Р†Р В°Р Р…Р С‘РЎРЏ РЎРЏР Т‘РЎР‚Р В°.
 
-## Р’Р°Р¶РЅРѕ РїСЂРѕ РѕРіСЂР°РЅРёС‡РµРЅРёСЏ MVP
+## Р вЂ™Р В°Р В¶Р Р…Р С• Р С—РЎР‚Р С• Р С•Р С–РЎР‚Р В°Р Р…Р С‘РЎвЂЎР ВµР Р…Р С‘РЎРЏ MVP
 
-- Read-only РїРѕРІРµРґРµРЅРёРµ: РЅРёРєР°РєРёС… РґРµР№СЃС‚РІРёР№ `save/submit/delete`.
-- РќР° СЌС‚РѕРј С€Р°РіРµ С„РёР»СЊС‚СЂС‹ РІС‹СЃС‚Р°РІР»СЏСЋС‚СЃСЏ РІСЂСѓС‡РЅСѓСЋ РІ amoCRM UI.
+- Read-only Р С—Р С•Р Р†Р ВµР Т‘Р ВµР Р…Р С‘Р Вµ: Р Р…Р С‘Р С”Р В°Р С”Р С‘РЎвЂ¦ Р Т‘Р ВµР в„–РЎРѓРЎвЂљР Р†Р С‘Р в„– `save/submit/delete`.
+- Р СњР В° РЎРЊРЎвЂљР С•Р С РЎв‚¬Р В°Р С–Р Вµ РЎвЂћР С‘Р В»РЎРЉРЎвЂљРЎР‚РЎвЂ№ Р Р†РЎвЂ№РЎРѓРЎвЂљР В°Р Р†Р В»РЎРЏРЎР‹РЎвЂљРЎРѓРЎРЏ Р Р†РЎР‚РЎС“РЎвЂЎР Р…РЎС“РЎР‹ Р Р† amoCRM UI.
 
 
 
@@ -697,13 +697,13 @@ python -m src.run_profile_analytics --report-id weekly_refusals_example --writer
 
 ## Weekly Refusals: `event_type` Search Control Notes
 
-- amoCRM field `Типы событий` is rendered as `checkboxes-search` (not standard select/dropdown).
+- amoCRM field `РўРёРїС‹ СЃРѕР±С‹С‚РёР№` is rendered as `checkboxes-search` (not standard select/dropdown).
 - Valid scope can be the control root itself (`filter__custom_settings__item checkboxes-search js-control-checkboxes-search`).
 - Primary search-kind selectors:
   - open/check state: `.checkboxes-search__opening-list`, `.checkboxes-search__search-input`, `.checkboxes-search__section-common`, `.checkboxes-search__item-label`, `input[type='checkbox'][data-value]`
   - option resolve: `.checkboxes-search__item-label:has-text(...)`, `label:has(input[data-value='...'])`, `input[type='checkbox'][data-value='...']`
-  - apply: `.js-checkboxes-search-list-apply` (including `.checkboxes-search__buttons-wrapper .button-input`) and `OK/ОК` variants.
-- Do not use page-wide `label/li/input[type='checkbox']` for this stage: it can click left preset panel instead of opened `Типы событий` widget.
+  - apply: `.js-checkboxes-search-list-apply` (including `.checkboxes-search__buttons-wrapper .button-input`) and `OK/РћРљ` variants.
+- Do not use page-wide `label/li/input[type='checkbox']` for this stage: it can click left preset panel instead of opened `РўРёРїС‹ СЃРѕР±С‹С‚РёР№` widget.
 - On failure, inspect `exports/debug/weekly_refusals_event_type_search_failed_<timestamp>.*`.
 - Focus on JSON field `checkbox_search_debug_snapshot` (`active_element`, `control_scope_elements`, `ok_buttons`, `event_type_text_elements`).
 
@@ -750,17 +750,17 @@ Unsupported DSL fields are now logged explicitly as:
 `unsupported dsl filter field: ...`
 (ignored for execution, not silently hidden).
 
-## Боевой запуск без UI
+## Р‘РѕРµРІРѕР№ Р·Р°РїСѓСЃРє Р±РµР· UI
 
-Минимальный операционный запуск теперь делается через PowerShell launcher:
+РњРёРЅРёРјР°Р»СЊРЅС‹Р№ РѕРїРµСЂР°С†РёРѕРЅРЅС‹Р№ Р·Р°РїСѓСЃРє С‚РµРїРµСЂСЊ РґРµР»Р°РµС‚СЃСЏ С‡РµСЂРµР· PowerShell launcher:
 
-1. Открыть терминал в корне проекта:
+1. РћС‚РєСЂС‹С‚СЊ С‚РµСЂРјРёРЅР°Р» РІ РєРѕСЂРЅРµ РїСЂРѕРµРєС‚Р°:
    - `D:\AI_Automation\amocrm_bot\project`
-2. Активировать venv (пример для Windows PowerShell):
+2. РђРєС‚РёРІРёСЂРѕРІР°С‚СЊ venv (РїСЂРёРјРµСЂ РґР»СЏ Windows PowerShell):
    - `.\.venv\Scripts\Activate.ps1`
-3. Запустить launcher:
+3. Р—Р°РїСѓСЃС‚РёС‚СЊ launcher:
    - `.\scripts\run_reports.ps1`
-4. Выбрать пункт меню:
+4. Р’С‹Р±СЂР°С‚СЊ РїСѓРЅРєС‚ РјРµРЅСЋ:
    - `1` Analytics dry-run batch from sheet DSL
    - `2` Analytics live write block A1
    - `3` Analytics live write block F1
@@ -768,22 +768,22 @@ Unsupported DSL fields are now logged explicitly as:
    - `5` Weekly refusals live 2m
    - `6` Weekly refusals live cumulative long
 
-Launcher перед каждым запуском выставляет:
+Launcher РїРµСЂРµРґ РєР°Р¶РґС‹Рј Р·Р°РїСѓСЃРєРѕРј РІС‹СЃС‚Р°РІР»СЏРµС‚:
 - `GOOGLE_API_AUTH_MODE=cache_only`
 
-Это исключает неожиданный интерактивный OAuth popup в обычном runtime.
+Р­С‚Рѕ РёСЃРєР»СЋС‡Р°РµС‚ РЅРµРѕР¶РёРґР°РЅРЅС‹Р№ РёРЅС‚РµСЂР°РєС‚РёРІРЅС‹Р№ OAuth popup РІ РѕР±С‹С‡РЅРѕРј runtime.
 
 ### Dry-run vs Live write
 
-- `dry-run`: discovery/compute/debug artifacts без фактической записи значений в таблицу.
-- `live write`: фактическое обновление целевых блоков в Google Sheets.
+- `dry-run`: discovery/compute/debug artifacts Р±РµР· С„Р°РєС‚РёС‡РµСЃРєРѕР№ Р·Р°РїРёСЃРё Р·РЅР°С‡РµРЅРёР№ РІ С‚Р°Р±Р»РёС†Сѓ.
+- `live write`: С„Р°РєС‚РёС‡РµСЃРєРѕРµ РѕР±РЅРѕРІР»РµРЅРёРµ С†РµР»РµРІС‹С… Р±Р»РѕРєРѕРІ РІ Google Sheets.
 
-Операционный порядок:
-1. Сначала всегда гоняем на тестовый лист.
-2. Проверяем debug/compiled artifacts.
-3. Только потом запускаем live write.
+РћРїРµСЂР°С†РёРѕРЅРЅС‹Р№ РїРѕСЂСЏРґРѕРє:
+1. РЎРЅР°С‡Р°Р»Р° РІСЃРµРіРґР° РіРѕРЅСЏРµРј РЅР° С‚РµСЃС‚РѕРІС‹Р№ Р»РёСЃС‚.
+2. РџСЂРѕРІРµСЂСЏРµРј debug/compiled artifacts.
+3. РўРѕР»СЊРєРѕ РїРѕС‚РѕРј Р·Р°РїСѓСЃРєР°РµРј live write.
 
-Пути артефактов:
+РџСѓС‚Рё Р°СЂС‚РµС„Р°РєС‚РѕРІ:
 - debug: `D:\AI_Automation\amocrm_bot\project\exports\debug`
 - compiled: `D:\AI_Automation\amocrm_bot\project\exports\compiled`
 
@@ -793,18 +793,18 @@ Minimal external integration OAuth bootstrap is documented in [docs/amocrm_auth_
 
 ## Update (2026-04-18): Deal Analyzer Enrichment MVP (Read-only)
 
-Фактическое состояние на этом этапе:
-- существующие analytics / weekly_refusals / Google Sheets writer flows не менялись;
-- в `deal_analyzer` добавлен read-only enrich pipeline для внешних таблиц и KPI-контекста;
-- запись обратно в Google Sheets из enrich pipeline не выполняется.
+Р¤Р°РєС‚РёС‡РµСЃРєРѕРµ СЃРѕСЃС‚РѕСЏРЅРёРµ РЅР° СЌС‚РѕРј СЌС‚Р°РїРµ:
+- СЃСѓС‰РµСЃС‚РІСѓСЋС‰РёРµ analytics / weekly_refusals / Google Sheets writer flows РЅРµ РјРµРЅСЏР»РёСЃСЊ;
+- РІ `deal_analyzer` РґРѕР±Р°РІР»РµРЅ read-only enrich pipeline РґР»СЏ РІРЅРµС€РЅРёС… С‚Р°Р±Р»РёС† Рё KPI-РєРѕРЅС‚РµРєСЃС‚Р°;
+- Р·Р°РїРёСЃСЊ РѕР±СЂР°С‚РЅРѕ РІ Google Sheets РёР· enrich pipeline РЅРµ РІС‹РїРѕР»РЅСЏРµС‚СЃСЏ.
 
-Новые CLI-команды:
+РќРѕРІС‹Рµ CLI-РєРѕРјР°РЅРґС‹:
 - `python -m src.deal_analyzer.cli enrich-deal --config ... --input ...`
 - `python -m src.deal_analyzer.cli enrich-period --config ... --input ...`
-- `python -m src.deal_analyzer.cli roks-snapshot --config ... --manager "Илья"`
+- `python -m src.deal_analyzer.cli roks-snapshot --config ... --manager "РР»СЊСЏ"`
 - `python -m src.deal_analyzer.cli roks-snapshot --config ... --team`
 
-Ключевые output-поля по сделке:
+РљР»СЋС‡РµРІС‹Рµ output-РїРѕР»СЏ РїРѕ СЃРґРµР»РєРµ:
 - `enrichment_match_status`
 - `enrichment_match_source`
 - `enrichment_confidence`
@@ -814,7 +814,7 @@ Minimal external integration OAuth bootstrap is documented in [docs/amocrm_auth_
 - `employee_coaching`
 - `employee_fix_tasks`
 
-Детали контракта и ограничений см. в:
+Р”РµС‚Р°Р»Рё РєРѕРЅС‚СЂР°РєС‚Р° Рё РѕРіСЂР°РЅРёС‡РµРЅРёР№ СЃРј. РІ:
 - `docs/deal_analyzer_enrichment_mvp.md`
 
 ## Update (2026-04-18): Deal Analyzer Call Evidence + Transcription MVP
@@ -855,29 +855,114 @@ CLI:
 
 ## Update 2026-04-26: Daily Control LLM-First Path
 
-Daily control active path is now organized as a dedicated pipeline package:
-- `src/deal_analyzer/daily_control/cli.py` (discover/build/write orchestration),
-- `source_reader.py`, `day_grouper.py`, `roks_oap_resolver.py`, `roks_oap_parser.py`,
-- `daily_analyzer.py` (LLM-first manager-day analytics),
-- `idempotency.py`, `writer_plan.py`, `sheets_writer.py`,
+Daily control active path uses a dedicated package:
+- `src/deal_analyzer/daily_control/cli.py` (discover/build/write orchestration)
+- `source_reader.py`, `day_grouper.py`, `roks_oap_resolver.py`, `roks_oap_parser.py`
+- `daily_analyzer.py` (LLM-first manager-day analytics)
+- `idempotency.py`, `writer_plan.py`, `sheets_writer.py`
 - `validation/*` and `style/*` as separate technical layers.
 
 Design contract:
 - code builds facts/context and writes safely,
 - LLM generates management narrative fields,
-- no hardcoded scripted analytics templates in active daily path,
-- deterministic fallback only produces explicit `"не сформировано: llm_json_invalid"` markers if both main and fallback LLM JSON are invalid.
+- scripted deterministic analytics phrases are not generated by code.
 
-ROKS OAP month selection for period ending 2026-04-24:
-- current month: `РОКС ОАП-апрель 2026`,
-- previous month: `РОКС ОАП-март 2026`.
+Language policy:
+- blockers: foreign greeting/chinese/markdown fence/long foreign text in user-facing fields,
+- warnings: allowed business Latin terms and technical terms,
+- allowlist includes: `LINK`, `INFO`, `PLM`, `CRM`, `amoCRM`, `ID`, `URL`, `http`, `https`, `API`, `JSON`, `LLM`, `STT`, `ROKS`, `OAP`,
+- row-level language repair runs before writer preflight,
+- unrepaired rows are quarantined (row-level), not treated as whole-batch blockers by default.
+
+Daily idempotency/update policy:
+- base key: `period_start|period_end|control_day_date|manager_name`,
+- exact key: base key + `sample_size|deals_count|calls_count`,
+- exact match or same counts: skip,
+- same base + bigger counts: update existing row,
+- same base + smaller counts: stale skip,
+- weird mismatch: conflict for review.
+
+ROKS OAP month selection for period ending `2026-04-24`:
+- current month: `???? ???-?????? 2026`,
+- previous month: `???? ???-???? 2026`.
 
 Main commands:
 - discover:
-  - `python -m src.deal_analyzer.daily_control.cli discover --config <config> --workbook "РОКС 2026" --daily-sheet "Дневной контроль"`
+  - `python -m src.deal_analyzer.daily_control.cli discover --config <config> --workbook "???? 2026" --daily-sheet "??????? ????????"`
 - build dry-run:
-  - `python -m src.deal_analyzer.daily_control.cli build --config <config> --period-start YYYY-MM-DD --period-end YYYY-MM-DD --source-sheet "Разбор звонков" --daily-sheet "Дневной контроль" --dry-run`
+  - `python -m src.deal_analyzer.daily_control.cli build --config <config> --period-start YYYY-MM-DD --period-end YYYY-MM-DD --source-sheet "?????? ???????" --daily-sheet "??????? ????????" --dry-run`
 - write dry-run:
-  - `python -m src.deal_analyzer.daily_control.cli write --config <config> --run-dir <run_dir> --daily-sheet "Дневной контроль" --dry-run --strict-preflight`
+  - `python -m src.deal_analyzer.daily_control.cli write --config <config> --run-dir <run_dir> --daily-sheet "??????? ????????" --dry-run --strict-preflight --allow-partial-write --quarantine-unrepaired`
 
 Real write must be run only as an explicit separate command after dry-run artifact review.
+
+## Update 2026-04-27: Production Model Policy
+
+Current production contour:
+- `Р Р°Р·Р±РѕСЂ Р·РІРѕРЅРєРѕРІ`: DeepSeek (`qwen3.5:397b-cloud`) for analyze-period real-write (fallback `deepseek-v3.1:671b-cloud`).
+- `Р”РЅРµРІРЅРѕР№ РєРѕРЅС‚СЂРѕР»СЊ`: DeepSeek (`qwen3.5:397b-cloud`) with fallback (`deepseek-v3.1:671b-cloud`).
+- `call_review_llm_replay` with Gemma: experimental only.
+- `Р Р°Р·Р±РѕСЂ Р·РІРѕРЅРєРѕРІ` Р±РµСЂРµС‚ production РјРѕРґРµР»СЊ РёР· `config/deal_analyzer.call_review.deepseek.realwrite.json`.
+- `Р”РЅРµРІРЅРѕР№ РєРѕРЅС‚СЂРѕР»СЊ` Рё weekly-РјРѕРґСѓР»Рё РјРѕР¶РЅРѕ РїРµСЂРµРѕРїСЂРµРґРµР»СЏС‚СЊ С‡РµСЂРµР· CLI: `--main-model` / `--fallback-model`.
+
+Safety for replay write:
+- `call_review_llm_replay` always logs warning:
+  - `EXPERIMENTAL: not recommended for production call review write`
+- if `--write` is used with `--main-model gemma*`, replay requires:
+  - `--allow-experimental-gemma-write`
+- otherwise write is blocked with:
+  - `experimental_gemma_write_requires_explicit_allow_flag`
+
+Production command (`Р Р°Р·Р±РѕСЂ Р·РІРѕРЅРєРѕРІ`, DeepSeek):
+```powershell
+python -m src.deal_analyzer.cli --config config/deal_analyzer.call_review.deepseek.realwrite.json analyze-period --input workspace/amocrm_collector/collect_period_2026-04-01_2026-04-07_latest.json --period-mode current_week_to_date --discussion-limit 10 --limit 10
+```
+
+Daily control commands:
+```powershell
+python -m src.deal_analyzer.daily_control.cli build --config config/deal_analyzer.call_review.deepseek.realwrite.json --period-start 2026-03-30 --period-end 2026-04-24 --source-sheet "Р Р°Р·Р±РѕСЂ Р·РІРѕРЅРєРѕРІ" --daily-sheet "Р”РЅРµРІРЅРѕР№ РєРѕРЅС‚СЂРѕР»СЊ" --main-model qwen3.5:397b-cloud --fallback-model deepseek-v3.1:671b-cloud --dry-run
+python -m src.deal_analyzer.daily_control.cli write --config config/deal_analyzer.call_review.deepseek.realwrite.json --run-dir <daily_run_dir> --daily-sheet "Р”РЅРµРІРЅРѕР№ РєРѕРЅС‚СЂРѕР»СЊ" --dry-run --strict-preflight
+```
+
+Experimental Gemma replay (dry-run only):
+```powershell
+python -m src.deal_analyzer.call_review_llm_replay --run-dir workspace/deal_analyzer/period_runs/20260425_224156 --config config/deal_analyzer.call_review.deepseek.realwrite.json --main-model gemma4:31b-cloud --fallback-model gpt-oss:20b --fallback2-model deepseek-v3.1:671b-cloud --limit 3 --dry-run --strict-preflight --allow-partial-write --quarantine-failed
+```
+
+## Weekly cycle (dry-run only)
+
+Week plan discovery:
+```powershell
+python -m src.deal_analyzer.week_plan.cli discover --config config/deal_analyzer.call_review.deepseek.realwrite.json --target-sheet "РџР»Р°РЅ РЅРµРґРµР»Рё"
+```
+
+Week plan build (signals from previous week, plan for target week):
+```powershell
+python -m src.deal_analyzer.week_plan.cli build --config config/deal_analyzer.call_review.deepseek.realwrite.json --signal-start 2026-04-20 --signal-end 2026-04-26 --plan-week-start 2026-04-27 --plan-week-end 2026-05-03 --daily-sheet "Р”РЅРµРІРЅРѕР№ РєРѕРЅС‚СЂРѕР»СЊ" --target-sheet "РџР»Р°РЅ РЅРµРґРµР»Рё" --main-model qwen3.5:397b-cloud --fallback-model deepseek-v3.1:671b-cloud --dry-run
+```
+
+Weekly manager summary build:
+```powershell
+python -m src.deal_analyzer.weekly_manager_summary.cli build --config config/deal_analyzer.call_review.deepseek.realwrite.json --period-start 2026-04-27 --period-end 2026-05-03 --daily-sheet "Р”РЅРµРІРЅРѕР№ РєРѕРЅС‚СЂРѕР»СЊ" --plan-sheet "РџР»Р°РЅ РЅРµРґРµР»Рё" --target-sheet "РќРµРґРµР»СЊРЅС‹Р№ СЃРІРѕРґ РјРµРЅРµРґР¶РµСЂРѕРІ" --main-model qwen3.5:397b-cloud --fallback-model deepseek-v3.1:671b-cloud --dry-run
+```
+
+Week summary build:
+```powershell
+python -m src.deal_analyzer.week_summary.cli build --config config/deal_analyzer.call_review.deepseek.realwrite.json --period-start 2026-04-27 --period-end 2026-05-03 --daily-sheet "Р”РЅРµРІРЅРѕР№ РєРѕРЅС‚СЂРѕР»СЊ" --plan-sheet "РџР»Р°РЅ РЅРµРґРµР»Рё" --manager-summary-sheet "РќРµРґРµР»СЊРЅС‹Р№ СЃРІРѕРґ РјРµРЅРµРґР¶РµСЂРѕРІ" --target-sheet "РЎРІРѕРґ РЅРµРґРµР»Рё" --main-model qwen3.5:397b-cloud --fallback-model deepseek-v3.1:671b-cloud --dry-run
+```
+
+Integrated weekly cycle (in-memory, no sheet writes):
+```powershell
+python -m src.deal_analyzer.weekly_shared.pipeline_cli build-cycle --config config/deal_analyzer.call_review.deepseek.realwrite.json --signal-start 2026-04-20 --signal-end 2026-04-26 --plan-week-start 2026-04-27 --plan-week-end 2026-05-03 --daily-sheet "Р”РЅРµРІРЅРѕР№ РєРѕРЅС‚СЂРѕР»СЊ" --plan-sheet "РџР»Р°РЅ РЅРµРґРµР»Рё" --manager-summary-sheet "РќРµРґРµР»СЊРЅС‹Р№ СЃРІРѕРґ РјРµРЅРµРґР¶РµСЂРѕРІ" --week-summary-sheet "РЎРІРѕРґ РЅРµРґРµР»Рё" --main-model qwen3.5:397b-cloud --fallback-model deepseek-v3.1:671b-cloud --dry-run
+```
+
+
+## ROKS interpretation note
+
+Manager-level ROKS funnel is role-based and may be non-linear.
+
+- `demo > interest` for Ilya Bochkov is allowed when demos include routed meetings.
+- Rustam Khomidov is evaluated primarily on top-of-funnel (`дозвоны/ЛПР/есть интерес`); downstream stages may be not applicable.
+- Weekly texts must use role-correct wording (e.g. `провел N демо` vs `назначил N демо`).
+
+Details: `docs/roks_interpretation.md`.

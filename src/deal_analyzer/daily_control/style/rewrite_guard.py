@@ -5,6 +5,8 @@ from typing import Any
 
 
 PROTECTED_FIELDS_DAILY: tuple[str, ...] = (
+    "week_start",
+    "week_end",
     "period_start",
     "period_end",
     "control_day_date",

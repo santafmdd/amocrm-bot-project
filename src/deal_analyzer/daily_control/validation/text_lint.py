@@ -14,6 +14,8 @@ DAILY_NARRATIVE_FIELDS: tuple[str, ...] = (
     "what_to_tell_employee",
     "expected_quant_impact",
     "expected_qual_impact",
+    "evidence_short",
+    "data_limitations",
 )
 
 BAD_GRAMMAR_PATTERNS: tuple[tuple[str, str], ...] = (
@@ -31,11 +33,28 @@ BAD_GRAMMAR_PATTERNS: tuple[tuple[str, str], ...] = (
 
 FOREIGN_GREETING_RE = re.compile(r"(你好|您好|hello\b|hi\b|greetings)", re.IGNORECASE)
 MARKDOWN_FENCE_RE = re.compile(r"```")
-LATIN_WORD_RE = re.compile(r"\b[a-z]{3,}\b")
+LATIN_WORD_RE = re.compile(r"\b[a-z][a-z0-9_-]{1,}\b", re.IGNORECASE)
 CJK_RE = re.compile(r"[\u3400-\u9FFF]")
 EMPTY_QUOTES_RE = re.compile(r"(''|\"\")")
 
-ALLOWED_LATIN = {"amocrm", "url", "http", "https", "api", "json", "id"}
+ALLOWED_LATIN = {
+    "link",
+    "info",
+    "plm",
+    "crm",
+    "amocrm",
+    "id",
+    "url",
+    "http",
+    "https",
+    "api",
+    "json",
+    "llm",
+    "stt",
+    "roks",
+    "oap",
+}
+TECHNICAL_LATIN_WARNING = {"api", "json", "llm", "stt"}
 
 
 def _clean(value: Any) -> str:
@@ -48,9 +67,36 @@ def _norm(value: Any) -> str:
     )
 
 
-def _has_foreign_language(text: str) -> bool:
-    words = [w for w in LATIN_WORD_RE.findall(text.lower()) if w not in ALLOWED_LATIN]
-    return len(words) >= 2
+def _latin_terms(text: str) -> list[str]:
+    return [str(item or "").lower() for item in LATIN_WORD_RE.findall(str(text or ""))]
+
+
+def _split_latin_terms(text: str) -> tuple[list[str], list[str], list[str]]:
+    allowed: list[str] = []
+    technical_warning: list[str] = []
+    foreign: list[str] = []
+    for term in _latin_terms(text):
+        if term in ALLOWED_LATIN:
+            allowed.append(term)
+            if term in TECHNICAL_LATIN_WARNING:
+                technical_warning.append(term)
+            continue
+        foreign.append(term)
+    return allowed, technical_warning, foreign
+
+
+def _foreign_language_is_blocker(text: str, foreign_terms: list[str]) -> bool:
+    if not foreign_terms:
+        return False
+    latin_chars = sum(sum(1 for ch in token if "a" <= ch <= "z") for token in foreign_terms)
+    ratio = float(latin_chars) / max(1.0, float(len(str(text or ""))))
+    if len(foreign_terms) >= 4:
+        return True
+    if latin_chars >= 24:
+        return True
+    if len(foreign_terms) >= 2 and ratio >= 0.18:
+        return True
+    return False
 
 
 def _is_generic_crm_advice(text: str) -> bool:
@@ -76,9 +122,12 @@ def _is_truncated(text: str) -> bool:
 def lint_daily_text_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     counters: dict[str, int] = {
         "foreign_language_count": 0,
+        "foreign_language_warning_count": 0,
         "foreign_greeting_count": 0,
         "chinese_text_count": 0,
         "markdown_fence_count": 0,
+        "allowed_latin_terms_count": 0,
+        "technical_terms_warning_count": 0,
         "bad_grammar_marker_count": 0,
         "generic_crm_advice_count": 0,
         "empty_quote_count": 0,
@@ -109,12 +158,23 @@ def lint_daily_text_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
             if CJK_RE.search(text):
                 counters["chinese_text_count"] += 1
                 markers.append("chinese_text")
-            if _has_foreign_language(text):
-                counters["foreign_language_count"] += 1
-                markers.append("foreign_language")
             if MARKDOWN_FENCE_RE.search(text):
                 counters["markdown_fence_count"] += 1
                 markers.append("markdown_fence")
+
+            allowed_terms, technical_terms, foreign_terms = _split_latin_terms(text)
+            if allowed_terms:
+                counters["allowed_latin_terms_count"] += len(allowed_terms)
+            if technical_terms:
+                counters["technical_terms_warning_count"] += len(technical_terms)
+                markers.append("technical_term_in_user_text")
+            if foreign_terms:
+                if _foreign_language_is_blocker(text, foreign_terms):
+                    counters["foreign_language_count"] += 1
+                    markers.append("foreign_language")
+                else:
+                    counters["foreign_language_warning_count"] += 1
+                    markers.append("foreign_language_warning")
 
             for pattern, marker in BAD_GRAMMAR_PATTERNS:
                 if re.search(pattern, text, flags=re.IGNORECASE):
@@ -153,6 +213,9 @@ def lint_daily_text_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "generic_crm_advice_count": counters["generic_crm_advice_count"],
             "empty_quote_count": counters["empty_quote_count"],
             "truncated_text_count": counters["truncated_text_count"],
+            "foreign_language_warning_count": counters["foreign_language_warning_count"],
+            "allowed_latin_terms_count": counters["allowed_latin_terms_count"],
+            "technical_terms_warning_count": counters["technical_terms_warning_count"],
             "forbidden_markers": sorted(forbidden_markers),
         },
         "blockers": {
@@ -163,16 +226,18 @@ def lint_daily_text_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
         },
     }
 
-    # backward-compatible keys used in prior artifacts
     result.update(
         {
             "daily_text_foreign_language_count": counters["foreign_language_count"],
+            "daily_text_foreign_language_warning_count": counters["foreign_language_warning_count"],
             "daily_text_foreign_greeting_count": counters["foreign_greeting_count"],
             "daily_text_bad_grammar_marker_count": counters["bad_grammar_marker_count"],
             "daily_text_generic_crm_advice_count": counters["generic_crm_advice_count"],
             "daily_text_empty_quote_count": counters["empty_quote_count"],
             "daily_text_truncated_text_count": counters["truncated_text_count"],
             "daily_text_checked_fields_count": counters["checked_fields_count"],
+            "daily_text_allowed_latin_terms_count": counters["allowed_latin_terms_count"],
+            "daily_text_technical_terms_warning_count": counters["technical_terms_warning_count"],
             "daily_text_forbidden_markers": sorted(forbidden_markers),
             "daily_text_problem_examples": examples,
         }

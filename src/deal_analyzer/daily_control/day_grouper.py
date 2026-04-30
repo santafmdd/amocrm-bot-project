@@ -2,7 +2,7 @@
 
 import re
 from collections import Counter, defaultdict
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 
 from .models import DailyControlInputGroup
@@ -55,6 +55,19 @@ def _manager_allowed(manager_name: str, allowlist: tuple[str, ...] | None) -> bo
         if name == probe or probe in name or name in probe:
             return True
     return False
+
+
+def week_bounds_monday_sunday(control_day_iso: str) -> tuple[str, str]:
+    parsed = parse_date(control_day_iso)
+    if not parsed:
+        return "", ""
+    try:
+        control_day = date.fromisoformat(parsed)
+    except ValueError:
+        return "", ""
+    week_start = control_day - timedelta(days=control_day.weekday())
+    week_end = week_start + timedelta(days=6)
+    return week_start.isoformat(), week_end.isoformat()
 
 
 def group_by_manager_day(
@@ -147,6 +160,7 @@ def group_by_manager_day(
 
     packages: list[DailyControlInputGroup] = []
     for (control_day_date, manager_name), source_rows in sorted(grouped_rows.items(), key=lambda item: (item[0][0], item[0][1].lower())):
+        week_start, week_end = week_bounds_monday_sunday(control_day_date)
         deal_ids_unique: list[str] = []
         deal_names_unique: list[str] = []
         deal_links_unique: list[str] = []
@@ -222,6 +236,8 @@ def group_by_manager_day(
         package = DailyControlInputGroup(
             period_start=period_start.isoformat(),
             period_end=period_end.isoformat(),
+            week_start=week_start,
+            week_end=week_end,
             control_day_date=control_day_date,
             day_label=day_label_from_iso(control_day_date),
             manager_name=manager_name,

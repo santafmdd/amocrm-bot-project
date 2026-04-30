@@ -6,12 +6,15 @@ from datetime import date
 from pathlib import Path
 
 from src.deal_analyzer.config import DealAnalyzerConfig
-from src.deal_analyzer.daily_control.daily_analyzer import analyze_daily_packages
-from src.deal_analyzer.daily_control.day_grouper import aggregate_mix, group_by_manager_day
+from src.deal_analyzer.daily_control.daily_analyzer import _runtime_from_config, analyze_daily_packages
+from src.deal_analyzer.daily_control.day_grouper import aggregate_mix, group_by_manager_day, week_bounds_monday_sunday
 from src.deal_analyzer.daily_control.models import DailyControlInputGroup
 from src.deal_analyzer.daily_control.roks_oap_parser import parse_roks_oap_snapshot
-from src.deal_analyzer.daily_control.sheets_writer import plan_daily_control_write, write_daily_control_rows
-from src.deal_analyzer.daily_control.validation.text_lint import lint_daily_text_rows
+from src.deal_analyzer.daily_control.sheets_writer import (
+    _resolve_criticality_value_for_write,
+    plan_daily_control_write,
+    write_daily_control_rows,
+)
 from src.deal_analyzer.daily_control.validation.writer_preflight import evaluate_writer_preflight
 
 
@@ -35,6 +38,8 @@ def _sample_group() -> DailyControlInputGroup:
     return DailyControlInputGroup(
         period_start="2026-03-30",
         period_end="2026-04-24",
+        week_start="2026-04-20",
+        week_end="2026-04-26",
         control_day_date="2026-04-22",
         day_label="среда",
         manager_name="Илья Бочков",
@@ -93,6 +98,8 @@ def _valid_llm_payload() -> dict:
 
 def _row_for_preflight(**overrides):
     row = {
+        "week_start": "2026-04-20",
+        "week_end": "2026-04-26",
         "period_start": "2026-03-30",
         "period_end": "2026-04-24",
         "control_day_date": "2026-04-22",
@@ -116,7 +123,7 @@ def _row_for_preflight(**overrides):
         "expected_quant_impact": "Ожидаемо +1-2 шага в неделю.",
         "expected_qual_impact": "Переход к следующему этапу станет стабильнее.",
         "score_0_100": 62,
-        "criticality": "medium",
+        "criticality": "средняя",
     }
     row.update(overrides)
     return row
@@ -144,6 +151,7 @@ def test_llm_first_analyzer_uses_full_group_context(monkeypatch) -> None:
         source_run_id="run1",
         main_model_override="gemma4:31b-cloud",
         fallback_model_override="deepseek-v3.1:671b-cloud",
+        llm_max_attempts=3,
     )
 
     assert len(rows) == 1
@@ -156,7 +164,7 @@ def test_llm_first_analyzer_uses_full_group_context(monkeypatch) -> None:
     assert req["context"]["product_mix"] == "линк - 1"
 
 
-def test_fallback_selected_when_main_returns_invalid_json(monkeypatch) -> None:
+def test_fallback_selected_when_main_invalid_json(monkeypatch) -> None:
     def _fake_call_llm(*, model, base_url, timeout_seconds, messages):
         _ = base_url, timeout_seconds, messages
         if "gemma" in model:
@@ -178,14 +186,173 @@ def test_fallback_selected_when_main_returns_invalid_json(monkeypatch) -> None:
         source_run_id="run1",
         main_model_override="gemma4:31b-cloud",
         fallback_model_override="deepseek-v3.1:671b-cloud",
+        llm_max_attempts=5,
     )
 
     assert rows[0]["analysis_backend_used"] == "fallback"
     assert diag["llm_success_main"] == 0
     assert diag["llm_success_fallback"] == 1
+    runtime_diag = diag.get("llm_runtime", {}) if isinstance(diag.get("llm_runtime"), dict) else {}
+    fallback_diag = runtime_diag.get("fallback", {}) if isinstance(runtime_diag.get("fallback"), dict) else {}
+    assert fallback_diag.get("model") == "deepseek-v3.1:671b-cloud"
+    assert diag["quarantined_count"] == 0
 
 
-def test_both_invalid_json_do_not_create_fake_deterministic_analytics(monkeypatch) -> None:
+def test_fallback_is_reached_with_default_attempt_window(monkeypatch) -> None:
+    def _fake_call_llm(*, model, base_url, timeout_seconds, messages):
+        _ = base_url, timeout_seconds, messages
+        if "gemma" in model:
+            return None, {"ok": False, "error": "not valid JSON object", "elapsed_ms": 99, "repair_applied": False}
+        return _valid_llm_payload(), {"ok": True, "error": "", "elapsed_ms": 88, "repair_applied": False}
+
+    monkeypatch.setattr("src.deal_analyzer.daily_control.daily_analyzer._call_llm", _fake_call_llm)
+    monkeypatch.setattr(
+        "src.deal_analyzer.daily_control.daily_analyzer._preflight_model",
+        lambda **kwargs: {"ok": True, "error": "", "elapsed_ms": 1},
+    )
+
+    rows, diag = analyze_daily_packages(
+        packages=[_sample_group()],
+        cfg=_cfg(),
+        roks_snapshot={"status": "sheets_found_metrics_unparsed", "manager_metrics": {}},
+        llm_runtime={},
+        logger=None,
+        source_run_id="run1",
+        main_model_override="gemma4:31b-cloud",
+        fallback_model_override="deepseek-v3.1:671b-cloud",
+        llm_max_attempts=3,
+    )
+
+    assert rows[0]["analysis_backend_used"] == "fallback"
+    assert diag["llm_success_fallback"] == 1
+
+
+def test_main_429_moves_to_fallback_without_main_retry(monkeypatch) -> None:
+    calls: list[str] = []
+
+    def _fake_call_llm(*, model, base_url, timeout_seconds, messages):
+        _ = base_url, timeout_seconds, messages
+        calls.append(str(model))
+        if str(model).startswith("gemma4"):
+            return None, {"ok": False, "error": "HTTP 429: weekly usage limit", "elapsed_ms": 99, "repair_applied": False}
+        return _valid_llm_payload(), {"ok": True, "error": "", "elapsed_ms": 88, "repair_applied": False}
+
+    monkeypatch.setattr("src.deal_analyzer.daily_control.daily_analyzer._call_llm", _fake_call_llm)
+    monkeypatch.setattr(
+        "src.deal_analyzer.daily_control.daily_analyzer._preflight_model",
+        lambda **kwargs: {"ok": True, "error": "", "elapsed_ms": 1},
+    )
+
+    rows, diag = analyze_daily_packages(
+        packages=[_sample_group()],
+        cfg=_cfg(),
+        roks_snapshot={"status": "sheets_found_metrics_unparsed", "manager_metrics": {}},
+        llm_runtime={},
+        logger=None,
+        source_run_id="run1",
+        main_model_override="gemma4:31b-cloud",
+        fallback_model_override="gpt-oss:20b",
+        llm_max_attempts=7,
+        no_retry_on_rate_limit=True,
+    )
+
+    assert rows[0]["analysis_backend_used"] == "fallback"
+    assert diag["llm_success_fallback"] == 1
+    assert calls.count("gemma4:31b-cloud") == 1
+
+
+def test_daily_runtime_defaults_to_qwen_when_models_missing() -> None:
+    cfg = replace(_cfg(), ollama_model="", ollama_fallback_model="")
+    runtime = _runtime_from_config(
+        cfg=cfg,
+        llm_runtime={},
+        main_model_override=None,
+        fallback_model_override=None,
+        fallback2_model_override=None,
+        fallback_timeout_seconds=None,
+        no_retry_on_rate_limit=False,
+    )
+    assert runtime["main"]["model"] == "qwen3.5:397b-cloud"
+    assert runtime["fallback"]["model"] == "deepseek-v3.1:671b-cloud"
+
+
+def test_daily_runtime_cli_override_has_priority() -> None:
+    runtime = _runtime_from_config(
+        cfg=_cfg(),
+        llm_runtime={},
+        main_model_override="override-main",
+        fallback_model_override="override-fallback",
+        fallback2_model_override=None,
+        fallback_timeout_seconds=None,
+        no_retry_on_rate_limit=False,
+    )
+    assert runtime["main"]["model"] == "override-main"
+    assert runtime["fallback"]["model"] == "override-fallback"
+
+
+def test_fallback2_used_when_main_rate_limited_and_fallback_invalid(monkeypatch) -> None:
+    def _fake_call_llm(*, model, base_url, timeout_seconds, messages):
+        _ = base_url, timeout_seconds, messages
+        if str(model).startswith("gemma4"):
+            return None, {"ok": False, "error": "HTTP 429: usage limit", "elapsed_ms": 40, "repair_applied": False}
+        if str(model).startswith("gpt-oss"):
+            return None, {"ok": False, "error": "not valid JSON object", "elapsed_ms": 40, "repair_applied": False}
+        return _valid_llm_payload(), {"ok": True, "error": "", "elapsed_ms": 33, "repair_applied": False}
+
+    monkeypatch.setattr("src.deal_analyzer.daily_control.daily_analyzer._call_llm", _fake_call_llm)
+    monkeypatch.setattr(
+        "src.deal_analyzer.daily_control.daily_analyzer._preflight_model",
+        lambda **kwargs: {"ok": True, "error": "", "elapsed_ms": 1},
+    )
+
+    rows, diag = analyze_daily_packages(
+        packages=[_sample_group()],
+        cfg=_cfg(),
+        roks_snapshot={"status": "sheets_found_metrics_unparsed", "manager_metrics": {}},
+        llm_runtime={},
+        logger=None,
+        source_run_id="run1",
+        main_model_override="gemma4:31b-cloud",
+        fallback_model_override="gpt-oss:20b",
+        fallback2_model_override="deepseek-v3.1:671b-cloud",
+        llm_max_attempts=7,
+        no_retry_on_rate_limit=True,
+    )
+
+    assert rows[0]["analysis_backend_used"] == "fallback2"
+    assert diag["llm_success_fallback2"] == 1
+
+
+def test_timeout_on_main_moves_to_fallback(monkeypatch) -> None:
+    def _fake_call_llm(*, model, base_url, timeout_seconds, messages):
+        _ = base_url, timeout_seconds, messages
+        if str(model).startswith("gemma4"):
+            return None, {"ok": False, "error": "timed out", "elapsed_ms": 120000, "repair_applied": False}
+        return _valid_llm_payload(), {"ok": True, "error": "", "elapsed_ms": 50, "repair_applied": False}
+
+    monkeypatch.setattr("src.deal_analyzer.daily_control.daily_analyzer._call_llm", _fake_call_llm)
+    monkeypatch.setattr(
+        "src.deal_analyzer.daily_control.daily_analyzer._preflight_model",
+        lambda **kwargs: {"ok": True, "error": "", "elapsed_ms": 1},
+    )
+
+    rows, diag = analyze_daily_packages(
+        packages=[_sample_group()],
+        cfg=_cfg(),
+        roks_snapshot={"status": "sheets_found_metrics_unparsed", "manager_metrics": {}},
+        llm_runtime={},
+        logger=None,
+        source_run_id="run1",
+        main_model_override="gemma4:31b-cloud",
+        fallback_model_override="gpt-oss:20b",
+        llm_max_attempts=7,
+    )
+
+    assert rows[0]["analysis_backend_used"] == "fallback"
+    assert diag["llm_success_fallback"] == 1
+
+
+def test_all_attempts_fail_row_is_quarantined_not_scripted(monkeypatch) -> None:
     def _fake_call_llm(*, model, base_url, timeout_seconds, messages):
         _ = model, base_url, timeout_seconds, messages
         return None, {"ok": False, "error": "not valid JSON object", "elapsed_ms": 11, "repair_applied": False}
@@ -205,12 +372,43 @@ def test_both_invalid_json_do_not_create_fake_deterministic_analytics(monkeypatc
         source_run_id="run1",
         main_model_override="gemma4:31b-cloud",
         fallback_model_override="deepseek-v3.1:671b-cloud",
+        llm_max_attempts=5,
     )
 
     row = rows[0]
-    assert row["analysis_backend_used"] == "deterministic_fallback"
-    assert row["main_pattern"] == "не сформировано: llm_json_invalid"
+    assert row["analysis_backend_used"] == "quarantined_llm_failed"
+    assert row["main_pattern"] == ""
+    assert row["what_to_tell_employee"] == ""
     assert diag["llm_failed_count"] == 1
+    assert diag["quarantined_count"] == 1
+    quarantined = diag["quarantined_rows"][0]
+    assert quarantined["prompt_size_chars"] > 0
+    assert isinstance(quarantined["errors_by_attempt"], list)
+    assert quarantined["errors_by_attempt"]
+    assert "not valid JSON object" in quarantined["raw_response_preview"]
+
+
+def test_main_preflight_uses_non_empty_json_probe(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def _fake_call_llm(*, model, base_url, timeout_seconds, messages):
+        captured["model"] = model
+        captured["base_url"] = base_url
+        captured["timeout_seconds"] = timeout_seconds
+        captured["messages"] = messages
+        return {"ok": True}, {"ok": True, "error": "", "elapsed_ms": 12, "repair_applied": False}
+
+    monkeypatch.setattr("src.deal_analyzer.daily_control.daily_analyzer._call_llm", _fake_call_llm)
+
+    from src.deal_analyzer.daily_control.daily_analyzer import _preflight_model
+
+    result = _preflight_model(model="gemma4:31b-cloud", base_url="http://127.0.0.1:11434", timeout_seconds=20)
+    assert result["ok"] is True
+    assert int(result.get("prompt_size_chars", 0)) > 0
+    messages = captured.get("messages", [])
+    assert isinstance(messages, list)
+    assert messages
+    assert "Ответь строго JSON-объектом" in str(messages[-1].get("content", ""))
 
 
 def test_roks_parser_selects_april_and_march_and_extracts_metrics() -> None:
@@ -222,24 +420,10 @@ def test_roks_parser_selects_april_and_march_and_extracts_metrics() -> None:
     ]
 
     matrix = [["" for _ in range(17)] for _ in range(120)]
-    matrix[42][0] = "Бочков"  # row 43
-    # offsets 0..10 starting from row 43
-    metric_values = {
-        0: "20",  # days
-        1: "100",  # dials
-        2: "",  # reach -> fallback from weekly facts
-        3: "14",  # lpr
-        4: "9",  # interest
-        5: "7",  # demo
-        6: "4",  # test
-        7: "3",  # invoice_count
-        8: "120000",  # invoice_amount
-        9: "2",  # payment_count
-        10: "80000",  # payment_amount
-    }
+    matrix[42][0] = "Бочков"
+    metric_values = {0: "20", 1: "100", 2: "", 3: "14", 4: "9", 5: "7", 6: "4", 7: "3", 8: "120000", 9: "2", 10: "80000"}
     for offset, value in metric_values.items():
-        matrix[42 + offset][3] = value  # column D
-    # weekly facts for reach: F,H,J,L,N => idx 5,7,9,11,13
+        matrix[42 + offset][3] = value
     matrix[44][5] = "1"
     matrix[44][7] = "2"
     matrix[44][9] = "3"
@@ -271,107 +455,129 @@ def test_roks_parser_selects_april_and_march_and_extracts_metrics() -> None:
     assert snapshot["status"] == "sheets_found_metrics_extracted"
     metrics = snapshot["manager_metrics"]["Илья Бочков"]["current_month"]
     assert metrics["dials"] == 100
-    assert metrics["reach"] == 15  # 1+2+3+4+5 fallback from weekly fact cols
+    assert metrics["reach"] == 15
 
 
-def test_validation_blocks_foreign_greeting_but_not_style_warning() -> None:
-    row_warning = _row_for_preflight(what_to_fix="разобрать выявления ЛПР")
-    preflight_warning = evaluate_writer_preflight(
-        rows=[row_warning],
-        strict_preflight=True,
-        conflicts_count=0,
-        duplicate_policy="skip",
-    )
-    assert preflight_warning["passed"] is True
-    assert int(preflight_warning["text_lint"].get("bad_grammar_marker_count", 0)) > 0
-
-    row_block = _row_for_preflight(what_to_tell_employee="hello, fixed plan")
-    preflight_block = evaluate_writer_preflight(
-        rows=[row_block],
-        strict_preflight=True,
-        conflicts_count=0,
-        duplicate_policy="skip",
-    )
-    assert preflight_block["passed"] is False
-    assert any(rule.get("rule") == "text_lint_blockers_present" for rule in preflight_block["failed_rules"])
-
-
-def test_idempotency_skips_existing_row_with_same_key_and_counts() -> None:
-    headers = [
-        "Неделя с",
-        "Неделя по",
-        "Дата контроля",
-        "Менеджер",
-        "Проанализировано сделок",
-        "Количество звонков",
-    ]
-    existing_rows = [["2026-03-30", "2026-04-24", "2026-04-22", "Илья Бочков", "3", "5"]]
-    payload_rows = [
-        {
-            "period_start": "2026-03-30",
-            "period_end": "2026-04-24",
-            "control_day_date": "2026-04-22",
-            "manager_name": "Илья Бочков",
-            "deals_count": 3,
-            "calls_count": 5,
-        }
-    ]
+def test_idempotency_exact_same_skips_duplicate() -> None:
+    headers = ["Неделя с", "Неделя по", "Дата контроля", "Менеджер", "Проанализировано сделок", "Количество звонков"]
+    existing_rows = [["2026-04-20", "2026-04-26", "2026-04-22", "Илья Бочков", "3", "5"]]
+    payload_rows = [{"week_start": "2026-04-20", "week_end": "2026-04-26", "control_day_date": "2026-04-22", "manager_name": "Илья Бочков", "deals_count": 3, "calls_count": 5}]
     plan = plan_daily_control_write(payload_rows=payload_rows, headers=headers, existing_rows=existing_rows)
     assert plan["ok"] is True
     assert len(plan["rows_skipped_existing"]) == 1
     assert len(plan["rows_to_insert"]) == 0
+    assert len(plan["rows_to_update"]) == 0
 
 
-def test_conflict_when_same_day_manager_but_different_counts() -> None:
-    headers = [
-        "Неделя с",
-        "Неделя по",
-        "Дата контроля",
-        "Менеджер",
-        "Проанализировано сделок",
-        "Количество звонков",
-    ]
-    existing_rows = [["2026-03-30", "2026-04-24", "2026-04-22", "Илья Бочков", "3", "5"]]
-    payload_rows = [
-        {
-            "period_start": "2026-03-30",
-            "period_end": "2026-04-24",
-            "control_day_date": "2026-04-22",
-            "manager_name": "Илья Бочков",
-            "deals_count": 4,
-            "calls_count": 7,
-        }
-    ]
+def test_idempotency_bigger_counts_updates_existing_row() -> None:
+    headers = ["Неделя с", "Неделя по", "Дата контроля", "Менеджер", "Проанализировано сделок", "Количество звонков"]
+    existing_rows = [["2026-04-20", "2026-04-26", "2026-04-22", "Илья Бочков", "3", "5"]]
+    payload_rows = [{"week_start": "2026-04-20", "week_end": "2026-04-26", "control_day_date": "2026-04-22", "manager_name": "Илья Бочков", "deals_count": 4, "calls_count": 7}]
     plan = plan_daily_control_write(payload_rows=payload_rows, headers=headers, existing_rows=existing_rows)
-    assert len(plan["conflicts"]) == 1
+    assert len(plan["rows_to_update"]) == 1
+    assert len(plan["conflicts"]) == 0
     assert len(plan["rows_to_insert"]) == 0
 
 
-def test_rows_with_dropdown_only_are_treated_as_empty() -> None:
-    headers = [
-        "Неделя с",
-        "Неделя по",
-        "Дата контроля",
-        "Менеджер",
-        "Комментарий",
-        "Проанализировано сделок",
-        "Количество звонков",
-    ]
-    existing_rows = [["", "", "", "", "formula", "", ""]]
-    payload_rows = [
-        {
-            "period_start": "2026-03-30",
-            "period_end": "2026-04-24",
-            "control_day_date": "2026-04-22",
-            "manager_name": "Рустам Хомидов",
-            "deals_count": 1,
-            "calls_count": 1,
-        }
-    ]
+def test_idempotency_smaller_counts_skips_stale() -> None:
+    headers = ["Неделя с", "Неделя по", "Дата контроля", "Менеджер", "Проанализировано сделок", "Количество звонков"]
+    existing_rows = [["2026-04-20", "2026-04-26", "2026-04-22", "Илья Бочков", "6", "8"]]
+    payload_rows = [{"week_start": "2026-04-20", "week_end": "2026-04-26", "control_day_date": "2026-04-22", "manager_name": "Илья Бочков", "deals_count": 4, "calls_count": 7}]
     plan = plan_daily_control_write(payload_rows=payload_rows, headers=headers, existing_rows=existing_rows)
-    assert plan["existing_rows_detected"] == 0
-    assert len(plan["rows_to_insert"]) == 1
-    assert plan["rows_to_insert"][0]["row_number"] == 3
+    assert len(plan["rows_skipped_stale"]) == 1
+    assert len(plan["rows_to_update"]) == 0
+
+
+def test_idempotency_weird_mismatch_conflict() -> None:
+    headers = ["Неделя с", "Неделя по", "Дата контроля", "Менеджер", "Проанализировано сделок", "Количество звонков"]
+    existing_rows = [["2026-04-20", "2026-04-26", "2026-04-22", "Илья Бочков", "6", "8"]]
+    payload_rows = [{"week_start": "2026-04-20", "week_end": "2026-04-26", "control_day_date": "2026-04-22", "manager_name": "Илья Бочков", "deals_count": 5, "calls_count": 9}]
+    plan = plan_daily_control_write(payload_rows=payload_rows, headers=headers, existing_rows=existing_rows)
+    assert len(plan["conflicts"]) == 1
+    assert plan["conflicts"][0]["reason"] == "conflict_needs_review"
+
+
+def test_writer_plan_created_on_dry_run_contains_update_fields(monkeypatch) -> None:
+    payload = {"rows": [_row_for_preflight()]}
+    run_dir = Path("workspace/tmp_tests/daily_control_writer_test/new_run_v2").resolve()
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "daily_control_payload.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    class _FakeClient:
+        def __init__(self, *args, **kwargs):
+            _ = args, kwargs
+
+        def get_values(self, spreadsheet_id: str, rng: str):
+            _ = spreadsheet_id
+            if "A1:CS" in rng:
+                return [[
+                    "Неделя с", "Неделя по", "Дата контроля", "День", "Менеджер", "Роль менеджера",
+                    "Проанализировано сделок", "Количество звонков", "Ключевой вывод", "Сильные стороны",
+                    "Зоны роста", "Почему это важно", "Что закрепить", "Что исправить", "Что донес сотруднику",
+                    "Ожидаемый эффект - количество", "Ожидаемый эффект - качество", "Оценка 0-100", "Критичность",
+                ]]
+            return []
+
+        def resolve_sheet(self, spreadsheet_id: str, tab_name: str):
+            _ = spreadsheet_id
+            return {"title": tab_name, "sheetId": 1}
+
+        def build_service(self):
+            raise RuntimeError("no service in unit test")
+
+        def insert_rows(self, **kwargs):
+            raise AssertionError("dry-run must not insert")
+
+        def batch_update_values(self, *args, **kwargs):
+            raise AssertionError("dry-run must not write")
+
+    monkeypatch.setattr("src.deal_analyzer.daily_control.sheets_writer.GoogleSheetsApiClient", _FakeClient)
+
+    cfg = replace(_cfg(), deal_analyzer_spreadsheet_id="sheet-id", deal_analyzer_write_enabled=True)
+    status = write_daily_control_rows(
+        cfg=cfg,
+        run_dir=run_dir,
+        daily_sheet_name="Дневной контроль",
+        dry_run=True,
+        strict_preflight=True,
+        allow_partial_write=True,
+        quarantine_unrepaired=True,
+        logger=None,
+    )
+
+    assert status["mode"] == "dry_run"
+    assert status["rows_written"] == 0
+    assert status["block_reason"] == "dry_run_mode"
+
+    plan_path = run_dir / "daily_control_writer_plan.json"
+    assert plan_path.exists()
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    assert plan.get("write_strategy") == "values_only"
+    assert plan.get("structural_changes_required") is False
+    assert plan.get("insert_operations") == []
+    assert isinstance(plan.get("planned_value_ranges"), list)
+    assert "rows_to_update" in plan
+    assert "rows_skipped_stale" in plan
+    assert "planned_update_ranges" in plan
+    assert isinstance(plan.get("planned_ranges"), list)
+
+
+def test_preflight_allows_partial_write_with_row_quarantine() -> None:
+    rows = [
+        _row_for_preflight(),
+        _row_for_preflight(main_pattern="hello clarifying decision-makers and gathering contacts"),
+    ]
+    preflight = evaluate_writer_preflight(
+        rows=rows,
+        strict_preflight=True,
+        conflicts_count=0,
+        duplicate_policy="skip",
+        allow_partial_write=True,
+        quarantine_unrepaired=True,
+    )
+    assert preflight["passed"] is True
+    assert preflight["rows_quarantined_count"] == 1
+    assert preflight["rows_for_write_count"] == 1
 
 
 def test_base_and_product_mix_sorted_by_frequency() -> None:
@@ -402,143 +608,47 @@ def test_grouping_uses_period_and_manager_filters() -> None:
     assert diag["rows_filtered_out"] == 2
 
 
-def test_writer_plan_created_on_dry_run(monkeypatch) -> None:
-    payload = {
-        "rows": [_row_for_preflight()],
-    }
-    run_dir = Path("workspace/tmp_tests/daily_control_writer_test/new_run").resolve()
-    run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / "daily_control_payload.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+def test_week_bounds_from_control_day_date() -> None:
+    week_start, week_end = week_bounds_monday_sunday("2026-04-24")
+    assert week_start == "2026-04-20"
+    assert week_end == "2026-04-26"
 
-    class _FakeClient:
-        def __init__(self, *args, **kwargs):
-            _ = args, kwargs
 
-        def get_values(self, spreadsheet_id: str, rng: str):
-            _ = spreadsheet_id
-            if "A1:CS" in rng:
-                return [[
-                    "Неделя с",
-                    "Неделя по",
-                    "Дата контроля",
-                    "День",
-                    "Менеджер",
-                    "Роль менеджера",
-                    "Проанализировано сделок",
-                    "Количество звонков",
-                    "Ключевой вывод",
-                    "Сильные стороны",
-                    "Зоны роста",
-                    "Почему это важно",
-                    "Что закрепить",
-                    "Что исправить",
-                    "Что донес сотруднику",
-                    "Ожидаемый эффект - количество",
-                    "Ожидаемый эффект - качество",
-                    "Оценка 0-100",
-                    "Критичность",
-                ]]
-            return []
-
-        def resolve_sheet(self, spreadsheet_id: str, tab_name: str):
-            _ = spreadsheet_id
-            return {"title": tab_name, "sheetId": 1}
-
-        def build_service(self):
-            raise RuntimeError("no service in unit test")
-
-        def insert_rows(self, **kwargs):
-            raise AssertionError("dry-run must not insert")
-
-        def batch_update_values(self, *args, **kwargs):
-            raise AssertionError("dry-run must not write")
-
-    monkeypatch.setattr("src.deal_analyzer.daily_control.sheets_writer.GoogleSheetsApiClient", _FakeClient)
-
-    cfg = replace(_cfg(), deal_analyzer_spreadsheet_id="sheet-id", deal_analyzer_write_enabled=True)
-    status = write_daily_control_rows(
-        cfg=cfg,
-        run_dir=run_dir,
-        daily_sheet_name="Дневной контроль",
-        dry_run=True,
-        strict_preflight=True,
-        logger=None,
+def test_rows_have_per_day_week_not_global_period() -> None:
+    headers = ["Дата кейса", "Менеджер", "Роль", "Deal ID", "Прослушанные звонки", "Продукт / фокус", "База / тег"]
+    rows = [
+        ["2026-03-30", "Илья Бочков", "менеджер по продажам", "1", "2026-03-30 11:00 - 03:20", "линк", "tilda"],
+        ["2026-04-06", "Илья Бочков", "менеджер по продажам", "2", "2026-04-06 12:00 - 04:20", "инфо", "expo"],
+        ["2026-04-13", "Илья Бочков", "менеджер по продажам", "3", "2026-04-13 12:00 - 04:20", "инфо", "expo"],
+        ["2026-04-20", "Илья Бочков", "менеджер по продажам", "4", "2026-04-20 12:00 - 04:20", "инфо", "expo"],
+    ]
+    groups, _ = group_by_manager_day(
+        headers=headers,
+        rows=rows,
+        cfg=_cfg(),
+        period_start=date(2026, 3, 30),
+        period_end=date(2026, 4, 24),
+        manager_allowlist=("Илья Бочков",),
     )
-
-    assert status["mode"] == "dry_run"
-    assert status["rows_written"] == 0
-    assert status["block_reason"] == "dry_run_mode"
-
-    plan_path = run_dir / "daily_control_writer_plan.json"
-    assert plan_path.exists()
-    plan = json.loads(plan_path.read_text(encoding="utf-8"))
-    assert isinstance(plan.get("planned_ranges"), list)
-    assert len(plan.get("planned_ranges", [])) >= 1
+    by_day = {g.control_day_date: (g.week_start, g.week_end) for g in groups}
+    assert by_day["2026-03-30"] == ("2026-03-30", "2026-04-05")
+    assert by_day["2026-04-06"] == ("2026-04-06", "2026-04-12")
+    assert by_day["2026-04-13"] == ("2026-04-13", "2026-04-19")
+    assert by_day["2026-04-20"] == ("2026-04-20", "2026-04-26")
 
 
-def test_quality_block_reason_precedes_dry_run_mode(monkeypatch) -> None:
-    payload = {
-        "rows": [_row_for_preflight(what_to_tell_employee="hello team")],
-    }
-    run_dir = Path("workspace/tmp_tests/daily_control_writer_test/new_run_quality").resolve()
-    run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / "daily_control_payload.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+def test_criticality_written_in_russian_when_validation_is_free() -> None:
+    recommended, written, mode = _resolve_criticality_value_for_write(requested="medium", allowed_values=[])
+    assert recommended == "средняя"
+    assert written == "средняя"
+    assert mode == "free_input"
 
-    class _FakeClient:
-        def __init__(self, *args, **kwargs):
-            _ = args, kwargs
 
-        def get_values(self, spreadsheet_id: str, rng: str):
-            _ = spreadsheet_id
-            if "A1:CS" in rng:
-                return [[
-                    "Неделя с",
-                    "Неделя по",
-                    "Дата контроля",
-                    "День",
-                    "Менеджер",
-                    "Роль менеджера",
-                    "Проанализировано сделок",
-                    "Количество звонков",
-                    "Ключевой вывод",
-                    "Сильные стороны",
-                    "Зоны роста",
-                    "Почему это важно",
-                    "Что закрепить",
-                    "Что исправить",
-                    "Что донес сотруднику",
-                    "Ожидаемый эффект - количество",
-                    "Ожидаемый эффект - качество",
-                    "Оценка 0-100",
-                    "Критичность",
-                ]]
-            return []
-
-        def resolve_sheet(self, spreadsheet_id: str, tab_name: str):
-            _ = spreadsheet_id
-            return {"title": tab_name, "sheetId": 1}
-
-        def build_service(self):
-            raise RuntimeError("no service in unit test")
-
-    monkeypatch.setattr("src.deal_analyzer.daily_control.sheets_writer.GoogleSheetsApiClient", _FakeClient)
-
-    cfg = replace(_cfg(), deal_analyzer_spreadsheet_id="sheet-id", deal_analyzer_write_enabled=True)
-    status = write_daily_control_rows(
-        cfg=cfg,
-        run_dir=run_dir,
-        daily_sheet_name="Дневной контроль",
-        dry_run=True,
-        strict_preflight=True,
-        logger=None,
+def test_criticality_english_fallback_when_dropdown_english_only() -> None:
+    recommended, written, mode = _resolve_criticality_value_for_write(
+        requested="средняя",
+        allowed_values=["low", "medium", "high"],
     )
-
-    assert status["error"] == "quality_preflight_failed"
-    assert status["block_reason"] == "quality_preflight_failed"
-
-
-def test_daily_text_lint_detects_english_blocker() -> None:
-    lint = lint_daily_text_rows([
-        _row_for_preflight(main_pattern="Clarifying decision-makers and gathering contacts")
-    ])
-    assert int(lint.get("foreign_language_count", 0)) > 0
+    assert recommended == "средняя"
+    assert written == "medium"
+    assert mode == "dropdown_english_fallback"

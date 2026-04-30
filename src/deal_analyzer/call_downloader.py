@@ -128,13 +128,23 @@ class CallDownloader:
     ) -> tuple[list[CallEvidence], dict[str, Any]]:
         """Collect call notes from global call source for the period before deal-based filtering."""
         client, base_domain, token, auth_error = self._make_api_client()
+        base_domain_clean = str(base_domain or "").strip().rstrip("/")
+        if base_domain_clean and not base_domain_clean.startswith(("http://", "https://")):
+            base_domain_clean = f"https://{base_domain_clean}"
         audit: dict[str, Any] = {
             "source_mode": "deal_first_fallback",
             "base_domain": base_domain,
             "global_source_attempts": [],
+            "contacts_source_attempts": [],
             "events_fallback_attempts": [],
             "calls_seen_from_global_source": 0,
             "calls_missing_deal_id": 0,
+            "contacts_notes_requests_count": 0,
+            "contact_calls_seen": 0,
+            "contact_calls_linked_to_deal": 0,
+            "contact_calls_without_deal": 0,
+            "contact_calls_written_as_contact_only": 0,
+            "contact_call_resolution_debug": [],
             "deals_resolved_from_calls": 0,
             "deals_failed_to_resolve": 0,
             "auth_error": auth_error or "",
@@ -143,10 +153,113 @@ class CallDownloader:
             return [], audit
 
         users_cache = client.get_users_cache()
-        calls: list[CallEvidence] = []
+        calls_by_key: dict[str, CallEvidence] = {}
         missing_deal_id = 0
-        seen_call_keys: set[str] = set()
+        contact_calls_seen = 0
+        contact_calls_linked_to_deal = 0
+        contact_calls_without_deal = 0
+        contact_links_cache: dict[str, list[int]] = {}
+        lead_snapshot_cache: dict[int, dict[str, Any] | None] = {}
+        contact_call_resolution_debug: list[dict[str, Any]] = []
         period_from_unix, period_to_unix = self._period_unix_bounds(period_start=period_start, period_end=period_end)
+
+        def _append_call(call: CallEvidence) -> None:
+            key = self._call_dedup_key(call)
+            current = calls_by_key.get(key)
+            if current is None:
+                calls_by_key[key] = call
+                return
+            # Required precedence: if same call exists in lead and contact sources, keep lead.
+            current_is_lead = str(getattr(current, "entity_type", "lead") or "lead").strip().lower() == "lead"
+            new_is_lead = str(getattr(call, "entity_type", "lead") or "lead").strip().lower() == "lead"
+            if new_is_lead and not current_is_lead:
+                calls_by_key[key] = call
+                return
+            if current_is_lead and not new_is_lead:
+                return
+            if bool(call.recording_url) and not bool(current.recording_url):
+                calls_by_key[key] = call
+                return
+            if int(call.duration_seconds or 0) > int(current.duration_seconds or 0):
+                calls_by_key[key] = call
+
+        def _resolve_contact_linked_leads(contact_id_text: str) -> list[int]:
+            cached = contact_links_cache.get(contact_id_text)
+            if cached is not None:
+                return list(cached)
+            out: list[int] = []
+            if not contact_id_text.isdigit():
+                contact_links_cache[contact_id_text] = out
+                return out
+            try:
+                links = client.get_contact_links(int(contact_id_text))
+            except Exception:
+                links = []
+            for link in links:
+                if not isinstance(link, dict):
+                    continue
+                to_type = str(link.get("to_entity_type") or "").strip().lower()
+                if to_type != "leads":
+                    continue
+                to_id = link.get("to_entity_id")
+                if isinstance(to_id, int) and to_id > 0:
+                    out.append(to_id)
+                else:
+                    text = str(to_id or "").strip()
+                    if text.isdigit():
+                        out.append(int(text))
+            unique_sorted = sorted(set(out))
+            contact_links_cache[contact_id_text] = unique_sorted
+            return list(unique_sorted)
+
+        def _load_lead_snapshot(lead_id: int) -> dict[str, Any] | None:
+            cached = lead_snapshot_cache.get(int(lead_id))
+            if int(lead_id) in lead_snapshot_cache:
+                return cached
+            snapshot: dict[str, Any] | None = None
+            try:
+                loaded = client.get_lead(int(lead_id))
+                snapshot = loaded if isinstance(loaded, dict) else None
+            except Exception:
+                snapshot = None
+            lead_snapshot_cache[int(lead_id)] = snapshot
+            return snapshot
+
+        def _select_best_lead_for_contact(*, lead_ids: list[int], note: dict[str, Any]) -> tuple[str, str]:
+            params = note.get("params") if isinstance(note.get("params"), dict) else {}
+            lead_hint = ""
+            for key in ("lead_id", "deal_id", "entity_id"):
+                value = params.get(key)
+                if isinstance(value, int) and value > 0:
+                    lead_hint = str(value)
+                    break
+                text = str(value or "").strip()
+                if text.isdigit():
+                    lead_hint = text
+                    break
+            if lead_hint and any(int(lead_hint) == int(x) for x in lead_ids):
+                return lead_hint, "lead_hint_from_note_params"
+            if not lead_ids:
+                return "", "no_linked_leads"
+            best_lead_id = ""
+            best_rank: tuple[int, int, int] | None = None
+            for lead_id in lead_ids:
+                snapshot = _load_lead_snapshot(lead_id)
+                if not isinstance(snapshot, dict):
+                    rank = (0, 0, 0)
+                else:
+                    status_id_raw = snapshot.get("status_id")
+                    status_id = int(status_id_raw) if isinstance(status_id_raw, int) else 0
+                    is_open = 1 if self._is_probably_open_lead_status(status_id) else 0
+                    updated = int(snapshot.get("updated_at") or 0)
+                    created = int(snapshot.get("created_at") or 0)
+                    rank = (is_open, updated, created)
+                if best_rank is None or rank > best_rank:
+                    best_rank = rank
+                    best_lead_id = str(lead_id)
+            if best_lead_id:
+                return best_lead_id, "best_linked_lead_by_open_status_and_recency"
+            return str(lead_ids[0]), "linked_lead_fallback_first"
 
         def _append_calls_from_notes(*, notes: list[dict[str, Any]], source_location: str) -> None:
             nonlocal missing_deal_id
@@ -164,11 +277,61 @@ class CallDownloader:
                     source_location=source_location,
                 )
                 for call in extracted:
-                    key = self._call_dedup_key(call)
-                    if key in seen_call_keys:
-                        continue
-                    seen_call_keys.add(key)
-                    calls.append(call)
+                    _append_call(call)
+
+        def _append_calls_from_contact_notes(*, notes: list[dict[str, Any]], source_location: str) -> None:
+            nonlocal contact_calls_seen, contact_calls_linked_to_deal, contact_calls_without_deal
+            for note in notes:
+                if not isinstance(note, dict):
+                    continue
+                note_type = str(note.get("note_type") or "").strip().lower()
+                if note_type not in {"call_in", "call_out"}:
+                    continue
+                contact_id = self._resolve_note_contact_id(note)
+                if not contact_id:
+                    continue
+                linked_lead_ids = _resolve_contact_linked_leads(contact_id)
+                selected_deal_id, resolution_reason = _select_best_lead_for_contact(
+                    lead_ids=linked_lead_ids,
+                    note=note,
+                )
+                if selected_deal_id:
+                    entity_type = "lead"
+                    final_deal_id = selected_deal_id
+                    contact_calls_linked_to_deal += 1
+                else:
+                    entity_type = "contact_only"
+                    final_deal_id = f"contact_{contact_id}"
+                    contact_calls_without_deal += 1
+
+                contact_url = (
+                    f"{base_domain_clean}/contacts/detail/{contact_id}"
+                    if base_domain_clean and contact_id
+                    else ""
+                )
+                extracted = extract_calls_from_notes(
+                    notes=[note],
+                    deal_id=final_deal_id,
+                    users_cache=users_cache,
+                    source_location=source_location,
+                    entity_type=entity_type,
+                    contact_id=contact_id,
+                    contact_url=contact_url,
+                    resolution_reason=resolution_reason,
+                )
+                for call in extracted:
+                    contact_calls_seen += 1
+                    contact_call_resolution_debug.append(
+                        {
+                            "contact_id": str(contact_id),
+                            "call_id": str(call.call_id or ""),
+                            "linked_leads_found": [int(x) for x in linked_lead_ids],
+                            "selected_deal_id": str(selected_deal_id or ""),
+                            "final_entity_type": entity_type,
+                            "resolution_reason": str(resolution_reason or ""),
+                        }
+                    )
+                    _append_call(call)
 
         # Primary path: /api/v4/leads/notes with period filters and call note types.
         note_variants: list[dict[str, Any]] = [
@@ -224,8 +387,58 @@ class CallDownloader:
                 }
             )
 
+        # Secondary path: /api/v4/contacts/notes with same period filters and call note types.
+        for variant in note_variants:
+            total_items = 0
+            page_requests = 0
+            success = False
+            last_error = ""
+            last_request = ""
+            for page in range(1, 101):
+                params = {
+                    "limit": 250,
+                    "page": page,
+                    "filter[created_at][from]": period_from_unix,
+                    "filter[created_at][to]": period_to_unix,
+                }
+                note_type = variant.get("note_type")
+                if isinstance(note_type, str) and note_type:
+                    params["filter[note_type]"] = note_type
+                try:
+                    notes_page, meta, request_path = client.get_contacts_notes_page(params=params)
+                    page_requests += 1
+                    last_request = request_path
+                    page_count = len(notes_page)
+                    total_items += page_count
+                    _append_calls_from_contact_notes(
+                        notes=notes_page,
+                        source_location="amocrm_api:contacts_notes",
+                    )
+                    success = True
+                    if page_count < 250:
+                        break
+                except ApiRequestError as exc:
+                    last_error = str(exc)
+                    last_request = exc.path
+                    break
+                except Exception as exc:
+                    last_error = str(exc)
+                    break
+            audit["contacts_notes_requests_count"] = int(audit.get("contacts_notes_requests_count", 0) or 0) + int(page_requests)
+            audit["contacts_source_attempts"].append(
+                {
+                    "label": str(variant.get("label") or ""),
+                    "endpoint": "/api/v4/contacts/notes",
+                    "request_path_last": last_request,
+                    "page_requests": int(page_requests),
+                    "response_items_total": int(total_items),
+                    "ok": bool(success),
+                    "error": str(last_error or ""),
+                }
+            )
+
         # Fallback path: events search -> resolve lead_ids -> per-deal notes.
-        if not calls:
+        if not calls_by_key:
             event_type_variants = (
                 "incoming_call",
                 "outgoing_call",
@@ -299,10 +512,17 @@ class CallDownloader:
                         source_location="amocrm_api:events_fallback_notes_by_lead",
                     )
 
-        deduped = deduplicate_calls(calls)
+        deduped = deduplicate_calls(list(calls_by_key.values()))
         audit["source_mode"] = "call_first" if deduped else "deal_first_fallback"
         audit["calls_seen_from_global_source"] = len(deduped)
         audit["calls_missing_deal_id"] = int(missing_deal_id)
+        audit["contact_calls_seen"] = int(contact_calls_seen)
+        audit["contact_calls_linked_to_deal"] = int(contact_calls_linked_to_deal)
+        audit["contact_calls_without_deal"] = int(contact_calls_without_deal)
+        audit["contact_calls_written_as_contact_only"] = int(
+            sum(1 for call in deduped if str(getattr(call, "entity_type", "lead") or "lead").strip().lower() == "contact_only")
+        )
+        audit["contact_call_resolution_debug"] = contact_call_resolution_debug
         return deduped, audit
 
     def _resolve_call_audio(self, call: CallEvidence, *, audio_call_ids: set[str] | None = None) -> CallEvidence:
@@ -492,6 +712,34 @@ class CallDownloader:
             if text.isdigit():
                 return text
         return ""
+
+    @staticmethod
+    def _resolve_note_contact_id(note: dict[str, Any]) -> str:
+        for key in ("entity_id", "contact_id", "element_id"):
+            value = note.get(key)
+            if isinstance(value, int):
+                return str(value)
+            text = str(value or "").strip()
+            if text.isdigit():
+                return text
+        params = note.get("params") if isinstance(note.get("params"), dict) else {}
+        for key in ("contact_id", "entity_id", "contact"):
+            value = params.get(key)
+            if isinstance(value, int):
+                return str(value)
+            text = str(value or "").strip()
+            if text.isdigit():
+                return text
+        return ""
+
+    @staticmethod
+    def _is_probably_open_lead_status(status_id: int) -> bool:
+        if status_id <= 0:
+            return False
+        # Common amoCRM terminal statuses.
+        if status_id in {142, 143}:
+            return False
+        return True
 
     @staticmethod
     def _resolve_event_deal_id(event: dict[str, Any]) -> int | None:

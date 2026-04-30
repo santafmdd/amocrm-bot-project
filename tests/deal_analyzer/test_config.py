@@ -1,4 +1,5 @@
-﻿from pathlib import Path
+﻿import json
+from pathlib import Path
 from unittest.mock import patch
 from datetime import date
 
@@ -208,3 +209,26 @@ def test_resolve_period_custom_range_requires_dates():
 
     with pytest.raises(RuntimeError, match="requires both date_from and date_to"):
         resolve_period(config=cfg, requested_mode="custom_range", today=date(2026, 4, 17))
+
+
+def test_resolve_period_control_day_window_uses_control_date() -> None:
+    cfg_path = Path("d:/AI_Automation/amocrm_bot/project/config/deal_analyzer.local.json")
+    with patch("pathlib.Path.exists", return_value=True), patch("pathlib.Path.read_text", return_value=_cfg_payload()):
+        cfg = load_deal_analyzer_config(str(cfg_path))
+
+    resolved = resolve_period(
+        config=cfg,
+        requested_mode="control_day_window",
+        cli_control_date="2026-04-28",
+        today=date(2026, 4, 29),
+    )
+    assert resolved.resolved_mode == "control_day_window"
+    assert resolved.period_start.isoformat() == "2026-04-28"
+    assert resolved.period_end.isoformat() == "2026-04-28"
+
+
+def test_call_review_realwrite_config_uses_qwen_and_deepseek_fallback() -> None:
+    payload = json.loads(Path("config/deal_analyzer.call_review.deepseek.realwrite.json").read_text(encoding="utf-8-sig"))
+    assert payload.get("ollama_model") == "qwen3.5:397b-cloud"
+    assert payload.get("ollama_fallback_model") == "deepseek-v3.1:671b-cloud"
+

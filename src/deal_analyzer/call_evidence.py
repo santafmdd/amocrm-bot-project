@@ -23,6 +23,11 @@ class CallEvidence:
     audio_source_url: str = ""
     audio_download_status: str = "not_attempted"
     audio_download_error: str = ""
+    entity_type: str = "lead"
+    contact_id: str = ""
+    contact_url: str = ""
+    phone: str = ""
+    resolution_reason: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -34,6 +39,10 @@ def extract_calls_from_notes(
     deal_id: int | str,
     users_cache: dict[int, dict[str, Any]] | None = None,
     source_location: str = "amocrm_api:notes",
+    entity_type: str = "lead",
+    contact_id: int | str | None = None,
+    contact_url: str = "",
+    resolution_reason: str = "",
 ) -> list[CallEvidence]:
     out: list[CallEvidence] = []
     users_cache = users_cache or {}
@@ -55,6 +64,13 @@ def extract_calls_from_notes(
         link = str(params.get("link") or "").strip()
         uniq = str(params.get("uniq") or note.get("id") or "").strip()
         ts_unix = _safe_int(note.get("created_at") or note.get("updated_at") or 0)
+        phone_raw = str(
+            params.get("phone")
+            or params.get("phone_number")
+            or params.get("contact_phone")
+            or note.get("phone")
+            or ""
+        ).strip()
 
         quality_flags: list[str] = []
         if duration <= 0:
@@ -76,6 +92,11 @@ def extract_calls_from_notes(
                 recording_ref=uniq,
                 quality_flags=quality_flags,
                 missing_recording=not bool(link),
+                entity_type=str(entity_type or "lead").strip() or "lead",
+                contact_id=str(contact_id or "").strip(),
+                contact_url=str(contact_url or "").strip(),
+                phone=phone_raw,
+                resolution_reason=str(resolution_reason or "").strip(),
             )
         )
 

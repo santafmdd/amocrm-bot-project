@@ -756,3 +756,12 @@ In simple business words, the service must do this:
 - recommend whether to continue, drop or conditionally continue those bases,
 - recommend how to distribute future effort by segment, product and manager profile,
 - and write all that into the working workbook in a way that looks like a normal management system, not an AI artifact.
+## Role-based ROKS interpretation (2026-05)
+
+ROKS manager funnel is role-based, not always linearly attributable by one manager.
+
+- Bochkov can have `demo > interest` because he conducts routed meetings.
+- Khomidov can have `interest > 0` with `demo/test/invoice/payment = 0`; downstream stages are not required for his personal KPI.
+
+Use role-correct wording in weekly artifacts and summaries.
+See also: `docs/roks_interpretation.md`.

@@ -159,7 +159,18 @@ def build_period_snapshots(
 def _build_call_derived_summary(calls, transcripts: list[dict[str, Any]]) -> dict[str, Any]:
     total = len(calls)
     longest = max((int(c.duration_seconds) for c in calls), default=0)
-    with_transcript = sum(1 for item in transcripts if str(item.get("transcript_status") or "") in {"ok", "cached"})
+    with_transcript = sum(
+        1
+        for item in transcripts
+        if isinstance(item, dict)
+        and (
+            bool(item.get("transcript_usable"))
+            or (
+                str(item.get("transcript_status") or "").strip().lower() in {"ok", "cached"}
+                and len(str(item.get("transcript_text") or "").strip()) >= 20
+            )
+        )
+    )
     return {
         "calls_total": total,
         "longest_call_duration_seconds": longest,
