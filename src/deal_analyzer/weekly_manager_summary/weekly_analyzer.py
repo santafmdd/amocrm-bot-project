@@ -5,9 +5,19 @@ import re
 import time
 from typing import Any
 
+from src.deal_analyzer.employee_profiles.analyzer import (
+    apply_profile_to_row_fields,
+    build_employee_profile_context,
+    sanitize_employee_text,
+)
+from src.deal_analyzer.employee_profiles.registry import (
+    build_employee_profile_registry,
+    resolve_employee_profile,
+)
 from src.deal_analyzer.llm_client import OllamaClient, OllamaClientError
 from src.deal_analyzer.llm_runtime import classify_llm_error
 
+from ..weekly_shared.role_policy import contains_forbidden_upper_funnel_for_sales_manager, resolve_role_policy
 from ..weekly_shared.roks_oap import build_manager_metric_interpretation
 from .models import WeeklyManagerGroup
 
@@ -113,7 +123,7 @@ def _sanitize_quantitative_phrase(
     analyzed_deals_count: int,
     roks_calls_fact: int | float | None,
 ) -> str:
-    out = _safe_text(text)
+    out = sanitize_employee_text(_safe_text(text))
     if not out:
         return ""
     if analyzed_deals_count > 0:
@@ -136,6 +146,27 @@ def _sanitize_quantitative_phrase(
         out,
         flags=re.IGNORECASE,
     )
+    return out
+
+
+def _sanitize_role_scope_phrase(*, text: str, manager_name: str, manager_role_profile: str) -> str:
+    out = sanitize_employee_text(_safe_text(text))
+    policy = resolve_role_policy(
+        manager_name=manager_name,
+        manager_role_profile=manager_role_profile,
+    )
+    blocked, _marker = contains_forbidden_upper_funnel_for_sales_manager(text=out, policy=policy)
+    if blocked:
+        return (
+            "Фокус: теплая/текущая воронка, перевод интереса в демо, дожим теста/счета и контроль "
+            "следующего шага в amoCRM; без массового холодного обзвона."
+        )
+    if str(policy.get("role") or "") == "sales_manager":
+        if re.search(r"(давить|продавл\w+|жестк\w+\s+продаж\w+|презент\w+\s+все\s+функц\w+)", out, flags=re.IGNORECASE):
+            return (
+                "Фокус: consultative demo и guided discovery — вести клиента через его задачу, "
+                "дать hands-on действие в сервисе, зафиксировать критерий успеха теста и следующий шаг."
+            )
     return out
 
 
@@ -251,7 +282,14 @@ def _runtime_from_config(
     }
 
 
-def _build_group_context(group: WeeklyManagerGroup, roks_snapshot: dict[str, Any], *, compact: bool = False) -> dict[str, Any]:
+def _build_group_context(
+    group: WeeklyManagerGroup,
+    roks_snapshot: dict[str, Any],
+    *,
+    compact: bool = False,
+    client_context_by_manager: dict[str, dict[str, Any]] | None = None,
+    employee_profiles_registry: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     manager_metrics = (
         (roks_snapshot.get("manager_metrics") or {}) if isinstance(roks_snapshot.get("manager_metrics"), dict) else {}
     ).get(group.manager_name, {})
@@ -280,6 +318,17 @@ def _build_group_context(group: WeeklyManagerGroup, roks_snapshot: dict[str, Any
                 "score_0_100": item.get("score_0_100"),
             }
         )
+    client_context = {}
+    if isinstance(client_context_by_manager, dict):
+        node = client_context_by_manager.get(_safe_text(group.manager_name).lower())
+        if isinstance(node, dict):
+            client_context = node
+    employee_profile_context = build_employee_profile_context(
+        manager_name=group.manager_name,
+        manager_role_profile=group.manager_role_profile,
+        source_rows=[item for item in group.source_rows if isinstance(item, dict)],
+        registry_raw=employee_profiles_registry,
+    )
     payload = {
         "period_start": group.period_start,
         "period_end": group.period_end,
@@ -338,6 +387,8 @@ def _build_group_context(group: WeeklyManagerGroup, roks_snapshot: dict[str, Any
                 "note": "В разбор попадает только выборка для качественного анализа, это не общий объем работы менеджера.",
             },
         },
+        "client_list_context": client_context,
+        "employee_profile": employee_profile_context,
     }
     if compact:
         payload["context_mode"] = "compact_retry"
@@ -371,6 +422,13 @@ def _build_llm_messages(context: dict[str, Any], *, repair_mode: bool = False, p
         "Для профиля демо-исполнителя не пиши 'назначил N демо'; корректно: 'провел N демо', "
         "часть демо может прийти из встреч, назначенных другими менеджерами/источниками. "
         "Для профиля top-funnel не оценивай менеджера по demo/test/invoice/payment как обязательным KPI."
+        " Для sales_manager не давай рекомендации в формате массового холодного обзвона/наборов/дозвонов. "
+        "Для рекомендаций по демо используй consultative demo стандарт: educational demo, guided discovery, "
+        "client-led walkthrough, hands-on demonstration, совместная диагностика; "
+        "не 'давить' и не 'показывать все функции подряд'."
+        " Если в context есть client_list_context, опирайся на него для sales_manager: рекомендации через теплую/текущую воронку и конкретные клиентские категории."
+        " Учитывай employee_profile: direct_accountability = прямой тон без унижения, "
+        "expert_to_expert = профессионально, через коммерческий результат и автономию."
     )
     if repair_mode:
         system += " Режим repair: исправь JSON и язык, верни только JSON-объект."
@@ -436,6 +494,7 @@ def _row_from_payload(
     backend: str,
     source_run_id: str,
     roks_snapshot: dict[str, Any],
+    employee_profiles_registry: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     manager_metrics = (
         (roks_snapshot.get("manager_metrics") or {}) if isinstance(roks_snapshot.get("manager_metrics"), dict) else {}
@@ -486,7 +545,7 @@ def _row_from_payload(
         training_status = "обучение не планировалось"
         training_rows_used = []
 
-    return {
+    row = {
         "week_start": group.week_start,
         "week_end": group.week_end,
         "manager_name": group.manager_name,
@@ -538,10 +597,14 @@ def _row_from_payload(
         "training_link": training_link,
         "post_training_tasks": post_training_tasks,
         "post_training_tasks_link": post_training_link,
-        "manager_actions_next_week": _sanitize_quantitative_phrase(
-            text=str(payload.get("manager_actions_next_week") or ""),
-            analyzed_deals_count=analyzed_deals_count,
-            roks_calls_fact=roks_calls_fact if isinstance(roks_calls_fact, (int, float)) else None,
+        "manager_actions_next_week": _sanitize_role_scope_phrase(
+            text=_sanitize_quantitative_phrase(
+                text=str(payload.get("manager_actions_next_week") or ""),
+                analyzed_deals_count=analyzed_deals_count,
+                roks_calls_fact=roks_calls_fact if isinstance(roks_calls_fact, (int, float)) else None,
+            ),
+            manager_name=group.manager_name,
+            manager_role_profile=group.manager_role_profile,
         ),
         "expected_quantity_effect": _sanitize_quantitative_phrase(
             text=str(payload.get("expected_quantity_effect") or ""),
@@ -558,10 +621,14 @@ def _row_from_payload(
             analyzed_deals_count=analyzed_deals_count,
             roks_calls_fact=roks_calls_fact if isinstance(roks_calls_fact, (int, float)) else None,
         ),
-        "employee_message": _sanitize_quantitative_phrase(
-            text=str(payload.get("employee_message") or ""),
-            analyzed_deals_count=analyzed_deals_count,
-            roks_calls_fact=roks_calls_fact if isinstance(roks_calls_fact, (int, float)) else None,
+        "employee_message": _sanitize_role_scope_phrase(
+            text=_sanitize_quantitative_phrase(
+                text=str(payload.get("employee_message") or ""),
+                analyzed_deals_count=analyzed_deals_count,
+                roks_calls_fact=roks_calls_fact if isinstance(roks_calls_fact, (int, float)) else None,
+            ),
+            manager_name=group.manager_name,
+            manager_role_profile=group.manager_role_profile,
         ),
         "avg_score_0_100": int(group.avg_score_0_100 or 0),
         "training_source": training_source,
@@ -571,6 +638,19 @@ def _row_from_payload(
         "analysis_backend_used": backend,
         "source_run_id": source_run_id,
     }
+    profile_registry = build_employee_profile_registry(employee_profiles_registry)
+    profile = resolve_employee_profile(
+        manager_name=group.manager_name,
+        manager_role_profile=group.manager_role_profile,
+        registry=profile_registry,
+    )
+    row, _changes = apply_profile_to_row_fields(
+        row=row,
+        profile=profile,
+        fields=("employee_message", "manager_report_phrase", "manager_actions_next_week"),
+        date_hint_field="week_end",
+    )
+    return row
 
 
 def analyze_weekly_groups(
@@ -584,6 +664,7 @@ def analyze_weekly_groups(
     main_model_override: str | None = None,
     fallback_model_override: str | None = None,
     llm_max_attempts: int = 6,
+    client_context_by_manager: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     runtime = _runtime_from_config(
         cfg=cfg,
@@ -632,10 +713,57 @@ def analyze_weekly_groups(
     llm_success_fallback_compact_retry = 0
     llm_failed_count = 0
     llm_attempts_total = 0
+    employee_profile_context_rows: list[dict[str, Any]] = []
+    employee_behavior_marker_rows: list[dict[str, Any]] = []
 
     for idx, group in enumerate(groups):
-        full_context = _build_group_context(group, roks_snapshot, compact=False)
-        compact_context = _build_group_context(group, roks_snapshot, compact=True)
+        profile_context = build_employee_profile_context(
+            manager_name=group.manager_name,
+            manager_role_profile=group.manager_role_profile,
+            source_rows=[item for item in group.source_rows if isinstance(item, dict)],
+            registry_raw=getattr(cfg, "employee_profiles", None),
+        )
+        employee_profile_context_rows.append(
+            {
+                "manager_name": group.manager_name,
+                "week_start": group.week_start,
+                "week_end": group.week_end,
+                "communication_style": profile_context.get("communication_style", ""),
+                "motivators": profile_context.get("motivators", []),
+                "avoid": profile_context.get("avoid", []),
+                "profile_source": profile_context.get("profile_source", ""),
+            }
+        )
+        marker_payload = profile_context.get("behavior_markers", {})
+        if isinstance(marker_payload, dict):
+            employee_behavior_marker_rows.append(
+                {
+                    "manager_name": group.manager_name,
+                    "week_start": group.week_start,
+                    "week_end": group.week_end,
+                    "repeated_growth_zones": marker_payload.get("repeated_growth_zones", []),
+                    "repeated_strong_sides": marker_payload.get("repeated_strong_sides", []),
+                    "preferred_behavior_pattern_under_pressure": marker_payload.get(
+                        "preferred_behavior_pattern_under_pressure",
+                        "",
+                    ),
+                    "coaching_response_style": marker_payload.get("coaching_response_style", ""),
+                }
+            )
+        full_context = _build_group_context(
+            group,
+            roks_snapshot,
+            compact=False,
+            client_context_by_manager=client_context_by_manager,
+            employee_profiles_registry=getattr(cfg, "employee_profiles", None),
+        )
+        compact_context = _build_group_context(
+            group,
+            roks_snapshot,
+            compact=True,
+            client_context_by_manager=client_context_by_manager,
+            employee_profiles_registry=getattr(cfg, "employee_profiles", None),
+        )
         attempts: list[dict[str, Any]] = []
         if bool(preflight.get("main", {}).get("ok", False)):
             attempts.extend(
@@ -782,6 +910,7 @@ def analyze_weekly_groups(
                 backend=selected_backend,
                 source_run_id=source_run_id,
                 roks_snapshot=roks_snapshot,
+                employee_profiles_registry=getattr(cfg, "employee_profiles", None),
             )
             rows.append(row)
             llm_requests.append(
@@ -868,5 +997,7 @@ def analyze_weekly_groups(
         "training_rows_used_count": len(training_rows_used),
         "training_missing_but_generated_count": int(training_missing_but_generated_count),
         "training_missing_but_generated_examples": training_examples,
+        "employee_profile_context_rows": employee_profile_context_rows,
+        "employee_behavior_marker_rows": employee_behavior_marker_rows,
     }
     return rows, diagnostics

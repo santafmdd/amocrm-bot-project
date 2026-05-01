@@ -250,25 +250,155 @@ class ExternalMethodSourceProvider:
         _ = query
         configured = getattr(self.cfg, "training_materials_external_curated_urls", None)
         urls: list[str] = []
-        if isinstance(configured, list):
+        if isinstance(configured, (list, tuple)):
             urls = [clean_text(item) for item in configured if clean_text(item)]
         if not urls:
             env_raw = str(os.environ.get("TRAINING_EXTERNAL_CURATED_URLS", "") or "").strip()
             if env_raw:
                 urls = [clean_text(item) for item in env_raw.split(",") if clean_text(item)]
-        if not urls:
-            return self._empty("unavailable", provider="manual_curated_urls", fetch_errors=["curated_urls_missing"])
 
+        file_sources, file_errors = self._load_curated_sources_file()
+        by_url: dict[str, dict[str, str]] = {}
+        for item in file_sources:
+            url = clean_text(item.get("url", ""))
+            if not url:
+                continue
+            by_url[url] = item
+        for url in urls:
+            if url not in by_url:
+                by_url[url] = {"title": "", "url": url, "summary": ""}
+
+        if not by_url:
+            fetch_errors = [*file_errors, "curated_urls_missing"]
+            return self._empty("unavailable", provider="manual_curated_urls", fetch_errors=fetch_errors)
+
+        timeout_s = max(
+            3,
+            int(
+                getattr(
+                    self.cfg,
+                    "training_materials_external_fetch_timeout_seconds",
+                    getattr(self.cfg, "external_retrieval_timeout_seconds", self.timeout_seconds),
+                )
+                or self.timeout_seconds
+            ),
+        )
         rows: list[dict[str, str]] = []
-        for url in urls[: max(1, int(limit or 1))]:
+        fetch_errors: list[str] = [*file_errors]
+        for url, meta in list(by_url.items())[: max(1, int(limit or 1))]:
+            curated_title = clean_text(meta.get("title", ""))
+            curated_summary = clean_text(meta.get("summary", ""))
+            fetched = self._fetch_external_page(url=url, timeout_seconds=timeout_s)
+            title = fetched.get("title") or curated_title or f"Curated external methodology: {url}"
+            snippet = (
+                fetched.get("snippet")
+                or curated_summary
+                or "Внешний источник методики продаж/переговоров (curated fallback)."
+            )
+            if fetched.get("error"):
+                fetch_errors.append(f"{url}: {fetched.get('error')}")
             rows.append(
                 {
-                    "title": f"Curated external methodology: {url}",
-                    "url": url,
-                    "snippet": "Внешний источник методики продаж/переговоров (curated fallback).",
+                    "title": clean_text(title),
+                    "url": clean_text(url),
+                    "snippet": clean_text(snippet),
                 }
             )
-        return self._pack_results(provider="manual_curated_urls", status="ok", rows=rows)
+        return self._pack_results(provider="manual_curated_urls", status="ok", rows=rows, fetch_errors=fetch_errors[:100])
+
+    def _resolve_project_root(self) -> Path:
+        cfg_path_raw = str(getattr(self.cfg, "config_path", "") or "").strip()
+        if cfg_path_raw:
+            path = Path(cfg_path_raw)
+            try:
+                path = path.resolve()
+            except Exception:
+                path = path.absolute()
+            parent = path.parent
+            if parent.name.lower() == "config":
+                return parent.parent
+            if len(path.parents) >= 2:
+                return path.parents[1]
+            return parent
+        return Path.cwd()
+
+    def _load_curated_sources_file(self) -> tuple[list[dict[str, str]], list[str]]:
+        rel_path = clean_text(getattr(self.cfg, "training_materials_external_sources_file", ""))
+        if not rel_path:
+            return [], []
+        project_root = self._resolve_project_root()
+        source_path = Path(rel_path)
+        if not source_path.is_absolute():
+            source_path = project_root / source_path
+        if not source_path.exists():
+            return [], [f"curated_sources_file_missing:{source_path}"]
+        try:
+            payload = json.loads(source_path.read_text(encoding="utf-8-sig"))
+        except Exception as exc:
+            return [], [f"curated_sources_file_invalid_json:{exc}"]
+
+        items: list[Any]
+        if isinstance(payload, dict):
+            src = payload.get("sources")
+            items = list(src) if isinstance(src, list) else []
+        elif isinstance(payload, list):
+            items = list(payload)
+        else:
+            items = []
+        rows: list[dict[str, str]] = []
+        for raw in items:
+            if isinstance(raw, str):
+                url = clean_text(raw)
+                if url:
+                    rows.append({"title": "", "url": url, "summary": ""})
+                continue
+            if not isinstance(raw, dict):
+                continue
+            url = clean_text(raw.get("url", ""))
+            if not url:
+                continue
+            rows.append(
+                {
+                    "title": clean_text(raw.get("title", "")),
+                    "url": url,
+                    "summary": clean_text(raw.get("summary", "")),
+                }
+            )
+        return rows, []
+
+    def _fetch_external_page(self, *, url: str, timeout_seconds: int) -> dict[str, str]:
+        req = Request(
+            url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+                ),
+                "Accept-Language": "ru,en-US;q=0.8,en;q=0.6",
+            },
+            method="GET",
+        )
+        try:
+            with urlopen(req, timeout=max(3, int(timeout_seconds or self.timeout_seconds))) as response:
+                raw = response.read().decode("utf-8", errors="replace")
+        except HTTPError as exc:
+            return {"title": "", "snippet": "", "error": f"http_{exc.code}"}
+        except (URLError, TimeoutError) as exc:
+            return {"title": "", "snippet": "", "error": str(getattr(exc, "reason", exc))}
+        except Exception as exc:
+            return {"title": "", "snippet": "", "error": str(exc)}
+
+        title_match = re.search(r"<title[^>]*>(.*?)</title>", raw, flags=re.IGNORECASE | re.DOTALL)
+        title = clean_text(html.unescape(re.sub(r"<[^>]+>", " ", title_match.group(1)))) if title_match else ""
+        meta_match = re.search(
+            r'<meta[^>]+name=["\']description["\'][^>]+content=["\'](.*?)["\']',
+            raw,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        meta_desc = clean_text(html.unescape(re.sub(r"<[^>]+>", " ", meta_match.group(1)))) if meta_match else ""
+        text = clean_text(html.unescape(re.sub(r"<[^>]+>", " ", raw)))
+        snippet = meta_desc or text[:2500]
+        return {"title": title, "snippet": snippet[:2500], "error": ""}
 
 def _read_plan_matrix(
     *,
@@ -674,6 +804,7 @@ def collect_source_snippets(
     training_topic: str,
     project_root: Path,
     candidate: TrainingCandidate | None = None,
+    client_list_context: dict[str, Any] | None = None,
     external_search_provider: str = "auto",
     external_search_limit: int = 5,
 ) -> tuple[list[SourceSnippet], SourceCoverage]:
@@ -750,7 +881,17 @@ def collect_source_snippets(
     external_provider = ExternalMethodSourceProvider(
         cfg=cfg,
         provider=str(external_search_provider or "auto"),
-        timeout_seconds=max(3, int(getattr(cfg, "external_retrieval_timeout_seconds", 10) or 10)),
+        timeout_seconds=max(
+            3,
+            int(
+                getattr(
+                    cfg,
+                    "training_materials_external_fetch_timeout_seconds",
+                    getattr(cfg, "external_retrieval_timeout_seconds", 10),
+                )
+                or 10
+            ),
+        ),
     )
     external_result = external_provider.search(query=training_topic, limit=max(1, int(external_search_limit or 5)))
     external_used = bool(external_result.get("used", False))
@@ -802,6 +943,41 @@ def collect_source_snippets(
                 text="Сигналы разбора звонков использованы через связанный недельный план и тезисы обучения. Опирайся на факты и не придумывай цитаты, которых нет в источниках.",
             )
         )
+        if isinstance(client_list_context, dict):
+            categories = client_list_context.get("categories", {})
+            top_items = client_list_context.get("top_priority_items", [])
+            if isinstance(categories, dict) and categories:
+                categories_text = ", ".join(
+                    f"{clean_text(key)}={int(value or 0)}"
+                    for key, value in categories.items()
+                    if clean_text(key)
+                )
+                snippets.append(
+                    SourceSnippet(
+                        source_type="client_list",
+                        source="Клиентский список",
+                        text=f"Коммерческий клиентский контекст менеджера по категориям: {categories_text}.",
+                    )
+                )
+            if isinstance(top_items, list) and top_items:
+                top = top_items[:5]
+                compact = "; ".join(
+                    (
+                        f"{clean_text(item.get('priority_category', ''))}: "
+                        f"{clean_text(item.get('client_name', '')) or clean_text(item.get('deal_name', ''))} "
+                        f"{clean_text(item.get('deal_link', ''))}"
+                    ).strip()
+                    for item in top
+                    if isinstance(item, dict)
+                )
+                if compact:
+                    snippets.append(
+                        SourceSnippet(
+                            source_type="client_list",
+                            source="Клиентский список",
+                            text=f"Приоритетные клиенты/сделки: {compact}",
+                        )
+                    )
 
     coverage = SourceCoverage(
         style_sources_used=len([x for x in snippets if x.source_type == "style"]),

@@ -27,9 +27,98 @@
   "deal_analyzer_spreadsheet_id": "1snOH42aIRUtxS3AU9PJPHSrk1vDyFQdiIJNJRhasxX0",
   "deal_analyzer_call_review_sheet_name": "Разбор звонков",
   "deal_analyzer_call_review_start_cell": "A2",
+  "client_list_enabled": true,
+  "client_list_spreadsheet_id": "1snOH42aIRUtxS3AU9PJPHSrk1vDyFQdiIJNJRhasxX0",
+  "client_list_sheet_name": "база",
+  "client_list_link_columns": [
+    "amoCRM link",
+    "Deal link",
+    "Contact link",
+    "Company link",
+    "Ссылка на сделку",
+    "Ссылка на контакт"
+  ],
+  "client_list_status_columns": [
+    "Статус",
+    "Этап",
+    "Стадия"
+  ],
+  "client_list_comment_columns": [
+    "Комментарий",
+    "Примечание"
+  ],
+  "client_list_value_columns": [
+    "Сумма",
+    "Потенциал",
+    "Бюджет"
+  ],
+  "client_list_next_step_columns": [
+    "Следующий шаг",
+    "Дата следующего шага",
+    "Next step"
+  ],
+  "training_materials_external_sources_file": "docs/training_materials_external_sources.json",
+  "training_materials_external_fetch_timeout_seconds": 10,
+  "cache_cleanup_enabled": true,
+  "cache_retention_days": 14,
+  "cache_max_size_gb": 20,
+  "progress_heartbeat_seconds": 30,
   "daily_manager_allowlist": [
     "Рустам Хомидов",
     "Илья Бочков"
   ],
+  "role_policy_registry": {
+    "Илья Бочков": {
+      "role": "sales_manager",
+      "primary_funnel_scope": [
+        "interest_to_demo",
+        "demo_to_test",
+        "test_to_invoice",
+        "invoice_to_payment",
+        "renewals"
+      ],
+      "restricted_funnel_scope": [
+        "cold_calling",
+        "mass_lpr_discovery"
+      ],
+      "max_upper_funnel_tasks_per_week": 1
+    },
+    "Рустам Хомидов": {
+      "role": "telemarketer",
+      "primary_funnel_scope": [
+        "cold_calling",
+        "lpr_discovery",
+        "interest_creation",
+        "appointment_setting"
+      ],
+      "restricted_funnel_scope": [],
+      "max_upper_funnel_tasks_per_week": 5
+    }
+  },
+  "employee_profiles": {
+    "Рустам Хомидов": {
+      "communication_style": "direct_accountability",
+      "motivators": [
+        "responsibility",
+        "discipline",
+        "visible_progress"
+      ],
+      "avoid": [
+        "soft_generic_advice"
+      ]
+    },
+    "Илья Бочков": {
+      "communication_style": "expert_to_expert",
+      "motivators": [
+        "commercial_effect",
+        "autonomy",
+        "professional_mastery"
+      ],
+      "avoid": [
+        "tool_for_tool_sake",
+        "crm_moralizing"
+      ]
+    }
+  },
   "period_mode": "current_week_to_date"
 }

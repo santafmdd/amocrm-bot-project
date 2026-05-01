@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -54,13 +55,20 @@ class DealAnalyzerConfig:
     hide_executed_at_from_public_exports: bool = True
     executed_at_visibility: str = "internal_only"
     client_list_enrich_enabled: bool = False
+    client_list_enabled: bool = False
     appointment_list_enrich_enabled: bool = False
     client_list_source_name: str = ""
     appointment_list_source_name: str = ""
     client_list_source_url: str = ""
     appointment_list_source_url: str = ""
+    client_list_spreadsheet_id: str = ""
     client_list_sheet_name: str = ""
     appointment_list_sheet_name: str = ""
+    client_list_link_columns: tuple[str, ...] = ()
+    client_list_status_columns: tuple[str, ...] = ()
+    client_list_comment_columns: tuple[str, ...] = ()
+    client_list_value_columns: tuple[str, ...] = ()
+    client_list_next_step_columns: tuple[str, ...] = ()
     matching_strategy: str = "priority_v1"
     fields_mapping: dict[str, dict[str, str]] | None = None
     operator_outputs_enabled: bool = True
@@ -102,6 +110,8 @@ class DealAnalyzerConfig:
     deal_analyzer_overwrite_mode: bool = False
     daily_manager_allowlist: tuple[str, ...] = ("Илья", "Рустам")
     manager_role_registry: dict[str, str] | None = None
+    role_policy_registry: dict[str, dict[str, Any]] | None = None
+    employee_profiles: dict[str, dict[str, Any]] | None = None
     product_reference_urls: dict[str, str] | None = None
     sales_module_references: tuple[str, ...] = ()
     external_retrieval_enabled: bool = False
@@ -111,6 +121,13 @@ class DealAnalyzerConfig:
     external_retrieval_top_k: int = 3
     external_retrieval_api_key: str = ""
     external_retrieval_query_prefix: str = ""
+    training_materials_external_curated_urls: tuple[str, ...] = ()
+    training_materials_external_sources_file: str = ""
+    training_materials_external_fetch_timeout_seconds: int = 10
+    cache_cleanup_enabled: bool = False
+    cache_retention_days: int = 14
+    cache_max_size_gb: float = 20.0
+    progress_heartbeat_seconds: int = 30
     janitor_enabled: bool = False
     janitor_dry_run_default: bool = True
     retention_days_exports: int = 30
@@ -294,14 +311,21 @@ def load_deal_analyzer_config(config_path: str | None = None) -> DealAnalyzerCon
         )
 
     client_list_enrich_enabled = bool(raw.get("client_list_enrich_enabled", False))
+    client_list_enabled = bool(raw.get("client_list_enabled", client_list_enrich_enabled))
     appointment_list_enrich_enabled = bool(raw.get("appointment_list_enrich_enabled", False))
     client_list_source_name = str(raw.get("client_list_source_name", "")).strip()
     appointment_list_source_name = str(raw.get("appointment_list_source_name", "")).strip()
 
     client_list_source_url = str(raw.get("client_list_source_url", "")).strip()
     appointment_list_source_url = str(raw.get("appointment_list_source_url", "")).strip()
+    client_list_spreadsheet_id = str(raw.get("client_list_spreadsheet_id", "")).strip()
     client_list_sheet_name = str(raw.get("client_list_sheet_name", "")).strip()
     appointment_list_sheet_name = str(raw.get("appointment_list_sheet_name", "")).strip()
+    client_list_link_columns = tuple(_parse_str_list(raw.get("client_list_link_columns", [])))
+    client_list_status_columns = tuple(_parse_str_list(raw.get("client_list_status_columns", [])))
+    client_list_comment_columns = tuple(_parse_str_list(raw.get("client_list_comment_columns", [])))
+    client_list_value_columns = tuple(_parse_str_list(raw.get("client_list_value_columns", [])))
+    client_list_next_step_columns = tuple(_parse_str_list(raw.get("client_list_next_step_columns", [])))
 
     matching_strategy = str(raw.get("matching_strategy", "priority_v1")).strip().lower() or "priority_v1"
     if matching_strategy not in {"priority_v1"}:
@@ -386,6 +410,8 @@ def load_deal_analyzer_config(config_path: str | None = None) -> DealAnalyzerCon
         _parse_str_list(raw.get("daily_manager_allowlist", ["Илья", "Рустам"]))
     ) or ("Илья", "Рустам")
     manager_role_registry = _parse_manager_role_registry(raw.get("manager_role_registry"))
+    role_policy_registry = _parse_role_policy_registry(raw.get("role_policy_registry"))
+    employee_profiles = _parse_employee_profiles(raw.get("employee_profiles"))
     product_reference_urls_raw = raw.get("product_reference_urls")
     product_reference_urls: dict[str, str] = {}
     if isinstance(product_reference_urls_raw, dict):
@@ -413,6 +439,45 @@ def load_deal_analyzer_config(config_path: str | None = None) -> DealAnalyzerCon
         external_retrieval_top_k = 3
     external_retrieval_api_key = str(raw.get("external_retrieval_api_key", "")).strip()
     external_retrieval_query_prefix = str(raw.get("external_retrieval_query_prefix", "")).strip()
+    curated_urls_cfg = _parse_str_list(raw.get("training_materials_external_curated_urls", []))
+    curated_urls_env_raw = str(os.environ.get("TRAINING_EXTERNAL_CURATED_URLS", "") or "").strip()
+    curated_urls_env = _parse_str_list(curated_urls_env_raw.split(",")) if curated_urls_env_raw else []
+    curated_urls_seen: set[str] = set()
+    curated_urls_merged: list[str] = []
+    for item in [*curated_urls_cfg, *curated_urls_env]:
+        key = str(item or "").strip()
+        if not key:
+            continue
+        lowered = key.lower()
+        if lowered in curated_urls_seen:
+            continue
+        curated_urls_seen.add(lowered)
+        curated_urls_merged.append(key)
+    training_materials_external_curated_urls = tuple(curated_urls_merged)
+    training_materials_external_sources_file = str(raw.get("training_materials_external_sources_file", "")).strip()
+    try:
+        training_materials_external_fetch_timeout_seconds = max(
+            3,
+            int(raw.get("training_materials_external_fetch_timeout_seconds", 10)),
+        )
+    except (TypeError, ValueError):
+        training_materials_external_fetch_timeout_seconds = 10
+    cache_cleanup_enabled = bool(raw.get("cache_cleanup_enabled", False))
+    cache_retention_days = _parse_non_negative_int(
+        raw.get("cache_retention_days", 14),
+        field="cache_retention_days",
+    )
+    cache_max_size_gb = _parse_non_negative_float(
+        raw.get("cache_max_size_gb", 20.0),
+        field="cache_max_size_gb",
+    )
+    progress_heartbeat_seconds = max(
+        5,
+        _parse_non_negative_int(
+            raw.get("progress_heartbeat_seconds", 30),
+            field="progress_heartbeat_seconds",
+        ),
+    )
 
     janitor_enabled = bool(raw.get("janitor_enabled", False))
     janitor_dry_run_default = bool(raw.get("janitor_dry_run_default", True))
@@ -468,13 +533,20 @@ def load_deal_analyzer_config(config_path: str | None = None) -> DealAnalyzerCon
         hide_executed_at_from_public_exports=hide_executed_at_from_public_exports,
         executed_at_visibility=executed_at_visibility,
         client_list_enrich_enabled=client_list_enrich_enabled,
+        client_list_enabled=client_list_enabled,
         appointment_list_enrich_enabled=appointment_list_enrich_enabled,
         client_list_source_name=client_list_source_name,
         appointment_list_source_name=appointment_list_source_name,
         client_list_source_url=client_list_source_url,
         appointment_list_source_url=appointment_list_source_url,
+        client_list_spreadsheet_id=client_list_spreadsheet_id,
         client_list_sheet_name=client_list_sheet_name,
         appointment_list_sheet_name=appointment_list_sheet_name,
+        client_list_link_columns=client_list_link_columns,
+        client_list_status_columns=client_list_status_columns,
+        client_list_comment_columns=client_list_comment_columns,
+        client_list_value_columns=client_list_value_columns,
+        client_list_next_step_columns=client_list_next_step_columns,
         matching_strategy=matching_strategy,
         fields_mapping=fields_mapping,
         operator_outputs_enabled=operator_outputs_enabled,
@@ -516,6 +588,8 @@ def load_deal_analyzer_config(config_path: str | None = None) -> DealAnalyzerCon
         deal_analyzer_overwrite_mode=deal_analyzer_overwrite_mode,
         daily_manager_allowlist=daily_manager_allowlist,
         manager_role_registry=manager_role_registry,
+        role_policy_registry=role_policy_registry,
+        employee_profiles=employee_profiles,
         product_reference_urls=product_reference_urls or None,
         sales_module_references=sales_module_references,
         external_retrieval_enabled=external_retrieval_enabled,
@@ -525,6 +599,13 @@ def load_deal_analyzer_config(config_path: str | None = None) -> DealAnalyzerCon
         external_retrieval_top_k=external_retrieval_top_k,
         external_retrieval_api_key=external_retrieval_api_key,
         external_retrieval_query_prefix=external_retrieval_query_prefix,
+        training_materials_external_curated_urls=training_materials_external_curated_urls,
+        training_materials_external_sources_file=training_materials_external_sources_file,
+        training_materials_external_fetch_timeout_seconds=training_materials_external_fetch_timeout_seconds,
+        cache_cleanup_enabled=cache_cleanup_enabled,
+        cache_retention_days=cache_retention_days,
+        cache_max_size_gb=cache_max_size_gb,
+        progress_heartbeat_seconds=progress_heartbeat_seconds,
         janitor_enabled=janitor_enabled,
         janitor_dry_run_default=janitor_dry_run_default,
         retention_days_exports=retention_days_exports,
@@ -644,6 +725,64 @@ def _parse_manager_role_registry(raw: Any) -> dict[str, str]:
     if not out:
         out = {"Рустам": "telemarketer", "Илья": "sales_manager"}
     return out
+
+def _parse_role_policy_registry(raw: Any) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    if not isinstance(raw, dict):
+        return out
+    for key, value in raw.items():
+        manager_name = str(key or "").strip()
+        if not manager_name or not isinstance(value, dict):
+            continue
+        item: dict[str, Any] = {}
+        role = str(value.get("role") or "").strip()
+        if role:
+            item["role"] = role
+        for list_field in (
+            "primary_funnel_scope",
+            "restricted_funnel_scope",
+            "demo_methodology",
+            "demo_quality_checklist",
+            "sales_demo_methodology",
+        ):
+            raw_list = value.get(list_field)
+            if isinstance(raw_list, list):
+                cleaned = [str(entry).strip() for entry in raw_list if str(entry).strip()]
+                if cleaned:
+                    item[list_field] = cleaned
+        max_upper = value.get("max_upper_funnel_tasks_per_week")
+        try:
+            if max_upper is not None:
+                item["max_upper_funnel_tasks_per_week"] = max(0, int(max_upper))
+        except (TypeError, ValueError):
+            pass
+        if item:
+            out[manager_name] = item
+    return out
+
+
+def _parse_employee_profiles(raw: Any) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    if not isinstance(raw, dict):
+        return out
+    for key, value in raw.items():
+        manager_name = str(key or "").strip()
+        if not manager_name or not isinstance(value, dict):
+            continue
+        communication_style = str(value.get("communication_style") or "").strip()
+        if not communication_style:
+            continue
+        motivators = [str(item).strip() for item in (value.get("motivators") or []) if str(item).strip()]
+        avoid = [str(item).strip() for item in (value.get("avoid") or []) if str(item).strip()]
+        role_hint = str(value.get("role_hint") or value.get("role") or "").strip()
+        out[manager_name] = {
+            "communication_style": communication_style,
+            "motivators": motivators,
+            "avoid": avoid,
+            "role_hint": role_hint,
+        }
+    return out
+
 
 def _parse_non_negative_int(value: Any, *, field: str) -> int:
     try:

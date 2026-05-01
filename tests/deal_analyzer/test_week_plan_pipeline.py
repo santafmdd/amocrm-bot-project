@@ -8,10 +8,17 @@ from types import SimpleNamespace
 
 from src.deal_analyzer.config import DealAnalyzerConfig
 from src.deal_analyzer.week_plan.cli import (
+    _apply_daily_task_triad_and_business_rules,
+    _apply_duplicate_guard_with_repair,
     _build_bootstrap_rows,
+    _clean_technical_text,
     _compute_manager_week_coverage,
+    _evaluate_duplicate_guard,
+    _evaluate_smart_task_row,
     _expand_missing_manager_week_rows,
+    _parse_task_triad,
     _resolve_signal_and_plan_periods,
+    _triad_template_for_role_day,
 )
 from src.deal_analyzer.week_plan.models import WeekPlanSignalGroup
 from src.deal_analyzer.week_plan.plan_analyzer import (
@@ -29,6 +36,7 @@ from src.deal_analyzer.week_plan.validation import (
 )
 from src.deal_analyzer.week_plan.weekly_signal_builder import aggregate_mix, group_daily_rows_into_week_signals
 from src.deal_analyzer.daily_control.source_reader import map_headers
+from src.deal_analyzer.weekly_shared.role_policy import contains_forbidden_upper_funnel_for_sales_manager, resolve_role_policy
 
 
 def _cfg() -> DealAnalyzerConfig:
@@ -1270,3 +1278,193 @@ def test_writer_dry_run_header_only_russian_sheet_plans_contiguous_range(monkeyp
     assert status["block_reason"] == "dry_run_mode"
     assert len(status["planned_ranges"]) == 1
     assert status["planned_ranges"][0].endswith("A2:P11")
+
+
+def test_week_plan_sales_manager_upper_funnel_forbidden() -> None:
+    policy = resolve_role_policy(
+        manager_name="Илья Бочков",
+        manager_role_profile="менеджер по продажам",
+    )
+    blocked, _marker = contains_forbidden_upper_funnel_for_sales_manager(
+        text="Совершаю 20 звонков по базе с целью выявления ЛПР.",
+        policy=policy,
+    )
+    assert blocked is True
+
+
+def test_week_plan_telemarketer_upper_funnel_allowed() -> None:
+    policy = resolve_role_policy(
+        manager_name="Рустам Хомидов",
+        manager_role_profile="телемаркетолог",
+    )
+    blocked, _marker = contains_forbidden_upper_funnel_for_sales_manager(
+        text="Совершаю 20 звонков по базе с целью выявления ЛПР.",
+        policy=policy,
+    )
+    assert blocked is False
+
+
+def test_week_plan_duplicate_tasks_blocked() -> None:
+    duplicated_rows = [
+        _payload_row(
+            recipient="Рустам Хомидов",
+            plan_week_start="2026-04-13",
+            plan_week_end="2026-04-17",
+            plan_date=f"2026-04-{13 + idx:02d}",
+            day_label=("понедельник", "вторник", "среда", "четверг", "пятница")[idx],
+            what_i_do="Прослушать 5 записей звонков за прошлую неделю.",
+            task_to_assign="Задавать вопрос про ЛПР в каждом диалоге.",
+            what_to_check="Поле ЛПР заполнено в каждой проверенной сделке.",
+            daily_meeting_thesis="Фокус на выявлении ЛПР.",
+        )
+        for idx in range(5)
+    ]
+    diag = _evaluate_duplicate_guard(duplicated_rows)
+    assert diag["status"] == "failed"
+    manager_diag = diag["manager_weeks"][0]
+    assert manager_diag["duplicate_exact_count"] > 0 or manager_diag["duplicate_similarity_count"] > 0
+
+
+def test_week_plan_coverage_repair_generates_unique_days() -> None:
+    rows = [
+        _payload_row(
+            recipient="Рустам Хомидов",
+            manager_role_profile="телемаркетолог",
+            plan_week_start="2026-04-13",
+            plan_week_end="2026-04-17",
+            plan_date="2026-04-13",
+            day_label="понедельник",
+            what_i_do="Один и тот же текст",
+        )
+    ]
+    repaired_rows, added = _expand_missing_manager_week_rows(
+        rows=rows,
+        missing_dates_by_manager={
+            "Рустам Хомидов": ["2026-04-14", "2026-04-15", "2026-04-16", "2026-04-17"]
+        },
+        cfg=_cfg(),
+    )
+    assert added == 4
+    manager_rows = [item for item in repaired_rows if item.get("recipient") == "Рустам Хомидов"]
+    assert len(manager_rows) == 5
+    unique_what_i_do = {str(item.get("what_i_do") or "") for item in manager_rows}
+    assert len(unique_what_i_do) == 5
+
+
+def test_week_plan_repair_does_not_duplicate_idempotency_key() -> None:
+    rows = [
+        _payload_row(
+            recipient="Илья Бочков",
+            manager_role_profile="менеджер по продажам",
+            plan_week_start="2026-04-13",
+            plan_week_end="2026-04-17",
+            plan_date="2026-04-13",
+            day_label="понедельник",
+        )
+    ]
+    repaired_rows, _added = _expand_missing_manager_week_rows(
+        rows=rows,
+        missing_dates_by_manager={"Илья Бочков": ["2026-04-14", "2026-04-15", "2026-04-16", "2026-04-17"]},
+        cfg=_cfg(),
+    )
+    keys = [str(item.get("idempotency_key") or "") for item in repaired_rows]
+    assert len(keys) == len(set(keys))
+
+
+def test_week_plan_duplicate_guard_repair_produces_passed_group() -> None:
+    duplicated_rows = [
+        _payload_row(
+            recipient="Рустам Хомидов",
+            manager_role_profile="телемаркетолог",
+            plan_week_start="2026-04-13",
+            plan_week_end="2026-04-17",
+            plan_date=f"2026-04-{13 + idx:02d}",
+            day_label=("понедельник", "вторник", "среда", "четверг", "пятница")[idx],
+            what_i_do="Одинаковая задача",
+            task_to_assign="Одинаковое поручение",
+            what_to_check="Одинаковая проверка",
+            daily_meeting_thesis="Одинаковый тезис",
+        )
+        for idx in range(5)
+    ]
+    repaired_rows, debug = _apply_duplicate_guard_with_repair(rows=duplicated_rows, cfg=_cfg())
+    assert len(repaired_rows) == 5
+    assert debug["repair_attempted"] is True
+    assert debug["status"] == "passed"
+
+
+def test_week_plan_clean_technical_text_replaces_english_non_url_terms() -> None:
+    text = "Downstream этапы и next step фиксируем в pipeline. Ссылка https://example.com/next-step должна сохраниться."
+    cleaned = _clean_technical_text(text)
+    assert "Downstream" not in cleaned
+    assert "next step" not in cleaned.lower()
+    assert "pipeline" not in cleaned.lower()
+    assert "следующие этапы" in cleaned
+    assert "следующий шаг" in cleaned
+    assert "воронка" in cleaned
+    assert "https://example.com/next-step" in cleaned
+
+
+def test_week_plan_clean_technical_text_removes_cjk_noise() -> None:
+    text = "Работа с ЛПР: выход на 策略 при смене контакта."
+    cleaned = _clean_technical_text(text)
+    assert "策略" not in cleaned
+    assert "Работа с ЛПР" in cleaned
+
+
+def test_week_plan_daily_task_triad_present() -> None:
+    rows, quarantined, triad_debug, _smart_debug, _commercial_debug = _apply_daily_task_triad_and_business_rules(
+        rows=[_payload_row(task_to_assign="Сделать задачу", what_to_check="Проверить итог в CRM.")],
+        cfg=_cfg(),
+    )
+    assert quarantined == []
+    assert len(rows) == 1
+    triad = _parse_task_triad(str(rows[0].get("task_to_assign") or ""))
+    assert triad["triad_present"] is True
+    assert "1. Развитие:" in str(rows[0].get("task_to_assign") or "")
+    assert "2. Коммерческий результат:" in str(rows[0].get("task_to_assign") or "")
+    assert "3. Контроль:" in str(rows[0].get("task_to_assign") or "")
+    assert int(triad_debug.get("rows_with_triad_after", 0) or 0) == 1
+
+
+def test_sales_manager_demo_tasks_use_educational_demo() -> None:
+    template = _triad_template_for_role_day(role="sales_manager", day_slot=1)
+    merged = " ".join(str(template.get(key) or "") for key in ("focus", "development", "commercial", "control", "thesis")).lower()
+    assert any(marker in merged for marker in ("consultative demo", "guided discovery", "hands-on", "совместн", "обучающ"))
+    assert "массовый обзвон" not in merged
+    assert "20 звонков по базе" not in merged
+
+
+def test_week_plan_commercial_result_required() -> None:
+    row = _payload_row(
+        task_to_assign="1. Развитие: Отработать речевые модули. 2. Коммерческий результат: До конца дня по 3 сделкам назначить демо. 3. Контроль: Проверить запись в CRM.",
+        what_to_check="Проверить фиксацию даты демо и следующего шага.",
+    )
+    smart_eval = _evaluate_smart_task_row(row=row, task_text=str(row.get("task_to_assign") or ""))
+    assert smart_eval["smart_passed"] is True
+
+
+def test_week_plan_crm_only_task_not_allowed_as_primary() -> None:
+    rows, quarantined, _triad_debug, _smart_debug, commercial_debug = _apply_daily_task_triad_and_business_rules(
+        rows=[_payload_row(what_i_do="Проверить CRM и заполнить поле ЛПР в 5 карточках.")],
+        cfg=_cfg(),
+    )
+    assert quarantined == []
+    assert len(rows) == 1
+    what_i_do = str(rows[0].get("what_i_do") or "").lower()
+    assert "проверить crm" not in what_i_do
+    assert "заполнить поле лпр" not in what_i_do
+    assert any(token in what_i_do for token in ("сделк", "демо", "тест", "дозвон", "лпр", "интерес"))
+    assert int(commercial_debug.get("crm_only_primary_count_after", 0) or 0) == 0
+
+
+def test_week_plan_smart_task_validation() -> None:
+    rows, quarantined, _triad_debug, smart_debug, _commercial_debug = _apply_daily_task_triad_and_business_rules(
+        rows=[_payload_row(task_to_assign="Сделать звонки", what_to_check="Ок.")],
+        cfg=_cfg(),
+    )
+    assert quarantined == []
+    assert len(rows) == 1
+    row_eval = _evaluate_smart_task_row(row=rows[0], task_text=str(rows[0].get("task_to_assign") or ""))
+    assert row_eval["smart_passed"] is True
+    assert int(smart_debug.get("rows_failed_after", 0) or 0) == 0

@@ -232,3 +232,90 @@ def test_call_review_realwrite_config_uses_qwen_and_deepseek_fallback() -> None:
     assert payload.get("ollama_model") == "qwen3.5:397b-cloud"
     assert payload.get("ollama_fallback_model") == "deepseek-v3.1:671b-cloud"
 
+
+def test_load_deal_analyzer_config_parses_training_external_curated_fields() -> None:
+    cfg_path = Path("d:/AI_Automation/amocrm_bot/project/config/deal_analyzer.local.json")
+    payload = {
+        "analyzer_backend": "hybrid",
+        "training_materials_external_curated_urls": ["https://example.com/a", "https://example.com/b"],
+        "training_materials_external_sources_file": "docs/training_materials_external_sources.json",
+        "training_materials_external_fetch_timeout_seconds": 15,
+    }
+    with patch("pathlib.Path.exists", return_value=True), patch(
+        "pathlib.Path.read_text", return_value=json.dumps(payload, ensure_ascii=False)
+    ):
+        cfg = load_deal_analyzer_config(str(cfg_path))
+    assert cfg.training_materials_external_curated_urls == ("https://example.com/a", "https://example.com/b")
+    assert cfg.training_materials_external_sources_file == "docs/training_materials_external_sources.json"
+    assert cfg.training_materials_external_fetch_timeout_seconds == 15
+
+
+def test_load_deal_analyzer_config_merges_env_training_external_curated_urls() -> None:
+    cfg_path = Path("d:/AI_Automation/amocrm_bot/project/config/deal_analyzer.local.json")
+    payload = {
+        "analyzer_backend": "hybrid",
+        "training_materials_external_curated_urls": ["https://example.com/a"],
+    }
+    with patch.dict("os.environ", {"TRAINING_EXTERNAL_CURATED_URLS": "https://example.com/b, https://example.com/a"}, clear=False):
+        with patch("pathlib.Path.exists", return_value=True), patch(
+            "pathlib.Path.read_text", return_value=json.dumps(payload, ensure_ascii=False)
+        ):
+            cfg = load_deal_analyzer_config(str(cfg_path))
+    assert cfg.training_materials_external_curated_urls == ("https://example.com/a", "https://example.com/b")
+
+
+def test_load_deal_analyzer_config_parses_role_policy_registry() -> None:
+    cfg_path = Path("d:/AI_Automation/amocrm_bot/project/config/deal_analyzer.local.json")
+    payload = {
+        "analyzer_backend": "hybrid",
+        "role_policy_registry": {
+            "Илья Бочков": {
+                "role": "sales_manager",
+                "primary_funnel_scope": ["interest_to_demo", "demo_to_test"],
+                "restricted_funnel_scope": ["cold_calling", "mass_lpr_discovery"],
+                "max_upper_funnel_tasks_per_week": 1,
+            },
+            "Рустам Хомидов": {
+                "role": "telemarketer",
+                "primary_funnel_scope": ["cold_calling", "lpr_discovery"],
+            },
+        },
+    }
+    with patch("pathlib.Path.exists", return_value=True), patch(
+        "pathlib.Path.read_text", return_value=json.dumps(payload, ensure_ascii=False)
+    ):
+        cfg = load_deal_analyzer_config(str(cfg_path))
+    assert isinstance(cfg.role_policy_registry, dict)
+    ilya = cfg.role_policy_registry.get("Илья Бочков", {})
+    rustam = cfg.role_policy_registry.get("Рустам Хомидов", {})
+    assert ilya.get("role") == "sales_manager"
+    assert ilya.get("max_upper_funnel_tasks_per_week") == 1
+    assert rustam.get("role") == "telemarketer"
+
+
+def test_load_deal_analyzer_config_parses_client_list_weekly_fields() -> None:
+    cfg_path = Path("d:/AI_Automation/amocrm_bot/project/config/deal_analyzer.local.json")
+    payload = {
+        "analyzer_backend": "hybrid",
+        "client_list_enabled": True,
+        "client_list_spreadsheet_id": "spreadsheet_xyz",
+        "client_list_sheet_name": "Клиентский список",
+        "client_list_link_columns": ["amoCRM link", "Deal link"],
+        "client_list_status_columns": ["Статус"],
+        "client_list_comment_columns": ["Комментарий"],
+        "client_list_value_columns": ["Сумма"],
+        "client_list_next_step_columns": ["Следующий шаг", "Дата следующего шага"],
+    }
+    with patch("pathlib.Path.exists", return_value=True), patch(
+        "pathlib.Path.read_text", return_value=json.dumps(payload, ensure_ascii=False)
+    ):
+        cfg = load_deal_analyzer_config(str(cfg_path))
+    assert cfg.client_list_enabled is True
+    assert cfg.client_list_spreadsheet_id == "spreadsheet_xyz"
+    assert cfg.client_list_sheet_name == "Клиентский список"
+    assert cfg.client_list_link_columns == ("amoCRM link", "Deal link")
+    assert cfg.client_list_status_columns == ("Статус",)
+    assert cfg.client_list_comment_columns == ("Комментарий",)
+    assert cfg.client_list_value_columns == ("Сумма",)
+    assert cfg.client_list_next_step_columns == ("Следующий шаг", "Дата следующего шага")
+

@@ -6,9 +6,18 @@ import time
 from dataclasses import asdict
 from typing import Any, Callable
 
+from src.deal_analyzer.employee_profiles.analyzer import (
+    apply_profile_to_row_fields,
+    build_employee_profile_context,
+)
+from src.deal_analyzer.employee_profiles.registry import (
+    build_employee_profile_registry,
+    resolve_employee_profile,
+)
 from src.deal_analyzer.llm_client import OllamaClient, OllamaClientError
 from src.deal_analyzer.llm_runtime import classify_llm_error
 
+from ..weekly_shared.role_policy import contains_forbidden_upper_funnel_for_sales_manager, resolve_role_policy
 from .models import SourceSnippet, TrainingCandidate, TrainingDraft
 from .validation import (
     POST_TASK_DOC_MIN_CHARS,
@@ -144,7 +153,15 @@ def _build_runtime(
     }
 
 
-def _build_messages(*, candidate: TrainingCandidate, snippets: list[SourceSnippet], repair_mode: bool, previous_error: str, compact: bool) -> list[dict[str, str]]:
+def _build_messages(
+    *,
+    candidate: TrainingCandidate,
+    snippets: list[SourceSnippet],
+    repair_mode: bool,
+    previous_error: str,
+    compact: bool,
+    employee_profile_context: dict[str, Any] | None = None,
+) -> list[dict[str, str]]:
     schema = {
         "training_title": "",
         "training_material": "",
@@ -159,8 +176,24 @@ def _build_messages(*, candidate: TrainingCandidate, snippets: list[SourceSnippe
         }
         for item in snippets[: (6 if compact else 12)]
     ]
+    role_policy = resolve_role_policy(
+        manager_name=str(candidate.recipient or ""),
+        manager_role_profile=str(candidate.manager_role_profile or ""),
+    )
+    profile_context = (
+        employee_profile_context
+        if isinstance(employee_profile_context, dict)
+        else build_employee_profile_context(
+            manager_name=str(candidate.recipient or ""),
+            manager_role_profile=str(candidate.manager_role_profile or ""),
+            source_rows=[],
+            registry_raw=None,
+        )
+    )
     context = {
         "candidate": asdict(candidate),
+        "role_policy": role_policy,
+        "employee_profile": profile_context,
         "source_snippets": snippets_payload,
         "constraints": {
             "language": "ru",
@@ -211,6 +244,46 @@ def _build_messages(*, candidate: TrainingCandidate, snippets: list[SourceSnippe
                 "product",
                 "external",
             ],
+            "role_scope_rules": {
+                "sales_manager_forbidden_main_focus": [
+                    "20 звонков по базе",
+                    "холодные звонки",
+                    "массовый обзвон",
+                    "наборы",
+                    "дозвоны",
+                ],
+                "sales_manager_primary_focus": [
+                    "теплая/текущая воронка",
+                    "interest_to_demo",
+                    "demo_to_test",
+                    "test_to_invoice",
+                    "invoice_to_payment",
+                    "renewals",
+                    "next_step_control",
+                ],
+                "sales_manager_demo_methodology": [
+                    "educational_demo",
+                    "guided_discovery",
+                    "client-led product walkthrough",
+                    "hands-on demonstration",
+                    "совместная диагностика",
+                    "обучающая демонстрация",
+                ],
+                "sales_manager_demo_quality_checklist": [
+                    "выявлена задача клиента до показа",
+                    "есть hands-on действие клиента",
+                    "показаны только релевантные функции",
+                    "есть вопрос после каждого смыслового блока",
+                    "зафиксирован критерий успеха теста",
+                    "назначен следующий шаг",
+                ],
+                "telemarketer_primary_focus": [
+                    "cold_calling",
+                    "lpr_discovery",
+                    "interest_creation",
+                    "appointment_setting",
+                ],
+            },
         },
         "repair_reason": previous_error,
         "compact_mode": compact,
@@ -223,6 +296,13 @@ def _build_messages(*, candidate: TrainingCandidate, snippets: list[SourceSnippe
         "Не используй формулировки про расхождение CRM-стадии с фактом. "
         "Не вставляй в документ раздел 'Использованные источники'. "
         "Не вставляй внешние URL в текст обучения и задания. "
+        "Строго соблюдай role_policy из context: для sales_manager запрещены задачи массового холодного обзвона "
+        "как основной вектор обучения; фокусируйся на теплой/текущей воронке и дожиме этапов. "
+        "Учитывай employee_profile из context: direct_accountability = прямой и требовательный тон без унижения, "
+        "expert_to_expert = профессиональный тон через коммерческий эффект и автономию сотрудника. "
+        "Если тема связана с demo/test/invoice/payment для sales_manager, обучай стандарту consultative demo: "
+        "guided discovery, client-led walkthrough, hands-on demonstration, совместная диагностика, "
+        "фиксация критерия успеха теста и следующего шага без агрессивного давления."
         "training_material и task_material должны быть многострочными документами с четкими разделами и списками. "
         "В разделе речевых модулей используй префикс 'Используй:' и дай не менее 10 фраз."
     )
@@ -422,6 +502,14 @@ def _pad_to_min_chars(text: str, *, min_chars: int, filler_paragraph: str) -> st
 
 
 def _build_quality_fallback_payload(*, candidate: TrainingCandidate, payload: dict[str, Any]) -> dict[str, Any]:
+    role_policy = resolve_role_policy(
+        manager_name=str(candidate.recipient or ""),
+        manager_role_profile=str(candidate.manager_role_profile or ""),
+    )
+    is_sales_manager = str(role_policy.get("role") or "") == "sales_manager"
+    demo_methodology = ", ".join(
+        [str(item) for item in role_policy.get("demo_methodology", []) if str(item or "").strip()]
+    )
     training_title = _safe_text(payload.get("training_title", "")) or f"Разбор навыка: {candidate.what_i_do}"
     task_title = _safe_text(payload.get("task_title", "")) or f"Задание по внедрению: {candidate.what_i_do}"
     base_training = normalize_training_text(str(payload.get("training_material", "") or ""))
@@ -455,6 +543,15 @@ def _build_quality_fallback_payload(*, candidate: TrainingCandidate, payload: di
             "- Отметил, какие фразы сработали и где был провал.",
         ]
     )
+    consultative_demo_block = (
+        "## Стандарт обучающей демонстрации\n"
+        "1. До показа формулирую гипотезу боли клиента и проверяю ее вопросами.\n"
+        "2. Даю клиенту hands-on сценарий: он сам выполняет 2-3 действия в сервисе.\n"
+        "3. После каждого блока задаю guided discovery вопрос: что изменится в процессе клиента.\n"
+        "4. Показываю только релевантные функции под текущую задачу, без экскурсии по всему продукту.\n"
+        "5. Фиксирую вывод клиента, критерий успеха теста и дату следующего шага.\n"
+        f"6. Внутренний методологический профиль: {demo_methodology or 'educational_demo, guided_discovery'}."
+    )
     training_template = "\n".join(
         [
             "# Название обучения",
@@ -470,6 +567,7 @@ def _build_quality_fallback_payload(*, candidate: TrainingCandidate, payload: di
             base_training,
             "## Теория простыми словами",
             "Клиент редко формулирует реальную проблему в первой реплике. Поэтому менеджер последовательно уточняет контекст, последствия и критерии успеха, чтобы клиент сам проговорил глубинную причину.",
+            *( [consultative_demo_block] if is_sales_manager else [] ),
             "## Основная модель / алгоритм",
             "1. Зафиксировать контекст и цель контакта.\n2. Уточнить текущий процесс клиента.\n3. Найти слабое место и последствия.\n4. Выяснить, кто принимает решение.\n5. Перевести боль в ценность решения.\n6. Назначить следующий шаг с датой.\n7. Зафиксировать факты в CRM.",
             "## Как применять в звонке",
@@ -545,6 +643,58 @@ def _build_template_payload_from_candidate(*, candidate: TrainingCandidate) -> d
         ),
     }
     return _build_quality_fallback_payload(candidate=candidate, payload=seed)
+
+
+def _enforce_role_topic_scope(*, candidate: TrainingCandidate, payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    updated = dict(payload)
+    policy = resolve_role_policy(
+        manager_name=str(candidate.recipient or ""),
+        manager_role_profile=str(candidate.manager_role_profile or ""),
+    )
+    role = str(policy.get("role") or "")
+    if role != "sales_manager":
+        return updated, {"applied": False, "role": role, "reason": "role_not_sales_manager"}
+
+    fields = ("training_title", "training_material", "task_title", "task_material")
+    blocked_fields: list[str] = []
+    replacement_count = 0
+    hard_forbidden_re = re.compile(
+        r"(20\s+звонк\w*\s+по\s+баз\w*|массов\w*\s+обзвон|прозвон\w*\s+баз\w*|"
+        r"наборы|дозвоны|холодн\w*\s+звонк\w*|холодн\w*\s+обзвон\w*)",
+        flags=re.IGNORECASE,
+    )
+    aggressive_demo_re = re.compile(
+        r"(давить|продавл\w+|агрессивн\w+\s+продаж\w+|презент\w+\s+все\s+функц\w+)",
+        flags=re.IGNORECASE,
+    )
+    for field in fields:
+        raw = str(updated.get(field) or "")
+        blocked, _marker = contains_forbidden_upper_funnel_for_sales_manager(text=raw, policy=policy)
+        if not blocked and hard_forbidden_re.search(raw):
+            blocked = True
+        if aggressive_demo_re.search(raw):
+            blocked = True
+        if not blocked:
+            continue
+        blocked_fields.append(field)
+        repaired = raw
+        repaired = hard_forbidden_re.sub("работа по текущим/теплым сделкам с фокусом на следующий шаг", repaired)
+        repaired = aggressive_demo_re.sub("consultative demo через guided discovery и hands-on действие клиента", repaired)
+        if repaired == raw:
+            repaired = (
+                "Фокус обучения: теплая/текущая воронка, переход интерес -> демо, контроль next step, "
+                "дожим тест/счет/оплата, без массового холодного обзвона. "
+                "Демо проводим в формате совместной диагностики: клиент делает действия сам, менеджер задает вопросы и фиксирует следующий шаг."
+            )
+        updated[field] = repaired
+        replacement_count += 1
+
+    return updated, {
+        "applied": bool(replacement_count > 0),
+        "role": role,
+        "blocked_fields": blocked_fields,
+        "replacement_count": replacement_count,
+    }
 
 
 def _validate_payload(payload: dict[str, Any]) -> tuple[bool, list[str]]:
@@ -674,10 +824,13 @@ def analyze_training_candidates(
     llm_error_summary_by_type: dict[str, int] = {}
     model_failures_by_type: dict[str, dict[str, int]] = {}
     model_used_by_row: list[dict[str, Any]] = []
+    employee_profile_context_rows: list[dict[str, Any]] = []
+    employee_behavior_marker_rows: list[dict[str, Any]] = []
     started_ts = time.time()
     stopped_reason = ""
     stopped_candidate_index = -1
     stop_requested = False
+    profile_registry = build_employee_profile_registry(getattr(cfg, "employee_profiles", None))
 
     def _inc_model_failure(model_name: str, error_type: str) -> None:
         key = str(model_name or "").strip() or "unknown_model"
@@ -714,6 +867,39 @@ def analyze_training_candidates(
     consecutive_dns_candidate_failures = 0
 
     for idx, candidate in enumerate(candidates):
+        candidate_profile_context = build_employee_profile_context(
+            manager_name=str(candidate.recipient or ""),
+            manager_role_profile=str(candidate.manager_role_profile or ""),
+            source_rows=[],
+            registry_raw=getattr(cfg, "employee_profiles", None),
+        )
+        employee_profile_context_rows.append(
+            {
+                "row_number": int(candidate.row_number or 0),
+                "recipient": str(candidate.recipient or ""),
+                "plan_date": str(candidate.plan_date or ""),
+                "communication_style": candidate_profile_context.get("communication_style", ""),
+                "motivators": candidate_profile_context.get("motivators", []),
+                "avoid": candidate_profile_context.get("avoid", []),
+                "profile_source": candidate_profile_context.get("profile_source", ""),
+            }
+        )
+        marker_payload = candidate_profile_context.get("behavior_markers", {})
+        if isinstance(marker_payload, dict):
+            employee_behavior_marker_rows.append(
+                {
+                    "row_number": int(candidate.row_number or 0),
+                    "recipient": str(candidate.recipient or ""),
+                    "plan_date": str(candidate.plan_date or ""),
+                    "repeated_growth_zones": marker_payload.get("repeated_growth_zones", []),
+                    "repeated_strong_sides": marker_payload.get("repeated_strong_sides", []),
+                    "preferred_behavior_pattern_under_pressure": marker_payload.get(
+                        "preferred_behavior_pattern_under_pressure",
+                        "",
+                    ),
+                    "coaching_response_style": marker_payload.get("coaching_response_style", ""),
+                }
+            )
         if int(max_runtime_seconds or 0) > 0 and int(time.time() - started_ts) >= int(max_runtime_seconds):
             stopped_reason = "max_runtime_exceeded"
             stopped_candidate_index = idx
@@ -789,6 +975,7 @@ def analyze_training_candidates(
                 repair_mode=bool(attempt.get("repair", False)),
                 previous_error=last_error,
                 compact=bool(attempt.get("compact", False)),
+                employee_profile_context=candidate_profile_context,
             )
             prompt_size_chars = sum(len(str(item.get("content") or "")) for item in messages)
             max_prompt_size_chars = max(max_prompt_size_chars, prompt_size_chars)
@@ -897,11 +1084,26 @@ def analyze_training_candidates(
                 else:
                     llm_failed_fallback += 1
                 continue
+            payload, role_scope_diag = _enforce_role_topic_scope(candidate=candidate, payload=payload)
+            if bool(role_scope_diag.get("applied", False)):
+                attempt_trace.append(
+                    {
+                        "stage": f"{str(attempt.get('stage') or '')}_role_scope_repair",
+                        "model": "deterministic_role_scope_guard",
+                        "error": "",
+                        "error_type": "",
+                        "prompt_size_chars": prompt_size_chars,
+                        "elapsed_ms": 0,
+                        "response_preview": ",".join(list(role_scope_diag.get("blocked_fields", []) or [])),
+                        "network_attempt": network_attempt,
+                    }
+                )
             ok, errors = _validate_payload(payload)
             if not ok:
                 targeted_payload, targeted_repairs = _apply_targeted_quality_repairs(payload=payload, errors=errors)
                 if targeted_repairs:
                     targeted_repairs_used += 1
+                    targeted_payload, _ = _enforce_role_topic_scope(candidate=candidate, payload=targeted_payload)
                     targeted_ok, targeted_errors = _validate_payload(targeted_payload)
                     attempt_trace.append(
                         {
@@ -1023,6 +1225,7 @@ def analyze_training_candidates(
                         llm_attempts_total=int(llm_attempts_total),
                     )
                     if expanded_payload is not None:
+                        expanded_payload, _ = _enforce_role_topic_scope(candidate=candidate, payload=expanded_payload)
                         expanded_ok, expanded_errors = _validate_payload(expanded_payload)
                         if expanded_ok:
                             payload = expanded_payload
@@ -1033,6 +1236,7 @@ def analyze_training_candidates(
                             repaired_payload, repaired_applied = _apply_targeted_quality_repairs(payload=expanded_payload or payload, errors=expanded_errors)
                             if repaired_applied:
                                 targeted_repairs_used += 1
+                                repaired_payload, _ = _enforce_role_topic_scope(candidate=candidate, payload=repaired_payload)
                                 repaired_ok, repaired_errors = _validate_payload(repaired_payload)
                                 attempt_trace.append(
                                     {
@@ -1080,6 +1284,7 @@ def analyze_training_candidates(
 
         if selected_payload is None and best_quality_payload is not None and _should_expand_quality(best_quality_errors):
             fallback_payload = _build_quality_fallback_payload(candidate=candidate, payload=best_quality_payload)
+            fallback_payload, _ = _enforce_role_topic_scope(candidate=candidate, payload=fallback_payload)
             fallback_ok, fallback_errors = _validate_payload(fallback_payload)
             if fallback_ok:
                 selected_payload = fallback_payload
@@ -1095,6 +1300,7 @@ def analyze_training_candidates(
             llm_failed_count += 1
             if bool(allow_template_fallback):
                 template_payload = _build_template_payload_from_candidate(candidate=candidate)
+                template_payload, _ = _enforce_role_topic_scope(candidate=candidate, payload=template_payload)
                 template_ok, template_errors = _validate_payload(template_payload)
                 if template_ok:
                     selected_payload = template_payload
@@ -1198,6 +1404,39 @@ def analyze_training_candidates(
                 "passed_after_repair": bool(row_passed_after_repair),
             }
         )
+        profile = resolve_employee_profile(
+            manager_name=str(candidate.recipient or ""),
+            manager_role_profile=str(candidate.manager_role_profile or ""),
+            registry=profile_registry,
+        )
+        profile_payload_row, profile_changes = apply_profile_to_row_fields(
+            row={
+                "plan_date": str(candidate.plan_date or ""),
+                "training_title": str(selected_payload.get("training_title") or ""),
+                "training_material": str(selected_payload.get("training_material") or ""),
+                "task_title": str(selected_payload.get("task_title") or ""),
+                "task_material": str(selected_payload.get("task_material") or ""),
+            },
+            profile=profile,
+            fields=("training_title", "training_material", "task_title", "task_material"),
+            date_hint_field="plan_date",
+        )
+        selected_payload["training_title"] = str(profile_payload_row.get("training_title") or "")
+        selected_payload["training_material"] = str(profile_payload_row.get("training_material") or "")
+        selected_payload["task_title"] = str(profile_payload_row.get("task_title") or "")
+        selected_payload["task_material"] = str(profile_payload_row.get("task_material") or "")
+        if isinstance(profile_changes, dict) and profile_changes.get("changed_fields"):
+            attempt_trace.append(
+                {
+                    "stage": "employee_profile_tone_adjust",
+                    "model": "deterministic_employee_profile_guard",
+                    "error": "",
+                    "error_type": "",
+                    "prompt_size_chars": 0,
+                    "elapsed_ms": 0,
+                    "response_preview": ",".join(profile_changes.get("changed_fields", [])),
+                }
+            )
         draft = TrainingDraft(
             candidate=candidate,
             training_title=_safe_text(selected_payload.get("training_title")),
@@ -1274,5 +1513,7 @@ def analyze_training_candidates(
         "stopped_reason": str(stopped_reason or ""),
         "stopped_candidate_index": int(stopped_candidate_index),
         "rows_processed": int(len(drafts) + len(quarantined)),
+        "employee_profile_context_rows": employee_profile_context_rows,
+        "employee_behavior_marker_rows": employee_behavior_marker_rows,
     }
     return drafts, quarantined, diagnostics

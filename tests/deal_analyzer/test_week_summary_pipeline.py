@@ -8,7 +8,7 @@ from pathlib import Path
 from src.deal_analyzer.config import DealAnalyzerConfig
 from src.deal_analyzer.week_summary import cli as week_summary_cli
 from src.deal_analyzer.week_summary.aggregator import build_week_summary_groups
-from src.deal_analyzer.week_summary.analyzer import _runtime_from_config, analyze_week_summary_groups
+from src.deal_analyzer.week_summary.analyzer import _runtime_from_config, _sanitize_role_based_phrase, analyze_week_summary_groups
 from src.deal_analyzer.week_summary.models import WeekSummaryGroup
 from src.deal_analyzer.week_summary.sheets_writer import plan_week_summary_write, write_week_summary_rows
 
@@ -143,6 +143,12 @@ def test_week_summary_runtime_cli_override_has_priority() -> None:
     )
     assert runtime["main"]["model"] == "override-main"
     assert runtime["fallback"]["model"] == "override-fallback"
+
+
+def test_weekly_summary_sales_manager_recommendations_do_not_push_cold_calls() -> None:
+    sanitized = _sanitize_role_based_phrase("Массовый обзвон и 20 звонков по базе как план дня.")
+    assert "массовый обзвон" not in sanitized.lower()
+    assert "фокус на теплой/текущей воронке" in sanitized.lower()
 
 
 def test_week_summary_writer_skip_existing() -> None:
@@ -395,3 +401,12 @@ def test_week_summary_cli_defaults_use_utf8_sheet_names(monkeypatch) -> None:
     assert args.manager_summary_sheet == "Недельный свод менеджеров"
     assert args.plan_sheet == "План недели"
     assert args.target_sheet == "Свод недели"
+
+def test_weekly_summary_sales_manager_demo_recommendations_not_aggressive() -> None:
+    sanitized = _sanitize_role_based_phrase(
+        "На демо нужно давить и презентовать все функции подряд, чтобы продавить решение."
+    ).lower()
+    assert "давить" not in sanitized
+    assert "презентовать все функции" not in sanitized
+    assert "consultative demo" in sanitized
+    assert "guided discovery" in sanitized

@@ -9,7 +9,20 @@ from typing import Any
 from src.config import load_config
 from src.logger import setup_logging
 
+from src.deal_analyzer.client_list.normalizer import (
+    build_header_mapping as build_client_list_header_mapping,
+)
+from src.deal_analyzer.client_list.normalizer import normalize_client_rows
+from src.deal_analyzer.client_list.prioritizer import (
+    build_manager_client_context,
+    build_priority_summary as build_client_priority_summary,
+)
+from src.deal_analyzer.client_list.reader import (
+    discover_client_list_sheet,
+    read_client_list_sheet,
+)
 from src.deal_analyzer.config import DealAnalyzerConfig, load_deal_analyzer_config
+from src.deal_analyzer.progress import ProgressReporter
 from src.deal_analyzer.daily_control.style.deterministic_cleaner import clean_rows
 from src.deal_analyzer.weekly_manager_summary.artifacts import write_json, write_markdown
 from src.deal_analyzer.weekly_manager_summary.roks_enrichment import build_roks_oap_snapshot
@@ -53,6 +66,54 @@ def _manager_allowlist(cfg: DealAnalyzerConfig, cli_values: list[str] | None) ->
     if cfg_values:
         return cfg_values
     return ("Илья Бочков", "Рустам Хомидов")
+
+
+def _load_client_context_by_manager(
+    *,
+    cfg: DealAnalyzerConfig,
+    logger: Any,
+    manager_names: list[str],
+    period_start: str,
+    period_end: str,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, dict[str, Any]]]:
+    if not bool(getattr(cfg, "client_list_enabled", False)):
+        return (
+            {"status": "disabled", "warnings": ["client_list_disabled"]},
+            {"rows_total": 0, "categories": {}, "top_rows": []},
+            {},
+        )
+    try:
+        discovery = discover_client_list_sheet(cfg=cfg, logger=logger)
+        snapshot = read_client_list_sheet(cfg=cfg, logger=logger)
+        mapping = build_client_list_header_mapping(snapshot.headers, cfg=cfg)
+        rows, _rejected = normalize_client_rows(
+            headers=snapshot.headers,
+            rows=snapshot.rows,
+            mapping=mapping,
+            header_row_number=snapshot.header_row_number,
+        )
+        priority = build_client_priority_summary(rows)
+        context_by_manager: dict[str, dict[str, Any]] = {}
+        for manager_name in manager_names:
+            manager = str(manager_name or "").strip()
+            if not manager:
+                continue
+            node = build_manager_client_context(
+                rows=rows,
+                manager_name=manager,
+                period_start=period_start,
+                period_end=period_end,
+                manager_role_registry=getattr(cfg, "manager_role_registry", None),
+                role_policy_registry=getattr(cfg, "role_policy_registry", None),
+            )
+            context_by_manager[manager.lower()] = node.__dict__
+        return discovery, priority, context_by_manager
+    except Exception as exc:
+        return (
+            {"status": "read_error", "warnings": ["client_list_read_failed"], "error": str(exc)},
+            {"rows_total": 0, "categories": {}, "top_rows": [], "error": str(exc)},
+            {},
+        )
 
 
 def _payload_row_validation_rejections(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -270,11 +331,25 @@ def _run_build(args: argparse.Namespace) -> None:
     app_cfg = load_config()
     logger = setup_logging(app_cfg.logs_dir, "INFO")
     run_dir = _new_run_dir(app_cfg.project_root)
+    progress = ProgressReporter(
+        process="weekly_manager_summary",
+        run_dir=run_dir,
+        heartbeat_seconds=int(getattr(cfg, "progress_heartbeat_seconds", 30) or 30),
+        logger=logger,
+        step_name="init",
+        total=0,
+    )
 
     period_start = _parse_iso_date(str(args.period_start), field="period_start").date()
     period_end = _parse_iso_date(str(args.period_end), field="period_end").date()
     if period_end < period_start:
         raise RuntimeError("period_end must be >= period_start")
+    progress.update(
+        step_name="period_resolved",
+        current=0,
+        total=0,
+        current_item={"stage": "period", "date": f"{period_start.isoformat()}..{period_end.isoformat()}"},
+    )
 
     discovery = discover_weekly_manager_sheet(
         cfg=cfg,
@@ -286,6 +361,7 @@ def _run_build(args: argparse.Namespace) -> None:
     )
     write_json(run_dir / "weekly_manager_sheet_discovery.json", discovery)
     write_markdown(run_dir / "weekly_manager_sheet_discovery.md", title="Weekly Manager Discovery", lines=build_discovery_markdown(discovery))
+    progress.update(step_name="sheet_discovery", current=0, total=0, current_item={"stage": "discover"})
 
     spreadsheet_id = resolve_spreadsheet_id(cfg)
     source_sheet_name = (
@@ -325,6 +401,23 @@ def _run_build(args: argparse.Namespace) -> None:
     grouping_diag["groups_total_before_limit"] = groups_total_before_limit
     grouping_diag["groups_total_after_limit"] = len(groups)
     grouping_diag["groups_limit_applied"] = int(args.limit or 0)
+    progress.update(
+        step_name="groups_built",
+        current=0,
+        total=len(groups),
+        current_item={"stage": "grouping", "groups": len(groups)},
+    )
+    client_discovery, client_priority, client_context_by_manager = _load_client_context_by_manager(
+        cfg=cfg,
+        logger=logger,
+        manager_names=[
+            str(getattr(group, "manager_name", "") or "")
+            for group in groups
+            if str(getattr(group, "manager_name", "") or "").strip()
+        ],
+        period_start=period_start.isoformat(),
+        period_end=period_end.isoformat(),
+    )
 
     app_root = Path(cfg.config_path).resolve().parents[1]
     sheet_client = None
@@ -373,12 +466,19 @@ def _run_build(args: argparse.Namespace) -> None:
         groups=groups,
         cfg=cfg,
         roks_snapshot=roks_snapshot,
+        client_context_by_manager=client_context_by_manager,
         llm_runtime=llm_runtime,
         logger=logger,
         source_run_id=run_dir.name,
         main_model_override=str(args.main_model or "").strip() or None,
         fallback_model_override=str(args.fallback_model or "").strip() or None,
         llm_max_attempts=int(args.llm_max_attempts or 6),
+    )
+    progress.update(
+        step_name="llm_completed",
+        current=len(rows),
+        total=max(len(groups), len(rows)),
+        current_item={"stage": "llm", "model": str(args.main_model or "") or "default"},
     )
     rows_cleaned, _cleanup_counts = clean_rows(
         rows,
@@ -549,6 +649,12 @@ def _run_build(args: argparse.Namespace) -> None:
     }
 
     write_json(run_dir / "weekly_manager_source_rows.json", {"headers": snapshot.headers, "rows": snapshot.rows})
+    write_json(run_dir / "client_list_discovery.json", client_discovery)
+    write_json(run_dir / "client_list_priority_summary.json", client_priority)
+    write_json(
+        run_dir / "weekly_manager_client_context_debug.json",
+        {"context_by_manager": client_context_by_manager, "status": client_discovery.get("status", "")},
+    )
     write_json(run_dir / "weekly_manager_plan_fact_rows.json", plan_fact_rows)
     write_json(run_dir / "weekly_manager_input_groups.json", input_groups_payload)
     write_json(run_dir / "roks_oap_snapshot.json", roks_snapshot)
@@ -556,6 +662,20 @@ def _run_build(args: argparse.Namespace) -> None:
     write_json(run_dir / "weekly_manager_metric_sources_debug.json", metric_sources_debug)
     write_json(run_dir / "weekly_manager_llm_requests.json", llm_diag.get("llm_requests", []))
     write_json(run_dir / "weekly_manager_llm_responses.json", llm_diag.get("llm_responses", []))
+    write_json(
+        run_dir / "employee_profile_context_debug.json",
+        {
+            "rows_total": len(llm_diag.get("employee_profile_context_rows", []) if isinstance(llm_diag.get("employee_profile_context_rows"), list) else []),
+            "rows": llm_diag.get("employee_profile_context_rows", []),
+        },
+    )
+    write_json(
+        run_dir / "employee_behavior_markers.json",
+        {
+            "rows_total": len(llm_diag.get("employee_behavior_marker_rows", []) if isinstance(llm_diag.get("employee_behavior_marker_rows"), list) else []),
+            "rows": llm_diag.get("employee_behavior_marker_rows", []),
+        },
+    )
     write_json(run_dir / "weekly_manager_payload.json", payload)
     write_json(run_dir / "weekly_manager_quarantine.json", {"rows_quarantined": len(quarantined_rows), "rows": quarantined_rows})
     write_json(run_dir / "weekly_manager_row_flow_debug.json", row_flow_debug)
@@ -594,6 +714,13 @@ def _run_build(args: argparse.Namespace) -> None:
         "training_rows_used_count": int(llm_diag.get("training_rows_used_count", 0) or 0),
         "training_missing_but_generated_count": int(llm_diag.get("training_missing_but_generated_count", 0) or 0),
         "training_rows_used": llm_diag.get("training_rows_used", []),
+        "client_list_status": client_discovery.get("status", ""),
+        "employee_profile_context_rows": len(llm_diag.get("employee_profile_context_rows", []))
+        if isinstance(llm_diag.get("employee_profile_context_rows"), list)
+        else 0,
+        "employee_behavior_markers_rows": len(llm_diag.get("employee_behavior_marker_rows", []))
+        if isinstance(llm_diag.get("employee_behavior_marker_rows"), list)
+        else 0,
         "rows_to_insert": 0,
         "rows_to_update": 0,
         "rows_skipped_existing": 0,
@@ -621,6 +748,13 @@ def _run_build(args: argparse.Namespace) -> None:
     }
     write_json(run_dir / "summary.json", summary)
     write_markdown(run_dir / "summary.md", title="Weekly Manager Summary", lines=_summary_markdown_lines(summary))
+    progress.update(
+        step_name="artifacts_written",
+        current=len(writer_rows),
+        total=max(len(rows), len(writer_rows)),
+        current_item={"stage": "artifacts", "rows": len(writer_rows)},
+    )
+    progress.finish(status="completed", step_name="build_completed")
     print(str(run_dir))
 
 

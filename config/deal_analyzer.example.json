@@ -27,13 +27,37 @@
   "hide_executed_at_from_public_exports": true,
   "executed_at_visibility": "internal_only",
   "client_list_enrich_enabled": false,
+  "client_list_enabled": false,
   "appointment_list_enrich_enabled": false,
   "client_list_source_name": "client_list_v1",
   "appointment_list_source_name": "appointments_v1",
   "client_list_source_url": "",
+  "client_list_spreadsheet_id": "",
   "appointment_list_source_url": "",
-  "client_list_sheet_name": "",
+  "client_list_sheet_name": "Клиентский список",
   "appointment_list_sheet_name": "",
+  "client_list_link_columns": [
+    "amoCRM link",
+    "Deal link",
+    "Contact link",
+    "Company link"
+  ],
+  "client_list_status_columns": [
+    "Статус",
+    "Этап"
+  ],
+  "client_list_comment_columns": [
+    "Комментарий",
+    "Примечание"
+  ],
+  "client_list_value_columns": [
+    "Сумма",
+    "Потенциал"
+  ],
+  "client_list_next_step_columns": [
+    "Следующий шаг",
+    "Дата следующего шага"
+  ],
   "matching_strategy": "priority_v1",
   "operator_outputs_enabled": true,
   "fields_mapping": {
@@ -102,6 +126,59 @@
     "Рустам": "telemarketer",
     "Илья": "sales_manager"
   },
+  "role_policy_registry": {
+    "Илья Бочков": {
+      "role": "sales_manager",
+      "primary_funnel_scope": [
+        "interest_to_demo",
+        "demo_to_test",
+        "test_to_invoice",
+        "invoice_to_payment",
+        "renewals"
+      ],
+      "restricted_funnel_scope": [
+        "cold_calling",
+        "mass_lpr_discovery"
+      ],
+      "max_upper_funnel_tasks_per_week": 1
+    },
+    "Рустам Хомидов": {
+      "role": "telemarketer",
+      "primary_funnel_scope": [
+        "cold_calling",
+        "lpr_discovery",
+        "interest_creation",
+        "appointment_setting"
+      ],
+      "restricted_funnel_scope": [],
+      "max_upper_funnel_tasks_per_week": 5
+    }
+  },
+  "employee_profiles": {
+    "Рустам Хомидов": {
+      "communication_style": "direct_accountability",
+      "motivators": [
+        "responsibility",
+        "discipline",
+        "visible_progress"
+      ],
+      "avoid": [
+        "soft_generic_advice"
+      ]
+    },
+    "Илья Бочков": {
+      "communication_style": "expert_to_expert",
+      "motivators": [
+        "commercial_effect",
+        "autonomy",
+        "professional_mastery"
+      ],
+      "avoid": [
+        "tool_for_tool_sake",
+        "crm_moralizing"
+      ]
+    }
+  },
   "product_reference_urls": {
     "info": "https://istock.info/",
     "link": "https://istock.link/",
@@ -115,6 +192,13 @@
   "external_retrieval_top_k": 3,
   "external_retrieval_api_key": "",
   "external_retrieval_query_prefix": "",
+  "training_materials_external_curated_urls": [],
+  "training_materials_external_sources_file": "docs/training_materials_external_sources.json",
+  "training_materials_external_fetch_timeout_seconds": 10,
+  "cache_cleanup_enabled": false,
+  "cache_retention_days": 14,
+  "cache_max_size_gb": 20,
+  "progress_heartbeat_seconds": 30,
   "amocrm_auth_config_path": "config/amocrm_auth.local.json",
   "call_base_domain": "",
   "deal_analyzer_sheet_url": "https://docs.google.com/spreadsheets/d/1snOH42aIRUtxS3AU9PJPHSrk1vDyFQdiIJNJRhasxX0/edit",

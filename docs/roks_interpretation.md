@@ -1,41 +1,52 @@
-﻿# ROKS Role-Based Interpretation
+﻿# ROKS Interpretation (Role-Based)
 
-This project treats manager funnel metrics in ROKS as role-based, not strictly linear per one manager.
+## Core principle
+ROKS manager funnel is role-based, not always linearly attributable to one manager.
 
-## Core rule
-- A manager's `demo/test/invoice/payment` volume can include meetings routed from other managers or inbound streams.
-- Therefore, per-manager comparisons like `demo <= interest` are diagnostic-only and must not be a validation blocker.
+## Manager profiles
 
-## May 2026 operational interpretation
+### Илья Бочков (`sales_manager`)
+- Работает в основном по теплым/текущим этапам вниз по воронке.
+- Может проводить демо, пришедшие из разных источников (свои и переданные).
+- `demo > interest` допустимо.
+- `ЛИД/СОСТ > 100%` может быть diagnostic-only, не blocker.
 
-### Ilya Bochkov
-- `interest` = mainly self-generated interest/meetings he scheduled.
-- `demo` = demos he actually conducted (own + routed).
-- `demo > interest` is allowed and not an error.
-- `ЛИД/СОСТ` above 100% can be diagnostic-only and not a hard validation error.
+Правильная формулировка:
+- `провел N демо`
+- `часть демо могла прийти из встреч, назначенных Хомидовым/другими источниками`
 
-Recommended wording in summaries:
-- Use `провел N демо`.
-- If needed: `часть демо могла прийти из встреч, назначенных Хомидовым/другими источниками`.
-- Do not claim `сам назначил N демо` unless source data explicitly confirms it.
+Неправильная формулировка:
+- `сам назначил N демо` (если это не подтверждено источником).
 
-### Rustam Khomidov
-- Owns top-of-funnel: `дозвоны -> ЛПР -> есть интерес`.
-- May pass meetings further for demo/test/invoice/payment.
-- `interest > 0` with `demo/test/invoice/payment = 0` is allowed and not an error.
-- Downstream stages are not mandatory for his personal KPI evaluation.
+### Рустам Хомидов (`telemarketer`)
+- Отвечает за верх воронки: `дозвоны -> ЛПР -> есть интерес`.
+- Может передавать встречи дальше по воронке.
+- `interest > 0` при `demo/test/invoice/payment = 0` допустимо.
+- Downstream-метрики для него не должны быть обязательным KPI.
 
-Recommended wording in summaries:
-- Use `назначил N встреч / создал N есть интерес`.
-- Mention routing: `часть встреч передана на проведение` when relevant.
-- Do not evaluate him as if demo/test/payment are required personal outputs.
+Правильная формулировка:
+- `назначил N встреч / создал N есть интерес`
+- `передал часть встреч на проведение`
 
-## Implementation contract
-- No weekly parser/validator should block rows because of role-based non-linearity above.
-- Weekly artifacts should include role interpretation debug fields:
-  - `manager_role_profile`
-  - `source_generated_interest`
-  - `conducted_demo`
-  - `routed_meetings_possible`
-  - `downstream_metrics_applicable`
+## Validation/analytics contract
+Нельзя считать ошибкой:
+- `demo > interest` у Бочкова;
+- `interest > 0` и downstream нули у Хомидова.
 
+В weekly debug желательно иметь:
+- `manager_role_profile`
+- `source_generated_interest`
+- `conducted_demo`
+- `routed_meetings_possible`
+- `downstream_metrics_applicable`
+
+## Planning impact
+- Week plan для Бочкова строится вокруг warm/current pipeline и коммерческих стадий.
+- Week plan для Рустама допускает top-of-funnel задачи как основной контур.
+
+## Demo methodology alignment
+Для `sales_manager` демо-рекомендации должны быть consultative:
+- educational demo
+- guided discovery
+- client hands-on
+- next-step commitment

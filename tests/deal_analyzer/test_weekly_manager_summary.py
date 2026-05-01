@@ -10,7 +10,11 @@ from src.deal_analyzer.weekly_manager_summary import cli as weekly_manager_cli
 from src.deal_analyzer.weekly_manager_summary.models import WeeklyManagerGroup
 from src.deal_analyzer.weekly_manager_summary.sheets_writer import plan_weekly_manager_write, write_weekly_manager_rows
 from src.deal_analyzer.weekly_manager_summary.week_grouper import aggregate_mix, group_daily_rows_by_week_manager
-from src.deal_analyzer.weekly_manager_summary.weekly_analyzer import _runtime_from_config, analyze_weekly_groups
+from src.deal_analyzer.weekly_manager_summary.weekly_analyzer import (
+    _runtime_from_config,
+    _sanitize_role_scope_phrase,
+    analyze_weekly_groups,
+)
 
 
 def _cfg() -> DealAnalyzerConfig:
@@ -260,6 +264,16 @@ def test_base_mix_sorted_by_frequency() -> None:
 
 def test_product_mix_sorted_and_aggregated() -> None:
     assert aggregate_mix(["info - 2", "info - 1", "link"]) == "info - 3; link - 1"
+
+
+def test_weekly_manager_sales_manager_recommendations_do_not_push_cold_calls() -> None:
+    sanitized = _sanitize_role_scope_phrase(
+        text="Делаем массовый обзвон и 20 звонков по базе для поиска ЛПР.",
+        manager_name="Илья Бочков",
+        manager_role_profile="менеджер по продажам",
+    )
+    assert "массовый обзвон" not in sanitized.lower()
+    assert "теплая/текущая воронка" in sanitized.lower()
 
 
 def test_existing_row_skip_when_count_same() -> None:

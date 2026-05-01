@@ -2,7 +2,7 @@
 
 import json
 import uuid
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -28,8 +28,10 @@ from src.deal_analyzer.training_materials.docs_writer import (
 from src.deal_analyzer.training_materials.models import SourceCoverage, TrainingCandidate, TrainingDraft
 from src.deal_analyzer.training_materials.training_analyzer import (
     _apply_targeted_quality_repairs,
+    _build_messages,
     _build_runtime,
     _classify_training_error,
+    _enforce_role_topic_scope,
     analyze_training_candidates,
 )
 from src.deal_analyzer.training_materials.sheets_link_writer import execute_links_write
@@ -80,6 +82,17 @@ def _candidate() -> TrainingCandidate:
 def test_build_block_reason_uses_llm_generation_failed_not_rows_empty() -> None:
     block_reason = _resolve_build_block_reason(rows_training_candidates=6, rows_docs_prepared=0, llm_failed_count=6)
     assert block_reason == "llm_generation_failed"
+    assert block_reason != "rows_empty"
+
+
+def test_build_block_reason_uses_source_coverage_failed_not_rows_empty() -> None:
+    block_reason = _resolve_build_block_reason(
+        rows_training_candidates=6,
+        rows_docs_prepared=0,
+        llm_failed_count=0,
+        source_coverage_failed_rows=2,
+    )
+    assert block_reason == "source_coverage_failed"
     assert block_reason != "rows_empty"
 
 
@@ -321,6 +334,53 @@ def test_analyzer_attempts_fallback_when_main_fails(monkeypatch) -> None:
     assert diagnostics["llm_attempts_main"] >= 1
     assert diagnostics["llm_attempts_fallback"] >= 1
     assert diagnostics["fallback_used_count"] >= 1
+
+
+def test_training_materials_sales_manager_topics_do_not_become_cold_calling() -> None:
+    candidate = replace(
+        _candidate(),
+        recipient="Илья Бочков",
+        manager_role_profile="менеджер по продажам",
+    )
+    payload = {
+        "training_title": "20 звонков по базе",
+        "training_material": "Сделай массовый холодный обзвон по базе и дозвоны.",
+        "task_title": "Холодный обзвон",
+        "task_material": "Нужно сделать прозвон базы и наборы.",
+    }
+    repaired, diag = _enforce_role_topic_scope(candidate=candidate, payload=payload)
+    assert diag["applied"] is True
+    merged = " ".join(
+        [
+            str(repaired.get("training_title") or ""),
+            str(repaired.get("training_material") or ""),
+            str(repaired.get("task_title") or ""),
+            str(repaired.get("task_material") or ""),
+        ]
+    ).lower()
+    assert "холодный обзвон" not in merged
+    assert "прозвон базы" not in merged
+
+
+def test_training_materials_include_guided_demo_methodology() -> None:
+    candidate = replace(
+        _candidate(),
+        recipient="Илья Бочков",
+        manager_role_profile="менеджер по продажам",
+    )
+    messages = _build_messages(
+        candidate=candidate,
+        snippets=[],
+        repair_mode=False,
+        previous_error="",
+        compact=False,
+    )
+    system_text = str(messages[0].get("content") or "").lower()
+    user_text = str(messages[1].get("content") or "").lower()
+    merged = f"{system_text}\n{user_text}"
+    assert "guided discovery" in merged
+    assert "hands-on" in merged
+    assert "consultative demo" in merged
 
 
 def test_analyzer_uses_model_pool_when_primary_model_fails(monkeypatch) -> None:
@@ -847,6 +907,65 @@ def test_collect_training_candidates_requests_expanded_scopes(monkeypatch) -> No
     )
     assert len(candidates) == 1
     assert set(captured.get("scopes", [])) == set(scopes)
+
+
+def test_external_provider_auto_uses_curated_file_when_live_search_fails(monkeypatch) -> None:
+    tmp_root = _new_tmp_root()
+    project_root = tmp_root / "project"
+    config_root = project_root / "config"
+    config_root.mkdir(parents=True, exist_ok=True)
+    curated_file = project_root / "docs" / "training_materials_external_sources.json"
+    curated_file.parent.mkdir(parents=True, exist_ok=True)
+    curated_file.write_text(
+        json.dumps(
+            {
+                "sources": [
+                    {
+                        "title": "SPIN",
+                        "url": "https://example.com/spin",
+                        "summary": "SPIN summary",
+                    },
+                    {
+                        "title": "BANT",
+                        "url": "https://example.com/bant",
+                        "summary": "BANT summary",
+                    },
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    cfg = SimpleNamespace(
+        config_path=config_root / "deal_analyzer.local.json",
+        external_retrieval_enabled=False,
+        external_retrieval_adapter="none",
+        external_retrieval_timeout_seconds=3,
+        training_materials_external_sources_file="docs/training_materials_external_sources.json",
+        training_materials_external_curated_urls=(),
+        training_materials_external_fetch_timeout_seconds=3,
+    )
+    provider = source_collector.ExternalMethodSourceProvider(cfg=cfg, provider="auto", timeout_seconds=3)
+    monkeypatch.setattr(
+        provider,
+        "_search_http_json",
+        lambda **_kwargs: provider._empty("disabled", provider="http_json", fetch_errors=["disabled"]),
+    )
+    monkeypatch.setattr(
+        provider,
+        "_search_duckduckgo_html",
+        lambda **_kwargs: provider._empty("provider_error", provider="duckduckgo_html", fetch_errors=["ddg_failed"]),
+    )
+    monkeypatch.setattr(
+        provider,
+        "_fetch_external_page",
+        lambda **_kwargs: {"title": "", "snippet": "", "error": "network_down"},
+    )
+    result = provider.search(query="SPIN вопросы в звонке", limit=5)
+    assert result["used"] is True
+    assert result["provider"] == "manual_curated_urls"
+    assert int(result.get("count", 0) or 0) >= 2
+    assert str(result.get("status") or "") == "ok"
 
 
 def test_scope_match_accepts_superset_token_scopes() -> None:
@@ -1627,6 +1746,102 @@ def test_build_blocks_when_external_sources_required_but_unavailable(monkeypatch
     assert (run_dir / "training_materials_external_sources_debug.json").exists()
 
 
+def test_build_with_allow_no_external_sources_continues_with_warning(monkeypatch) -> None:
+    tmp_root = _new_tmp_root()
+    project_root = tmp_root / "project"
+    logs_dir = tmp_root / "logs"
+    project_root.mkdir(parents=True, exist_ok=True)
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    candidate = _candidate()
+
+    monkeypatch.setattr("src.deal_analyzer.training_materials.cli.load_deal_analyzer_config", lambda _p: _cfg(tmp_root))
+    monkeypatch.setattr(
+        "src.deal_analyzer.training_materials.cli.load_config",
+        lambda: SimpleNamespace(project_root=project_root, logs_dir=logs_dir),
+    )
+    monkeypatch.setattr("src.deal_analyzer.training_materials.cli.setup_logging", lambda *_args, **_kwargs: _DummyLogger())
+    monkeypatch.setattr(
+        "src.deal_analyzer.training_materials.cli.ensure_training_materials_oauth_scopes",
+        lambda **_kwargs: {"status": "ok", "docs_api_available": True, "missing_scopes": [], "scope_mismatch_detected": False, "reauth_required": False},
+    )
+    monkeypatch.setattr(
+        "src.deal_analyzer.training_materials.cli.collect_training_candidates",
+        lambda **_kwargs: ([candidate], {"rows_skipped_existing_links": 0, "plan_rows_total": 1}),
+    )
+    monkeypatch.setattr(
+        "src.deal_analyzer.training_materials.cli.collect_source_snippets",
+        lambda **_kwargs: (
+            [],
+            SourceCoverage(1, 1, 1, False, 0, [], [], ["provider_error"], "unavailable", ["external_sources_missing"]),
+        ),
+    )
+    draft = TrainingDraft(
+        candidate=candidate,
+        training_title="Структурированное обучение",
+        training_material=_long_training_material(),
+        task_title="Структурированное задание",
+        task_material=_long_task_material(),
+        analysis_backend_used="main",
+        quality_metrics={
+            "training": review_training_quality(_long_training_material()),
+            "task": review_task_quality(_long_task_material()),
+        },
+    )
+    monkeypatch.setattr(
+        "src.deal_analyzer.training_materials.cli.analyze_training_candidates",
+        lambda **_kwargs: (
+            [draft],
+            [],
+            {
+                "llm_failed_count": 0,
+                "llm_requests": [],
+                "llm_responses": [],
+                "llm_runtime": {},
+                "llm_error_examples": [],
+            },
+        ),
+    )
+    run_dir = tmp_root / "run_ext_allow"
+    args = SimpleNamespace(
+        config=str(tmp_root / "cfg.json"),
+        run_dir=str(run_dir),
+        week_start="2026-04-06",
+        week_end="2026-04-10",
+        plan_sheet="План недели",
+        daily_sheet="Дневной контроль",
+        call_review_sheet="Разбор звонков",
+        manager="",
+        plan_date="",
+        limit=1,
+        offset=0,
+        max_runtime_minutes=0,
+        max_llm_calls=0,
+        main_timeout=0,
+        fallback_timeout=0,
+        allow_template_fallback=False,
+        allow_full_run=True,
+        resume=False,
+        dry_run=True,
+        force_reauth=False,
+        main_model="",
+        fallback_model="",
+        model_pool="",
+        require_external_sources=True,
+        allow_no_external_sources=True,
+        external_search_provider="auto",
+        external_search_limit=5,
+        external_source_min_count=2,
+        resume_run_dir="",
+        retry_failed_from_run_dir="",
+    )
+    _run_build(args)
+    summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary["rows_docs_prepared"] >= 1
+    assert summary["block_reason"] != "external_sources_unavailable"
+    assert summary["external_sources_used"] is False
+    assert summary["source_coverage_passed"] is True
+
+
 def test_build_passes_source_coverage_when_external_sources_present(monkeypatch) -> None:
     tmp_root = _new_tmp_root()
     project_root = tmp_root / "project"
@@ -1734,6 +1949,89 @@ def test_build_passes_source_coverage_when_external_sources_present(monkeypatch)
     assert summary["external_sources_used"] is True
     assert summary["external_sources_count"] >= 2
     assert summary["block_reason"] != "external_sources_unavailable"
+
+
+def test_external_search_limit_does_not_limit_training_candidates(monkeypatch) -> None:
+    tmp_root = _new_tmp_root()
+    project_root = tmp_root / "project"
+    logs_dir = tmp_root / "logs"
+    project_root.mkdir(parents=True, exist_ok=True)
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    candidates = [
+        TrainingCandidate(**{**asdict(_candidate()), "idempotency_key": "k1", "row_number": 2}),
+        TrainingCandidate(**{**asdict(_candidate()), "idempotency_key": "k2", "row_number": 3}),
+        TrainingCandidate(**{**asdict(_candidate()), "idempotency_key": "k3", "row_number": 4}),
+    ]
+    captured: dict[str, int] = {}
+
+    monkeypatch.setattr("src.deal_analyzer.training_materials.cli.load_deal_analyzer_config", lambda _p: _cfg(tmp_root))
+    monkeypatch.setattr(
+        "src.deal_analyzer.training_materials.cli.load_config",
+        lambda: SimpleNamespace(project_root=project_root, logs_dir=logs_dir),
+    )
+    monkeypatch.setattr("src.deal_analyzer.training_materials.cli.setup_logging", lambda *_args, **_kwargs: _DummyLogger())
+    monkeypatch.setattr(
+        "src.deal_analyzer.training_materials.cli.ensure_training_materials_oauth_scopes",
+        lambda **_kwargs: {"status": "ok", "docs_api_available": True, "missing_scopes": [], "scope_mismatch_detected": False, "reauth_required": False},
+    )
+    monkeypatch.setattr(
+        "src.deal_analyzer.training_materials.cli.collect_training_candidates",
+        lambda **_kwargs: (candidates, {"rows_skipped_existing_links": 0, "plan_rows_total": len(candidates)}),
+    )
+    monkeypatch.setattr(
+        "src.deal_analyzer.training_materials.cli.collect_source_snippets",
+        lambda **_kwargs: ([], SourceCoverage(1, 1, 1, True, 2, ["A", "B"], ["https://a", "https://b"], [], "ok", [])),
+    )
+    monkeypatch.setattr(
+        "src.deal_analyzer.training_materials.cli.analyze_training_candidates",
+        lambda **kwargs: (
+            [],
+            [],
+            {
+                "llm_failed_count": 0,
+                "llm_requests": [],
+                "llm_responses": [],
+                "llm_runtime": {},
+                "llm_error_examples": [],
+                "captured_count": captured.setdefault("count", len(kwargs.get("candidates", []))),
+            },
+        ),
+    )
+    run_dir = tmp_root / "run_ext_limit"
+    args = SimpleNamespace(
+        config=str(tmp_root / "cfg.json"),
+        run_dir=str(run_dir),
+        week_start="2026-04-06",
+        week_end="2026-04-10",
+        plan_sheet="План недели",
+        daily_sheet="Дневной контроль",
+        call_review_sheet="Разбор звонков",
+        manager="",
+        plan_date="",
+        limit=0,
+        offset=0,
+        max_runtime_minutes=0,
+        max_llm_calls=0,
+        main_timeout=0,
+        fallback_timeout=0,
+        allow_template_fallback=False,
+        allow_full_run=True,
+        resume=False,
+        dry_run=True,
+        force_reauth=False,
+        main_model="",
+        fallback_model="",
+        model_pool="",
+        require_external_sources=True,
+        allow_no_external_sources=False,
+        external_search_provider="auto",
+        external_search_limit=1,
+        external_source_min_count=2,
+        resume_run_dir="",
+        retry_failed_from_run_dir="",
+    )
+    _run_build(args)
+    assert captured.get("count") == 3
 
 
 def test_build_retry_failed_from_run_dir_processes_only_failed_rows(monkeypatch) -> None:

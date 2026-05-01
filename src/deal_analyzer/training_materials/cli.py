@@ -12,7 +12,14 @@ from src.config import load_config
 from src.integrations.google_sheets_api_client import AUTH_MODE_AUTO, AUTH_MODE_INTERACTIVE_BOOTSTRAP
 from src.logger import setup_logging
 
+from ..client_list.normalizer import (
+    build_header_mapping as build_client_list_header_mapping,
+)
+from ..client_list.normalizer import normalize_client_rows
+from ..client_list.prioritizer import build_manager_client_context
+from ..client_list.reader import read_client_list_sheet
 from ..config import load_deal_analyzer_config
+from ..progress import ProgressReporter
 from .artifacts import write_json, write_markdown
 from .docs_writer import (
     ensure_training_materials_oauth_scopes,
@@ -90,6 +97,44 @@ def _load_json(path: Path, *, default: Any) -> Any:
         data = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return default
+
+
+def _build_client_context_by_manager_for_training(
+    *,
+    cfg: Any,
+    logger: Any,
+    week_start: str,
+    week_end: str,
+    manager_names: list[str],
+) -> dict[str, dict[str, Any]]:
+    if not bool(getattr(cfg, "client_list_enabled", False)):
+        return {}
+    try:
+        snapshot = read_client_list_sheet(cfg=cfg, logger=logger)
+        mapping = build_client_list_header_mapping(snapshot.headers, cfg=cfg)
+        rows, _rejected = normalize_client_rows(
+            headers=snapshot.headers,
+            rows=snapshot.rows,
+            mapping=mapping,
+            header_row_number=snapshot.header_row_number,
+        )
+        out: dict[str, dict[str, Any]] = {}
+        for manager_name in manager_names:
+            name = str(manager_name or "").strip()
+            if not name:
+                continue
+            context = build_manager_client_context(
+                rows=rows,
+                manager_name=name,
+                period_start=week_start,
+                period_end=week_end,
+                manager_role_registry=getattr(cfg, "manager_role_registry", None),
+                role_policy_registry=getattr(cfg, "role_policy_registry", None),
+            )
+            out[name.lower()] = context.__dict__
+        return out
+    except Exception:
+        return {}
     return data
 
 
@@ -220,7 +265,10 @@ def _resolve_build_block_reason(
     rows_training_candidates: int,
     rows_docs_prepared: int,
     llm_failed_count: int,
+    source_coverage_failed_rows: int = 0,
 ) -> str:
+    if int(source_coverage_failed_rows or 0) > 0:
+        return "source_coverage_failed"
     if int(rows_training_candidates or 0) > 0 and int(rows_docs_prepared or 0) == 0 and int(llm_failed_count or 0) > 0:
         return "llm_generation_failed"
     if int(rows_training_candidates or 0) == 0:
@@ -554,6 +602,14 @@ def _run_build_legacy(args: argparse.Namespace) -> None:
         run_dir = _new_run_dir(app_cfg.project_root)
     run_dir.mkdir(parents=True, exist_ok=True)
     started_ts = time.time()
+    progress_reporter = ProgressReporter(
+        process="training_materials",
+        run_dir=run_dir,
+        heartbeat_seconds=int(getattr(cfg, "progress_heartbeat_seconds", 30) or 30),
+        logger=logger,
+        step_name="init",
+        total=0,
+    )
 
     week_start = str(args.week_start or "").strip()
     week_end = str(args.week_end or "").strip()
@@ -631,6 +687,13 @@ def _run_build_legacy(args: argparse.Namespace) -> None:
         logger=logger,
         force_reauth=bool(args.force_reauth),
     )
+    progress_reporter.update(
+        step_name="source_read_started",
+        current=0,
+        total=0,
+        current_item={"stage": "source_read", "date": f"{week_start}..{week_end}"},
+        details={"run_id": run_dir.name},
+    )
     if bool(api_caps.get("reauth_required", False)):
         logger.warning(
             "training_materials oauth scope mismatch: %s (token=%s)",
@@ -683,6 +746,19 @@ def _run_build_legacy(args: argparse.Namespace) -> None:
     rows_training_candidates_total = len(candidates)
     progress["rows_candidates_total"] = len(candidates)
     _update_progress(progress, progress_path, stage="source_read_completed", started_ts=started_ts, rows_candidates_total=len(candidates))
+    progress_reporter.update(
+        step_name="source_read_completed",
+        current=0,
+        total=len(candidates),
+        current_item={"stage": "source_read", "rows": len(candidates)},
+    )
+    client_context_by_manager = _build_client_context_by_manager_for_training(
+        cfg=cfg,
+        logger=logger,
+        week_start=week_start,
+        week_end=week_end,
+        manager_names=sorted({str(item.recipient or "").strip() for item in candidates if str(item.recipient or "").strip()}),
+    )
 
     require_external_sources = bool(getattr(args, "require_external_sources", True))
     allow_no_external_sources = bool(getattr(args, "allow_no_external_sources", False))
@@ -707,11 +783,13 @@ def _run_build_legacy(args: argparse.Namespace) -> None:
     eligible_candidates: list[Any] = []
 
     for candidate in candidates:
+        candidate_client_context = client_context_by_manager.get(str(candidate.recipient or "").strip().lower(), {})
         snippets, coverage = collect_source_snippets(
             cfg=cfg,
             training_topic=candidate.what_i_do,
             project_root=app_cfg.project_root,
             candidate=candidate,
+            client_list_context=candidate_client_context,
             external_search_provider=external_search_provider,
             external_search_limit=external_search_limit,
         )
@@ -774,6 +852,12 @@ def _run_build_legacy(args: argparse.Namespace) -> None:
     candidates = eligible_candidates
     progress["rows_candidates_total"] = len(candidates)
     _update_progress(progress, progress_path, stage="source_read_completed", started_ts=started_ts, rows_candidates_total=len(candidates))
+    progress_reporter.update(
+        step_name="candidate_filtering_completed",
+        current=0,
+        total=len(candidates),
+        current_item={"stage": "candidate_filtering", "rows": len(candidates)},
+    )
 
     llm_requests: list[dict[str, Any]] = [dict(item) for item in llm_requests_resume if isinstance(item, dict)]
     llm_responses: list[dict[str, Any]] = [dict(item) for item in llm_responses_resume if isinstance(item, dict)]
@@ -795,6 +879,19 @@ def _run_build_legacy(args: argparse.Namespace) -> None:
             progress["llm_attempts_total"] = int(event.get("llm_attempts_total", progress.get("llm_attempts_total", 0)) or 0)
             updates["llm_attempts_total"] = progress["llm_attempts_total"]
         _update_progress(progress, progress_path, stage=stage, started_ts=started_ts, **updates)
+        progress_reporter.update(
+            step_name=stage or "running",
+            current=int(progress.get("rows_completed", 0) or 0),
+            total=int(progress.get("rows_candidates_total", 0) or 0),
+            current_item={
+                "recipient": str(updates.get("current_recipient") or ""),
+                "row_number": int(updates.get("current_row_number", 0) or 0),
+                "model": str(updates.get("current_model") or ""),
+                "stage": stage,
+            },
+            details={"llm_attempts_total": int(progress.get("llm_attempts_total", 0) or 0)},
+            log=stage in {"candidate_started", "candidate_prepared", "candidate_quarantined", "build_completed"},
+        )
 
     def _on_llm_request(item: dict[str, Any]) -> None:
         llm_requests.append(item)
@@ -866,6 +963,7 @@ def _run_build_legacy(args: argparse.Namespace) -> None:
             },
         )
         _update_progress(progress, progress_path, stage="build_interrupted", started_ts=started_ts)
+        progress_reporter.finish(status="interrupted", step_name="build_interrupted", error="KeyboardInterrupt")
         print(str(run_dir))
         return
 
@@ -1076,6 +1174,7 @@ def _run_build_legacy(args: argparse.Namespace) -> None:
         rows_training_candidates=rows_training_candidates_total,
         rows_docs_prepared=len(rows_payload),
         llm_failed_count=llm_failed_count,
+        source_coverage_failed_rows=len(source_coverage_failed_rows),
     )
     source_coverage_passed = len(source_coverage_failed_rows) == 0
     external_source_fail_rows = [
@@ -1085,6 +1184,8 @@ def _run_build_legacy(args: argparse.Namespace) -> None:
     ]
     if bool(require_external_sources) and not bool(allow_no_external_sources) and len(external_source_fail_rows) > 0:
         build_block_reason = "external_sources_unavailable"
+    elif len(source_coverage_failed_rows) > 0 and build_block_reason == "source_coverage_failed":
+        build_block_reason = "source_coverage_failed"
     if stopped_reason:
         build_block_reason = stopped_reason
     llm_error_examples = llm_diag.get("llm_error_examples", []) if isinstance(llm_diag.get("llm_error_examples", []), list) else []
@@ -1095,8 +1196,13 @@ def _run_build_legacy(args: argparse.Namespace) -> None:
     action_required = ""
     if build_block_reason == "external_sources_unavailable":
         action_required = (
-            "Настройте внешний поиск (provider/env key/internet) "
-            "или запустите с --allow-no-external-sources для осознанного обхода."
+            "Configure training_materials_external_sources_file or TRAINING_EXTERNAL_CURATED_URLS, "
+            "or run with --allow-no-external-sources."
+        )
+    elif build_block_reason == "source_coverage_failed":
+        action_required = (
+            "Проверьте source coverage (style/speech/product/external). "
+            "Для external fallback настройте training_materials_external_sources_file."
         )
     elif int(llm_error_summary_by_type.get("ollama_dns_failure", 0) or 0) > 0:
         action_required = "Проверить DNS/интернет: Resolve-DnsName ollama.com; Test-NetConnection ollama.com -Port 443"
@@ -1242,6 +1348,12 @@ def _run_build_legacy(args: argparse.Namespace) -> None:
         "llm_error_examples": llm_error_examples,
         "model_used_by_row": llm_diag.get("model_used_by_row", []),
         "model_failures_by_type": llm_diag.get("model_failures_by_type", {}),
+        "employee_profile_context_rows": len(llm_diag.get("employee_profile_context_rows", []))
+        if isinstance(llm_diag.get("employee_profile_context_rows"), list)
+        else 0,
+        "employee_behavior_markers_rows": len(llm_diag.get("employee_behavior_marker_rows", []))
+        if isinstance(llm_diag.get("employee_behavior_marker_rows"), list)
+        else 0,
         "quality_repairs_used": int(llm_diag.get("quality_repairs_used", 0) or 0),
         "targeted_repairs_used": int(llm_diag.get("targeted_repairs_used", 0) or 0),
         "rows_passed_after_repair": int(llm_diag.get("rows_passed_after_repair", 0) or 0),
@@ -1297,6 +1409,20 @@ def _run_build_legacy(args: argparse.Namespace) -> None:
     write_json(run_dir / "training_materials_llm_requests.json", llm_requests)
     write_json(run_dir / "training_materials_llm_responses.json", llm_responses)
     write_json(
+        run_dir / "employee_profile_context_debug.json",
+        {
+            "rows_total": len(llm_diag.get("employee_profile_context_rows", []) if isinstance(llm_diag.get("employee_profile_context_rows"), list) else []),
+            "rows": llm_diag.get("employee_profile_context_rows", []),
+        },
+    )
+    write_json(
+        run_dir / "employee_behavior_markers.json",
+        {
+            "rows_total": len(llm_diag.get("employee_behavior_marker_rows", []) if isinstance(llm_diag.get("employee_behavior_marker_rows"), list) else []),
+            "rows": llm_diag.get("employee_behavior_marker_rows", []),
+        },
+    )
+    write_json(
         run_dir / "training_materials_quality_review.json",
         {
             "rows_total": len(quality_review_rows),
@@ -1323,6 +1449,14 @@ def _run_build_legacy(args: argparse.Namespace) -> None:
     )
     write_json(run_dir / "summary.json", summary)
     _update_progress(progress, progress_path, stage="build_completed", started_ts=started_ts)
+    progress_reporter.update(
+        step_name="artifacts_written",
+        current=len(valid_drafts),
+        total=max(rows_training_candidates_total, len(valid_drafts)),
+        current_item={"stage": "artifacts", "rows": len(valid_drafts)},
+        details={"rows_quarantined": len(quarantined_rows)},
+    )
+    progress_reporter.finish(status=summary_status, step_name="build_completed")
     write_markdown(run_dir / "summary.md", title="Training Materials", lines=_summary_lines(summary))
     print(str(run_dir))
 
@@ -1337,9 +1471,18 @@ def _run_write(args: argparse.Namespace) -> None:
     logger = setup_logging(app_cfg.logs_dir, "INFO")
     run_dir = Path(str(args.run_dir)).resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
+    progress_reporter = ProgressReporter(
+        process="training_materials_write",
+        run_dir=run_dir,
+        heartbeat_seconds=int(getattr(cfg, "progress_heartbeat_seconds", 30) or 30),
+        logger=logger,
+        step_name="init",
+        total=0,
+    )
 
     payload_path = run_dir / "training_materials_payload.json"
     if not payload_path.exists():
+        progress_reporter.finish(status="failed", step_name="payload_missing", error=f"payload_missing:{payload_path}")
         raise FileNotFoundError(f"training payload not found: {payload_path}")
     payload = json.loads(payload_path.read_text(encoding="utf-8"))
     rows = payload.get("rows", []) if isinstance(payload.get("rows"), list) else []
@@ -1349,6 +1492,12 @@ def _run_write(args: argparse.Namespace) -> None:
     write_enabled = bool(args.write and not args.dry_run)
     dry_run = not write_enabled
     overwrite_links = bool(args.overwrite_links or getattr(args, "force_regenerate_links", False))
+    progress_reporter.update(
+        step_name="payload_loaded",
+        current=0,
+        total=len(rows),
+        current_item={"stage": "payload_loaded", "rows": len(rows)},
+    )
 
     api_caps = ensure_training_materials_oauth_scopes(
         project_root=app_cfg.project_root,
@@ -1430,6 +1579,7 @@ def _run_write(args: argparse.Namespace) -> None:
         )
         write_json(summary_path, summary)
         write_markdown(run_dir / "summary.md", title="Training Materials", lines=_summary_lines(summary))
+        progress_reporter.finish(status="failed", step_name="llm_generation_failed")
         print(json.dumps(status, ensure_ascii=False, indent=2))
         return
 
@@ -1459,6 +1609,12 @@ def _run_write(args: argparse.Namespace) -> None:
     payload["rows_links_ready_to_write"] = int(docs_stats.get("rows_links_ready_to_write", 0) or 0)
     payload["docs_creation_mode"] = str(docs_stats.get("docs_creation_mode") or ("write" if write_enabled else "dry_run"))
     write_json(payload_path, payload)
+    progress_reporter.update(
+        step_name="docs_materialized",
+        current=int(docs_stats.get("rows_links_ready_to_write", 0) or 0),
+        total=len(materialized_rows),
+        current_item={"stage": "docs_materialized", "rows": len(materialized_rows)},
+    )
 
     if write_enabled and str(api_caps.get("status") or "") != "ok":
         status = {
@@ -1561,6 +1717,10 @@ def _run_write(args: argparse.Namespace) -> None:
     )
     write_json(summary_path, summary)
     write_markdown(run_dir / "summary.md", title="Training Materials", lines=_summary_lines(summary))
+    progress_reporter.finish(
+        status=str(status.get("status") or ("completed" if bool(status.get("write_allowed", False)) else "completed")),
+        step_name="write_completed",
+    )
     print(json.dumps(status, ensure_ascii=False, indent=2))
 
 

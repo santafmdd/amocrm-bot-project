@@ -5,6 +5,10 @@ import re
 import time
 from typing import Any
 
+from src.deal_analyzer.employee_profiles.analyzer import (
+    build_employee_profile_context,
+    sanitize_employee_text,
+)
 from src.deal_analyzer.llm_client import OllamaClient, OllamaClientError
 from src.deal_analyzer.llm_runtime import classify_llm_error
 
@@ -30,10 +34,22 @@ def _safe_text(value: Any) -> str:
 
 
 def _sanitize_role_based_phrase(value: Any) -> str:
-    out = _safe_text(value)
+    out = sanitize_employee_text(_safe_text(value))
     out = re.sub(
         r"\b(?:сам\s+)?назначил[аи]?\s+(\d+)\s+демо\b",
         lambda match: f"провел {match.group(1)} демо",
+        out,
+        flags=re.IGNORECASE,
+    )
+    out = re.sub(
+        r"(массов\w*\s+обзвон|20\s+звонк\w*\s+по\s+баз\w*|прозвон\w*\s+баз\w*|наборы|дозвоны)",
+        "фокус на теплой/текущей воронке и контроле следующего шага",
+        out,
+        flags=re.IGNORECASE,
+    )
+    out = re.sub(
+        r"(давить|продавл\w+|агрессивн\w+\s+продаж\w+|презент\w+\s+все\s+функц\w+)",
+        "вести клиента через consultative demo: guided discovery, hands-on действие и следующий шаг",
         out,
         flags=re.IGNORECASE,
     )
@@ -148,7 +164,27 @@ def _runtime_from_config(
     }
 
 
-def _build_group_context(group: WeekSummaryGroup, roks_snapshot: dict[str, Any], *, compact: bool = False) -> dict[str, Any]:
+def _build_group_context(
+    group: WeekSummaryGroup,
+    roks_snapshot: dict[str, Any],
+    *,
+    compact: bool = False,
+    client_priority_summary: dict[str, Any] | None = None,
+    employee_profiles_registry: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    employee_profiles_context: dict[str, Any] = {}
+    for row in group.source_manager_rows:
+        if not isinstance(row, dict):
+            continue
+        manager_name = _safe_text(row.get("manager_name"))
+        if not manager_name:
+            continue
+        employee_profiles_context[manager_name] = build_employee_profile_context(
+            manager_name=manager_name,
+            manager_role_profile=_safe_text(row.get("manager_role_profile")),
+            source_rows=[row],
+            registry_raw=employee_profiles_registry,
+        )
     return {
         "period_start": group.period_start,
         "period_end": group.period_end,
@@ -169,6 +205,8 @@ def _build_group_context(group: WeekSummaryGroup, roks_snapshot: dict[str, Any],
         "plan_rows": group.source_plan_rows[: (4 if compact else 12)],
         "roks_snapshot_status": roks_snapshot.get("status", ""),
         "roks_metrics": roks_snapshot.get("manager_metrics", {}),
+        "client_list_priority_summary": client_priority_summary or {},
+        "employee_profiles": employee_profiles_context,
         "context_mode": "compact_retry" if compact else "normal",
     }
 
@@ -188,7 +226,15 @@ def _build_llm_messages(context: dict[str, Any], *, repair_mode: bool = False, p
     }
     system = (
         "Ты формируешь свод недели для руководителя продаж. Верни только валидный JSON без markdown. "
-        "Пиши только на русском. Не придумывай факты и ссылки. Используй только факты из context."
+        "Пиши только на русском. Не придумывай факты и ссылки. Используй только факты из context. "
+        "Не давай рекомендации sales_manager в формате массового холодного обзвона; "
+        "для sales_manager фокус на теплой/текущей воронке, демо/тест/счет/оплата и next step. "
+        "Рекомендации по демо формулируй через consultative demo / guided discovery / hands-on demonstration, "
+        "без давления и без подхода 'показать все функции'."
+        " Если в context есть client_list_priority_summary, учитывай эти приоритеты для фокуса sales_manager на теплых клиентах."
+        " Если в context есть employee_profiles, учитывай персональные стили коучинга: "
+        "direct_accountability — жестко по ответственности без унижения; "
+        "expert_to_expert — через профессиональный рост и коммерческий результат."
     )
     system += (
         " ROKS manager funnel is role-based, not always strictly linear per one manager; "
@@ -249,6 +295,7 @@ def analyze_week_summary_groups(
     main_model_override: str | None = None,
     fallback_model_override: str | None = None,
     llm_max_attempts: int = 6,
+    client_priority_summary: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     runtime = _runtime_from_config(
         cfg=cfg,
@@ -297,10 +344,59 @@ def analyze_week_summary_groups(
     llm_success_fallback_compact_retry = 0
     llm_failed_count = 0
     llm_attempts_total = 0
+    employee_profile_context_rows: list[dict[str, Any]] = []
+    employee_behavior_marker_rows: list[dict[str, Any]] = []
 
     for idx, group in enumerate(groups):
-        full_context = _build_group_context(group, roks_snapshot, compact=False)
-        compact_context = _build_group_context(group, roks_snapshot, compact=True)
+        full_context = _build_group_context(
+            group,
+            roks_snapshot,
+            compact=False,
+            client_priority_summary=client_priority_summary,
+            employee_profiles_registry=getattr(cfg, "employee_profiles", None),
+        )
+        employee_profiles_payload = (
+            full_context.get("employee_profiles", {})
+            if isinstance(full_context.get("employee_profiles"), dict)
+            else {}
+        )
+        for manager_name, profile_node in employee_profiles_payload.items():
+            if not isinstance(profile_node, dict):
+                continue
+            employee_profile_context_rows.append(
+                {
+                    "manager_name": manager_name,
+                    "week_start": group.week_start,
+                    "week_end": group.week_end,
+                    "communication_style": profile_node.get("communication_style", ""),
+                    "motivators": profile_node.get("motivators", []),
+                    "avoid": profile_node.get("avoid", []),
+                    "profile_source": profile_node.get("profile_source", ""),
+                }
+            )
+            marker_payload = profile_node.get("behavior_markers", {})
+            if isinstance(marker_payload, dict):
+                employee_behavior_marker_rows.append(
+                    {
+                        "manager_name": manager_name,
+                        "week_start": group.week_start,
+                        "week_end": group.week_end,
+                        "repeated_growth_zones": marker_payload.get("repeated_growth_zones", []),
+                        "repeated_strong_sides": marker_payload.get("repeated_strong_sides", []),
+                        "preferred_behavior_pattern_under_pressure": marker_payload.get(
+                            "preferred_behavior_pattern_under_pressure",
+                            "",
+                        ),
+                        "coaching_response_style": marker_payload.get("coaching_response_style", ""),
+                    }
+                )
+        compact_context = _build_group_context(
+            group,
+            roks_snapshot,
+            compact=True,
+            client_priority_summary=client_priority_summary,
+            employee_profiles_registry=getattr(cfg, "employee_profiles", None),
+        )
         attempts: list[dict[str, Any]] = []
         if bool(preflight.get("main", {}).get("ok", False)):
             attempts.extend(
@@ -472,6 +568,8 @@ def analyze_week_summary_groups(
         "max_prompt_size_chars_seen": max(
             [int(item.get("prompt_size_chars", 0) or 0) for item in llm_responses if isinstance(item, dict)] or [0]
         ),
+        "employee_profile_context_rows": employee_profile_context_rows,
+        "employee_behavior_marker_rows": employee_behavior_marker_rows,
     }
     return rows, diagnostics
 

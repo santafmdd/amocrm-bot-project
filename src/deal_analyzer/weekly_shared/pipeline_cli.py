@@ -10,6 +10,7 @@ from src.logger import setup_logging
 
 from src.deal_analyzer.config import DealAnalyzerConfig, load_deal_analyzer_config
 from src.deal_analyzer.daily_control.style.deterministic_cleaner import clean_rows
+from src.deal_analyzer.progress import ProgressReporter
 from src.deal_analyzer.week_plan.plan_analyzer import analyze_week_plan_groups
 from src.deal_analyzer.week_plan.roks_enrichment import build_roks_oap_snapshot
 from src.deal_analyzer.week_plan.sheets_writer import (
@@ -309,6 +310,14 @@ def _run_build_cycle(args: argparse.Namespace) -> None:
     app_cfg = load_config()
     logger = setup_logging(app_cfg.logs_dir, "INFO")
     run_dir = _new_run_dir(app_cfg.project_root)
+    progress = ProgressReporter(
+        process="weekly_cycle",
+        run_dir=run_dir,
+        heartbeat_seconds=int(getattr(cfg, "progress_heartbeat_seconds", 30) or 30),
+        logger=logger,
+        step_name="init",
+        total=3,
+    )
 
     periods = _resolve_cycle_periods(args)
     signal_start = periods["signal_start"]
@@ -316,6 +325,12 @@ def _run_build_cycle(args: argparse.Namespace) -> None:
     plan_week_start = periods["plan_week_start"]
     plan_week_end = periods["plan_week_end"]
     period_warnings = list(periods.get("period_warnings", []) or [])
+    progress.update(
+        step_name="period_resolved",
+        current=0,
+        total=3,
+        current_item={"stage": "period", "date": f"{plan_week_start.isoformat()}..{plan_week_end.isoformat()}"},
+    )
 
     main_model = str(args.main_model or "").strip() or "deepseek-v4-pro:cloud"
     fallback_model = str(args.fallback_model or "").strip() or "deepseek-v4-flash:cloud"
@@ -330,6 +345,7 @@ def _run_build_cycle(args: argparse.Namespace) -> None:
     write_markdown(run_dir / "weekly_manager_sheet_discovery.md", title="Weekly Manager Discovery", lines=build_weekly_manager_discovery_markdown(weekly_manager_discovery))
     write_json(run_dir / "week_summary_sheet_discovery.json", week_summary_discovery)
     write_markdown(run_dir / "week_summary_sheet_discovery.md", title="Week Summary Discovery", lines=build_week_summary_discovery_markdown(week_summary_discovery))
+    progress.update(step_name="discover_completed", current=0, total=3, current_item={"stage": "discover"})
 
     spreadsheet_id = resolve_spreadsheet_id(cfg)
     source_sheet_name = ((week_plan_discovery.get("source_sheet") or {}) if isinstance(week_plan_discovery.get("source_sheet"), dict) else {}).get("title") or str(args.daily_sheet)
@@ -339,6 +355,12 @@ def _run_build_cycle(args: argparse.Namespace) -> None:
 
     daily_snapshot = read_daily_control_source(cfg=cfg, spreadsheet_id=spreadsheet_id, source_sheet_name=source_sheet_name, logger=logger)
     write_json(run_dir / "week_plan_source_rows.json", {"headers": daily_snapshot.headers, "rows": daily_snapshot.rows})
+    progress.update(
+        step_name="source_read_completed",
+        current=0,
+        total=3,
+        current_item={"stage": "source_read", "rows": len(daily_snapshot.rows)},
+    )
 
     managers = _manager_allowlist(cfg)
     try:
@@ -421,6 +443,12 @@ def _run_build_cycle(args: argparse.Namespace) -> None:
         },
     )
     write_json(run_dir / "week_plan_quality_review.json", {"text_lint": lint_week_plan_text_rows(week_plan_writer_rows)})
+    progress.update(
+        step_name="week_plan_completed",
+        current=1,
+        total=3,
+        current_item={"stage": "week_plan", "rows": len(week_plan_writer_rows)},
+    )
 
     week_plan_status = execute_week_plan_write(cfg=cfg, run_dir=run_dir, target_sheet_name=plan_sheet_name, dry_run=True, strict_preflight=True, allow_partial_write=True, quarantine_unrepaired=True, logger=logger)
     write_json(run_dir / "week_plan_writer_status.json", week_plan_status)
@@ -485,6 +513,12 @@ def _run_build_cycle(args: argparse.Namespace) -> None:
 
     weekly_manager_status = execute_weekly_write(cfg=cfg, run_dir=run_dir, target_sheet_name=manager_sheet_name, dry_run=True, strict_preflight=True, allow_partial_write=True, quarantine_unrepaired=True, logger=logger)
     write_json(run_dir / "weekly_manager_writer_status.json", weekly_manager_status)
+    progress.update(
+        step_name="weekly_manager_completed",
+        current=2,
+        total=3,
+        current_item={"stage": "weekly_manager", "rows": len(week_manager_writer_rows)},
+    )
 
     manager_headers, manager_rows = _manager_rows_table(week_manager_writer_rows)
     week_summary_groups, week_summary_grouping_diag, week_summary_plan_fact_rows = build_week_summary_groups(
@@ -609,6 +643,13 @@ def _run_build_cycle(args: argparse.Namespace) -> None:
         f"weekly_manager_summary rows_in_writer_payload: {(cycle_summary.get('weekly_manager_summary') or {}).get('rows_in_writer_payload', 0)}",
         f"week_summary rows_in_writer_payload: {(cycle_summary.get('week_summary') or {}).get('rows_in_writer_payload', 0)}",
     ])
+    progress.update(
+        step_name="week_summary_completed",
+        current=3,
+        total=3,
+        current_item={"stage": "week_summary", "rows": len(week_summary_writer_rows)},
+    )
+    progress.finish(status="completed", step_name="build_cycle_completed")
     print(str(run_dir))
 
 

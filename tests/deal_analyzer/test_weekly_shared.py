@@ -9,6 +9,7 @@ from src.deal_analyzer.weekly_shared.date_utils import week_bounds_monday_sunday
 from src.deal_analyzer.weekly_shared.pipeline_cli import _manager_rows_table, _plan_rows_table, _resolve_cycle_periods
 from src.deal_analyzer.weekly_shared import roks_oap
 from src.deal_analyzer.weekly_shared.roks_oap import resolve_weekly_roks_selection
+from src.deal_analyzer.weekly_shared.role_policy import demo_quality_checklist, resolve_role_policy
 from src.deal_analyzer.weekly_shared.validation import normalize_row_quotes, normalize_typographic_quotes
 
 
@@ -229,3 +230,49 @@ def test_roks_interpretation_allows_top_funnel_with_zero_downstream_for_khomidov
     assert interpretation["downstream_metrics_applicable"] is False
     assert interpretation["routed_meetings_possible"] is True
     assert "downstream_zero_role_allowed" in interpretation["warnings"]
+
+
+def test_role_policy_config_override() -> None:
+    policy = resolve_role_policy(
+        manager_name="Илья Бочков",
+        manager_role_profile="менеджер по продажам",
+        role_policy_registry={
+            "Илья Бочков": {
+                "role": "sales_manager",
+                "primary_funnel_scope": ["interest_to_demo", "demo_to_test"],
+                "restricted_funnel_scope": ["cold_calling", "mass_lpr_discovery"],
+                "max_upper_funnel_tasks_per_week": 0,
+            }
+        },
+    )
+    assert policy["role"] == "sales_manager"
+    assert policy["allowed_primary_funnel_focus"] == ["interest_to_demo", "demo_to_test"]
+    assert "cold_calling" in policy["restricted_upper_funnel"]
+    assert policy["max_upper_funnel_tasks_per_week"] == 0
+
+
+def test_demo_checklist_schema() -> None:
+    policy = resolve_role_policy(
+        manager_name="Илья Бочков",
+        manager_role_profile="менеджер по продажам",
+    )
+    checklist = demo_quality_checklist(policy)
+    assert isinstance(checklist, list)
+    assert len(checklist) >= 6
+    required = {
+        "была ли выявлена задача клиента до показа",
+        "было ли hands-on действие клиента",
+        "показаны ли только релевантные функции",
+        "был ли вопрос после каждого смыслового блока",
+        "зафиксирован ли критерий успеха теста",
+        "назначен ли следующий шаг",
+    }
+    assert required.issubset(set(checklist))
+    assert policy.get("demo_methodology") == [
+        "educational_demo",
+        "guided_discovery",
+        "client_hands_on",
+        "soft_influence",
+        "problem_based_demo",
+        "next_step_commitment",
+    ]

@@ -1,0 +1,34 @@
+{
+  "sources": [
+    {
+      "title": "SPIN Selling Overview",
+      "url": "https://en.wikipedia.org/wiki/SPIN_selling",
+      "tags": ["sales", "discovery", "questions", "spin"],
+      "summary": "SPIN: структура вопросов Situation, Problem, Implication, Need-payoff для выявления потребности и перехода к следующему шагу."
+    },
+    {
+      "title": "BANT Framework Basics",
+      "url": "https://en.wikipedia.org/wiki/BANT",
+      "tags": ["sales", "qualification", "bant"],
+      "summary": "BANT: бюджет, полномочия, потребность и сроки как каркас квалификации лида и фиксации коммерческого шага."
+    },
+    {
+      "title": "Challenger Sale Approach",
+      "url": "https://en.wikipedia.org/wiki/The_Challenger_Sale",
+      "tags": ["sales", "negotiation", "challenger"],
+      "summary": "Подход Challenger: обучать клиента, адаптировать аргументы и контролировать ход сделки через конкретный следующий шаг."
+    },
+    {
+      "title": "Objection Handling in Sales",
+      "url": "https://www.salesforce.com/resources/articles/objection-handling/",
+      "tags": ["sales", "objections", "scripts"],
+      "summary": "Практики работы с возражениями: уточнение причин, переформулирование ценности и закрытие на действие."
+    },
+    {
+      "title": "Discovery Call Playbook",
+      "url": "https://www.hubspot.com/sales/discovery-call",
+      "tags": ["sales", "discovery", "call-structure"],
+      "summary": "Шаблон discovery call: как вести разговор от контекста к проблеме, критериям решения и договоренности о следующем шаге."
+    }
+  ]
+}

@@ -4,10 +4,12 @@ import json
 import time
 from typing import Any
 
+from src.deal_analyzer.employee_profiles.analyzer import build_employee_profile_context
 from src.deal_analyzer.llm_client import OllamaClient, OllamaClientError
 from src.deal_analyzer.llm_runtime import classify_llm_error
 
 from ..daily_control.source_reader import day_label_from_iso
+from ..weekly_shared.role_policy import resolve_role_policy
 from ..weekly_shared.roks_oap import build_manager_metric_interpretation
 from .idempotency import build_exact_key
 from .models import WeekPlanSignalGroup
@@ -158,7 +160,16 @@ def _runtime_from_config(
     }
 
 
-def _build_group_context(group: WeekPlanSignalGroup, roks_snapshot: dict[str, Any], *, compact: bool = False) -> dict[str, Any]:
+def _build_group_context(
+    group: WeekPlanSignalGroup,
+    roks_snapshot: dict[str, Any],
+    *,
+    compact: bool = False,
+    manager_role_registry: dict[str, str] | None = None,
+    role_policy_registry: dict[str, dict[str, Any]] | None = None,
+    client_context_by_manager: dict[str, dict[str, Any]] | None = None,
+    employee_profiles_registry: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     manager_metrics = (
         (roks_snapshot.get("manager_metrics") or {}) if isinstance(roks_snapshot.get("manager_metrics"), dict) else {}
     ).get(group.manager_name, {})
@@ -197,6 +208,24 @@ def _build_group_context(group: WeekPlanSignalGroup, roks_snapshot: dict[str, An
                 "score_0_100": item.get("score_0_100"),
             }
         )
+    role_policy = resolve_role_policy(
+        manager_name=group.manager_name,
+        manager_role_profile=group.manager_role_profile,
+        manager_role_registry=manager_role_registry,
+        role_policy_registry=role_policy_registry,
+    )
+    client_context = {}
+    if isinstance(client_context_by_manager, dict):
+        manager_key = _safe_text(group.manager_name).lower()
+        node = client_context_by_manager.get(manager_key)
+        if isinstance(node, dict):
+            client_context = node
+    employee_profile_context = build_employee_profile_context(
+        manager_name=group.manager_name,
+        manager_role_profile=group.manager_role_profile,
+        source_rows=[item for item in group.source_rows if isinstance(item, dict)],
+        registry_raw=employee_profiles_registry,
+    )
     payload = {
         "period_start": group.period_start,
         "period_end": group.period_end,
@@ -221,6 +250,9 @@ def _build_group_context(group: WeekPlanSignalGroup, roks_snapshot: dict[str, An
         "roks_snapshot_status": roks_snapshot.get("status", ""),
         "roks_manager_metrics": manager_metrics,
         "roks_metric_interpretation": metric_interpretation,
+        "role_policy": role_policy,
+        "client_list_context": client_context,
+        "employee_profile": employee_profile_context,
     }
     if compact:
         payload["context_mode"] = "compact_retry"
@@ -263,7 +295,23 @@ def _build_llm_messages(
         "Если ссылки нет, оставь training_link/post_training_task_link пустыми строками. "
         "Учитывай роль-ориентированную интерпретацию РОКС: это не всегда линейная персональная воронка. "
         "Для профиля, который проводит демо, допустимо планировать демо выше self-generated 'есть интерес' "
-        "за счет встреч, переданных другими источниками. Для top-funnel профиля делай акцент на верх воронки."
+        "за счет встреч, переданных другими источниками. Для top-funnel профиля делай акцент на верх воронки. "
+        "Строго соблюдай role_policy из context: если роль sales_manager, не ставь массовый холодный верх воронки "
+        "как главный план дня (например, '20 звонков по базе', 'массовый обзвон', 'наборы', 'дозвоны'). "
+        "Для sales_manager фокусируйся на теплой/текущей воронке и качестве next step. "
+        "Для задач demo/test/invoice/payment применяй consultative demo стандарт: educational demo, guided discovery, "
+        "client-led product walkthrough, hands-on demonstration, совместная диагностика, обучающая демонстрация. "
+        "Не используй агрессивное давление и не превращай демо в экскурсию по кнопкам."
+        " Для каждого manager/day сформируй Daily Task Triad в поле task_to_assign строго в формате: "
+        "'1. Развитие: ... 2. Коммерческий результат: ... 3. Контроль: ...'. "
+        "Коммерческий результат обязан быть привязан к этапам воронки и измеримому результату за день. "
+        "CRM-задачи допустимы только как контрольный/вспомогательный компонент, но не как главный фокус дня."
+        " Учитывай employee_profile из context: стиль коммуникации, мотивацию сотрудника и ограничения по тону. "
+        "Для direct_accountability — жестко и по фактам, но без оскорблений. "
+        "Для expert_to_expert — через профессионализм, коммерческий эффект и уважение к экспертизе."
+        " Если в context есть client_list_context, используй его как первичный источник для sales_manager: "
+        "задачи должны быть вокруг конкретных теплых/текущих клиентов и этапов demo/test/invoice/payment/renewal. "
+        "Не давай абстрактные задачи вроде 'заполнить CRM' без привязки к клиентам/сделкам."
     )
     if repair_mode:
         system += " Режим repair: исправь JSON и язык, верни только JSON-объект со списком items."
@@ -293,6 +341,27 @@ def _build_llm_messages(
         "repair_reason": previous_error,
         "activity_types": normalized_allowed_activity_types,
         "activity_type_rule": "Используй только значения из activity_types без новых вариантов.",
+        "task_triad_rule": "task_to_assign обязан содержать 3 компонента: 1. Развитие, 2. Коммерческий результат, 3. Контроль.",
+        "smart_rule": (
+            "Каждый task_to_assign должен быть SMART: конкретное действие, измеримый результат, срок в рамках дня, "
+            "привязка к сделке/клиенту/воронке, критерий проверки через what_to_check."
+        ),
+        "sales_manager_demo_rule": (
+            "Если задача связана с демо/тестом/счетом/оплатой для sales_manager: подготовь гипотезу боли, "
+            "дай клиенту hands-on сценарий на 2-3 действия в сервисе, задавай guided discovery вопросы, "
+            "фиксируй вывод клиента и закрывай на следующий шаг (тест/счет/дата решения)."
+        ),
+        "client_list_rule": (
+            "Если в context.client_list_context есть top_priority_items, включай в формулировки категории/сделки из этого блока. "
+            "Для sales_manager фокусируйся на коммерческом потенциале конкретных клиентов, а не на массовом верхе воронки."
+        ),
+        "forbidden_examples": [
+            "улучшить ведение CRM",
+            "заполнить поля",
+            "проработать клиентов",
+            "повысить качество",
+            "сделать звонки",
+        ],
         "priority_values": ["high", "medium", "low"],
     }
     return [
@@ -404,6 +473,7 @@ def analyze_week_plan_groups(
     fallback_model_override: str | None = None,
     llm_max_attempts: int = 6,
     allowed_activity_types: list[str] | None = None,
+    client_context_by_manager: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     runtime = _runtime_from_config(
         cfg=cfg,
@@ -462,8 +532,24 @@ def analyze_week_plan_groups(
     llm_attempts_total = 0
 
     for idx, group in enumerate(groups):
-        full_context = _build_group_context(group, roks_snapshot, compact=False)
-        compact_context = _build_group_context(group, roks_snapshot, compact=True)
+        full_context = _build_group_context(
+            group,
+            roks_snapshot,
+            compact=False,
+            manager_role_registry=getattr(cfg, "manager_role_registry", None),
+            role_policy_registry=getattr(cfg, "role_policy_registry", None),
+            client_context_by_manager=client_context_by_manager,
+            employee_profiles_registry=getattr(cfg, "employee_profiles", None),
+        )
+        compact_context = _build_group_context(
+            group,
+            roks_snapshot,
+            compact=True,
+            manager_role_registry=getattr(cfg, "manager_role_registry", None),
+            role_policy_registry=getattr(cfg, "role_policy_registry", None),
+            client_context_by_manager=client_context_by_manager,
+            employee_profiles_registry=getattr(cfg, "employee_profiles", None),
+        )
 
         attempts: list[dict[str, Any]] = []
         if bool(preflight.get("main", {}).get("ok", False)):
