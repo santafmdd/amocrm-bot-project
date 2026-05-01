@@ -42,6 +42,8 @@ from .daily_case_modes import (
 )
 from .daily_multistep import BLOCK_KEYS as DAILY_BLOCK_KEYS, assemble_writer_columns, parse_blocks_markdown, validate_blocks
 from .crm_consistency import build_crm_consistency_layer
+from .evidence_sources import discover_presentation_evidence
+from .evidence_sources.models import PresentationDiscoveryOptions
 from .enrichment import build_operator_outputs, enrich_rows
 from .exporters import (
     analyzer_output_dir,
@@ -54,6 +56,7 @@ from .llm_backend import analyze_deal_with_hybrid_outcome, analyze_deal_with_oll
 from .llm_client import OllamaClient
 from .llm_runtime import classify_llm_error, is_cloud_usage_limit_error, resolve_ollama_runtime
 from .models import AnalysisRunMetadata
+from .progress import ProgressReporter
 from .prompt_builder import (
     append_call_review_case_json_repair_instruction,
     append_daily_rerank_json_repair_instruction,
@@ -178,6 +181,29 @@ def _parse_args() -> argparse.Namespace:
     period.add_argument("--status-contains", default=None, help="Optional case-insensitive status/stage filter for meeting queue")
     period.add_argument("--exclude-low-confidence", action="store_true", help="Exclude low-confidence records from meeting queue")
     period.add_argument("--discussion-limit", type=int, default=10, help="Max records in meeting queue artifacts (default: 10)")
+    period.add_argument(
+        "--include-presentations",
+        default="false",
+        choices=["true", "false", "yes", "no", "1", "0"],
+        help="Enable presentation/demo evidence ingestion from amoCRM notes/events + Google Drive links.",
+    )
+    period.add_argument(
+        "--presentation-link-fields",
+        default="auto",
+        help="Presentation link source fields selector (default: auto).",
+    )
+    period.add_argument(
+        "--presentation-transcribe-missing",
+        default="true",
+        choices=["true", "false", "yes", "no", "1", "0"],
+        help="When true, try STT for media links without transcript.",
+    )
+    period.add_argument(
+        "--max-presentation-files-per-run",
+        type=int,
+        default=20,
+        help="Max presentation media files to transcribe per run (default: 20).",
+    )
 
     weekly = sub.add_parser("analyze-weekly", help="Build weekly management layer artifacts from period payload")
     weekly.add_argument("--input", required=True, help="Path to collector period JSON")
@@ -216,6 +242,17 @@ def _parse_args() -> argparse.Namespace:
     janitor_clean.add_argument("--apply", action="store_true", help="Apply deletion for candidates")
 
     return parser.parse_args()
+
+
+def _parse_cli_bool(value: Any, *, default: bool) -> bool:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return bool(default)
+    if raw in {"1", "true", "yes", "y", "on"}:
+        return True
+    if raw in {"0", "false", "no", "n", "off"}:
+        return False
+    return bool(default)
 
 
 def main() -> None:
@@ -286,6 +323,13 @@ def main() -> None:
             status_contains=args.status_contains,
             exclude_low_confidence=bool(args.exclude_low_confidence),
             discussion_limit=args.discussion_limit,
+            include_presentations=_parse_cli_bool(args.include_presentations, default=False),
+            presentation_link_fields=str(getattr(args, "presentation_link_fields", "auto") or "auto"),
+            presentation_transcribe_missing=_parse_cli_bool(
+                getattr(args, "presentation_transcribe_missing", "true"),
+                default=True,
+            ),
+            max_presentation_files_per_run=int(getattr(args, "max_presentation_files_per_run", 20) or 20),
         )
         return
 
@@ -801,6 +845,10 @@ def _run_analyze_period(
     status_contains: str | None = None,
     exclude_low_confidence: bool = False,
     discussion_limit: int = 10,
+    include_presentations: bool = False,
+    presentation_link_fields: str = "auto",
+    presentation_transcribe_missing: bool = True,
+    max_presentation_files_per_run: int = 20,
 ) -> None:
     resolved = resolve_period(
         config=cfg,
@@ -884,6 +932,14 @@ def _run_analyze_period(
     )
     run_started_at = datetime.now(timezone.utc)
     run_dir, deals_dir = _prepare_period_run_dirs(output_dir=output_dir, run_started_at=run_started_at)
+    progress = ProgressReporter(
+        process="call_review",
+        run_dir=run_dir,
+        heartbeat_seconds=int(getattr(cfg, "progress_heartbeat_seconds", 30) or 30),
+        logger=logger,
+        step_name="call_collection_started",
+        total=len(normalized_rows_ranked),
+    )
     base_domain_for_links = _resolve_amo_base_domain_for_links(cfg=cfg)
     try:
         call_pool_debug = _collect_call_pool_debug(
@@ -935,6 +991,15 @@ def _run_analyze_period(
             },
         }
     _write_json_path(run_dir / "call_pool_debug.json", call_pool_debug)
+    progress.update(
+        step_name="call_collection_completed",
+        current=0,
+        total=len(normalized_rows_ranked),
+        current_item={
+            "stage": "call_pool",
+            "deal_id": f"rows={len(normalized_rows_ranked)}",
+        },
+    )
     _write_json_path(
         run_dir / "call_window_debug.json",
         call_pool_debug.get("call_window_debug", {})
@@ -981,6 +1046,79 @@ def _run_analyze_period(
         ),
     )
     _write_json_path(call_review_v3_dir / "deal_candidate_audit.json", deal_candidate_audit)
+    presentation_result = discover_presentation_evidence(
+        cfg=analysis_cfg,
+        logger=logger,
+        rows=normalized_rows_ranked,
+        raw_bundles_by_deal=raw_bundles_by_deal,
+        call_ledger_all=(
+            call_pool_debug.get("call_ledger_all", [])
+            if isinstance(call_pool_debug.get("call_ledger_all"), list)
+            else []
+        ),
+        period_start=resolved.period_start,
+        period_end=resolved.period_end,
+        options=PresentationDiscoveryOptions(
+            include_presentations=bool(include_presentations),
+            presentation_link_fields=str(presentation_link_fields or "auto"),
+            presentation_transcribe_missing=bool(presentation_transcribe_missing),
+            max_presentation_files_per_run=max(1, int(max_presentation_files_per_run or 20)),
+        ),
+        run_dir=run_dir,
+        progress_reporter=progress,
+    )
+    progress.update(
+        step_name="presentation_discovery_completed",
+        current=0,
+        total=len(normalized_rows_ranked),
+        current_item={
+            "stage": "presentation",
+            "deal_id": f"links={int((presentation_result.get('summary', {}) if isinstance(presentation_result.get('summary'), dict) else {}).get('presentation_links_found_count', 0) or 0)}",
+        },
+    )
+    presentation_deal_updates = (
+        presentation_result.get("deal_updates", {})
+        if isinstance(presentation_result.get("deal_updates"), dict)
+        else {}
+    )
+    for idx, row in enumerate(normalized_rows_ranked):
+        if not isinstance(row, dict):
+            continue
+        deal_id = str(row.get("deal_id") or row.get("amo_lead_id") or "").strip()
+        update = presentation_deal_updates.get(deal_id)
+        if not isinstance(update, dict):
+            continue
+        row["presentation_link_candidates"] = (
+            update.get("presentation_link_candidates", [])
+            if isinstance(update.get("presentation_link_candidates"), list)
+            else []
+        )
+        row["presentation_evidence_items"] = (
+            update.get("evidence_items", [])
+            if isinstance(update.get("evidence_items"), list)
+            else []
+        )
+        for key in (
+            "demo_format_detected",
+            "client_hands_on_detected",
+            "problem_discovery_before_demo",
+            "next_step_fixed_after_demo",
+            "demo_quality_score_0_100",
+            "demo_coaching_hint",
+        ):
+            if key in update:
+                row[key] = update.get(key)
+        normalized_rows_ranked[idx] = row
+    presentation_artifacts = (
+        presentation_result.get("artifacts", {})
+        if isinstance(presentation_result.get("artifacts"), dict)
+        else {}
+    )
+    if presentation_artifacts:
+        _write_json_path(
+            call_review_v3_dir / "presentation_artifacts_index.json",
+            presentation_artifacts,
+        )
     company_tag_propagation_plan = _build_company_tag_propagation_dry_run_plan(rows=normalized_rows_ranked)
     company_tag_propagation_plan_path = run_dir / "company_tag_propagation_dry_run.json"
     _write_json_path(company_tag_propagation_plan_path, company_tag_propagation_plan)
@@ -1144,6 +1282,12 @@ def _run_analyze_period(
     normalized_rows = [row_by_id[did] for did in selected_deal_ids if did in row_by_id]
     if not normalized_rows:
         logger.warning("analysis shortlist is empty after ranking; no deals selected for analyze-period")
+    progress.update(
+        step_name="analysis_shortlist_ready",
+        current=0,
+        total=len(normalized_rows),
+        current_item={"stage": "shortlist", "deal_id": f"selected={len(normalized_rows)}"},
+    )
     shortlist_by_deal = {
         str(x.get("deal_id") or "").strip(): x
         for x in shortlist_items
@@ -1174,6 +1318,17 @@ def _run_analyze_period(
 
     for idx, row in enumerate(normalized_rows):
         deal_hint = str(row.get("deal_id") or row.get("amo_lead_id") or idx)
+        progress.update(
+            step_name="analyze_deal",
+            current=idx + 1,
+            total=len(normalized_rows),
+            current_item={
+                "deal_id": deal_hint,
+                "model": str((analysis_llm_runtime.get("main") or {}).get("model") or ""),
+                "stage": "analysis",
+            },
+            log=True,
+        )
         try:
             shortlist_meta = shortlist_by_deal.get(str(deal_hint).strip(), {})
             analysis_meta = selected_by_deal.get(str(deal_hint).strip(), {})
@@ -1567,6 +1722,18 @@ def _run_analyze_period(
                     "business_window_closed": bool(shortlist_meta.get("business_window_closed")),
                     "call_anchor_timestamp": anchor_call_timestamp,
                     "call_anchor_date": _date_only_from_iso(anchor_call_timestamp),
+                    "presentation_link_candidates": row.get("presentation_link_candidates")
+                    if isinstance(row.get("presentation_link_candidates"), list)
+                    else [],
+                    "presentation_evidence_items": row.get("presentation_evidence_items")
+                    if isinstance(row.get("presentation_evidence_items"), list)
+                    else [],
+                    "demo_format_detected": str(row.get("demo_format_detected") or "unclear"),
+                    "client_hands_on_detected": str(row.get("client_hands_on_detected") or "unknown"),
+                    "problem_discovery_before_demo": str(row.get("problem_discovery_before_demo") or "unknown"),
+                    "next_step_fixed_after_demo": str(row.get("next_step_fixed_after_demo") or "unknown"),
+                    "demo_quality_score_0_100": int(row.get("demo_quality_score_0_100", 0) or 0),
+                    "demo_coaching_hint": str(row.get("demo_coaching_hint") or ""),
                     "analysis_shortlist_rank_group": int(analysis_meta.get("rank_group", 0) or 0),
                     "analysis_shortlist_reason": str(analysis_meta.get("shortlist_reason") or ""),
                     "analysis_shortlist_forced_fallback": bool(analysis_meta.get("forced_fallback")),
@@ -1608,6 +1775,13 @@ def _run_analyze_period(
                     "deal_hint": deal_hint,
                     "error": str(exc),
                 },
+            )
+            progress.update(
+                step_name="analyze_deal_failed",
+                current=idx + 1,
+                total=len(normalized_rows),
+                current_item={"deal_id": deal_hint, "stage": "failed"},
+                log=True,
             )
             deal_artifact_paths.append(str(failed_artifact))
             period_deal_records.append(
@@ -1859,6 +2033,29 @@ def _run_analyze_period(
     summary_payload["calls_inside_window_count"] = int(call_pool_debug.get("calls_inside_window_count", 0) or 0)
     summary_payload["deals_selected_by_call_window_count"] = int(call_pool_debug.get("deals_selected_by_call_window_count", 0) or 0)
     summary_payload["call_window_debug_path"] = str(run_dir / "call_window_debug.json")
+    presentation_summary = (
+        presentation_result.get("summary", {})
+        if isinstance(presentation_result.get("summary"), dict)
+        else {}
+    )
+    summary_payload["include_presentations"] = bool(include_presentations)
+    summary_payload["presentation_link_fields"] = str(presentation_link_fields or "auto")
+    summary_payload["presentation_transcribe_missing"] = bool(presentation_transcribe_missing)
+    summary_payload["max_presentation_files_per_run"] = int(max_presentation_files_per_run or 20)
+    summary_payload["presentation_links_found_count"] = int(
+        presentation_summary.get("presentation_links_found_count", 0) or 0
+    )
+    summary_payload["presentation_transcription_ok_count"] = int(
+        presentation_summary.get("presentation_transcription_ok_count", 0) or 0
+    )
+    summary_payload["presentation_transcription_failed_count"] = int(
+        presentation_summary.get("presentation_transcription_failed_count", 0) or 0
+    )
+    summary_payload["presentation_evidence_items_count"] = int(
+        presentation_summary.get("presentation_evidence_items_count", 0) or 0
+    )
+    if presentation_artifacts:
+        summary_payload["presentation_artifacts"] = presentation_artifacts
     summary_payload["contact_call_resolution_debug_path"] = str(call_review_v3_dir / "contact_call_resolution_debug.json")
     summary_payload["live_refresh"] = refresh_diag
     summary_payload["call_collection_audit"] = (
@@ -2385,6 +2582,13 @@ def _run_analyze_period(
         daily_control_payload_path,
         call_review_payload_path,
     )
+    progress.update(
+        step_name="artifacts_written",
+        current=len(analyses),
+        total=max(len(normalized_rows), len(analyses)),
+        current_item={"stage": "artifacts", "deal_id": f"analyzed={len(analyses)}"},
+    )
+    progress.finish(status="completed", step_name="run_completed")
 
 
 def _run_analyze_weekly(

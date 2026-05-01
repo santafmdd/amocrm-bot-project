@@ -265,6 +265,7 @@ def _resolve_build_block_reason(
     rows_training_candidates: int,
     rows_docs_prepared: int,
     llm_failed_count: int,
+    quality_rows_failed: int = 0,
     source_coverage_failed_rows: int = 0,
 ) -> str:
     if int(source_coverage_failed_rows or 0) > 0:
@@ -273,8 +274,10 @@ def _resolve_build_block_reason(
         return "llm_generation_failed"
     if int(rows_training_candidates or 0) == 0:
         return "rows_empty"
+    if int(rows_docs_prepared or 0) == 0 and int(quality_rows_failed or 0) > 0:
+        return "quality_gate_failed"
     if int(rows_docs_prepared or 0) == 0:
-        return "rows_empty"
+        return "rows_empty_after_quality_gate"
     return "dry_run_mode"
 
 
@@ -879,9 +882,12 @@ def _run_build_legacy(args: argparse.Namespace) -> None:
             progress["llm_attempts_total"] = int(event.get("llm_attempts_total", progress.get("llm_attempts_total", 0)) or 0)
             updates["llm_attempts_total"] = progress["llm_attempts_total"]
         _update_progress(progress, progress_path, stage=stage, started_ts=started_ts, **updates)
+        progress_current = int(progress.get("rows_completed", 0) or 0)
+        if stage in {"candidate_started", "candidate_prepared", "candidate_quarantined"}:
+            progress_current = max(progress_current, int(progress.get("rows_started", 0) or 0))
         progress_reporter.update(
             step_name=stage or "running",
-            current=int(progress.get("rows_completed", 0) or 0),
+            current=progress_current,
             total=int(progress.get("rows_candidates_total", 0) or 0),
             current_item={
                 "recipient": str(updates.get("current_recipient") or ""),
@@ -1059,6 +1065,18 @@ def _run_build_legacy(args: argparse.Namespace) -> None:
                 rows_completed=progress["rows_completed"],
                 rows_quarantined=progress["rows_quarantined"],
             )
+            progress_reporter.update(
+                step_name="candidate_quarantined",
+                current=int(progress.get("rows_completed", 0) or 0),
+                total=int(progress.get("rows_candidates_total", 0) or 0),
+                current_item={
+                    "stage": "quality_gate_failed",
+                    "recipient": str(draft.candidate.recipient or ""),
+                    "row_number": int(draft.candidate.row_number or 0),
+                },
+                details={"rows_quarantined": int(progress.get("rows_quarantined", 0) or 0)},
+                log=True,
+            )
             continue
         valid_drafts.append(draft)
         write_json(
@@ -1163,9 +1181,64 @@ def _run_build_legacy(args: argparse.Namespace) -> None:
             rows_prepared=progress["rows_prepared"],
             rows_completed=progress["rows_completed"],
         )
+        progress_reporter.update(
+            step_name="candidate_prepared",
+            current=int(progress.get("rows_completed", 0) or 0),
+            total=int(progress.get("rows_candidates_total", 0) or 0),
+            current_item={
+                "stage": "payload_prepared",
+                "recipient": str(draft.candidate.recipient or ""),
+                "row_number": int(draft.candidate.row_number or 0),
+            },
+            details={"rows_prepared": int(progress.get("rows_prepared", 0) or 0)},
+            log=True,
+        )
 
     llm_quarantine_effective = llm_quarantine_live if llm_quarantine_live else llm_quarantine
     quarantined_rows = [*source_coverage_quarantine, *llm_quarantine_effective, *validation_quarantine]
+    quality_rows_passed = sum(1 for item in quality_review_rows if bool(item.get("quality_passed", False)))
+    quality_rows_failed = sum(1 for item in quality_review_rows if not bool(item.get("quality_passed", False)))
+    quality_fail_examples: list[dict[str, Any]] = []
+    for item in quality_review_rows:
+        if not bool(item.get("quality_passed", False)):
+            quality_fail_examples.append(
+                {
+                    "row_number": int(item.get("row_number", 0) or 0),
+                    "recipient": str(item.get("recipient") or ""),
+                    "plan_date": str(item.get("plan_date") or ""),
+                    "quality_fail_reasons": list(item.get("quality_fail_reasons", []) if isinstance(item.get("quality_fail_reasons"), list) else []),
+                }
+            )
+        if len(quality_fail_examples) >= 10:
+            break
+
+    failed_quarantine_keys: set[str] = set()
+    for row in quarantined_rows:
+        if not isinstance(row, dict):
+            continue
+        key = _extract_resume_row_key(row)
+        if key:
+            failed_quarantine_keys.add(key)
+
+    model_used_by_row_payload = llm_diag.get("model_used_by_row", [])
+    if isinstance(model_used_by_row_payload, list):
+        for entry in model_used_by_row_payload:
+            if not isinstance(entry, dict):
+                continue
+            key = _extract_resume_row_key(entry)
+            final_quality_passed = not (key and key in failed_quarantine_keys)
+            if not key:
+                row_num = int(entry.get("row_number", 0) or 0)
+                final_quality_passed = not any(int(item.get("row_number", 0) or 0) == row_num for item in validation_quarantine)
+            entry["final_quality_passed"] = bool(final_quality_passed)
+            if not final_quality_passed:
+                entry["passed_after_repair"] = False
+        llm_diag["rows_passed_after_repair"] = sum(
+            1
+            for entry in model_used_by_row_payload
+            if isinstance(entry, dict) and bool(entry.get("passed_after_repair", False)) and bool(entry.get("final_quality_passed", True))
+        )
+
     generation_failures = _extract_generation_failures_rows(llm_quarantine_effective)
     llm_failed_count = int(llm_diag.get("llm_failed_count", 0) or 0)
     stopped_reason = str(llm_diag.get("stopped_reason") or "").strip()
@@ -1174,6 +1247,7 @@ def _run_build_legacy(args: argparse.Namespace) -> None:
         rows_training_candidates=rows_training_candidates_total,
         rows_docs_prepared=len(rows_payload),
         llm_failed_count=llm_failed_count,
+        quality_rows_failed=quality_rows_failed,
         source_coverage_failed_rows=len(source_coverage_failed_rows),
     )
     source_coverage_passed = len(source_coverage_failed_rows) == 0
@@ -1257,6 +1331,7 @@ def _run_build_legacy(args: argparse.Namespace) -> None:
         "block_reason": build_block_reason,
         "llm_error_summary_by_type": llm_error_summary_by_type,
         "llm_error_examples": llm_error_examples,
+        "quality_fail_examples": quality_fail_examples,
     }
     writer_status = {
         "mode": "dry_run",
@@ -1272,6 +1347,7 @@ def _run_build_legacy(args: argparse.Namespace) -> None:
         "rows_written": 0,
         "llm_error_summary_by_type": llm_error_summary_by_type,
         "llm_error_examples": llm_error_examples,
+        "quality_fail_examples": quality_fail_examples,
     }
 
     summary_status = "completed"
@@ -1302,8 +1378,9 @@ def _run_build_legacy(args: argparse.Namespace) -> None:
         "rows_skipped_existing_links": int(diag.get("rows_skipped_existing_links", 0) or 0),
         "rows_quarantined": len(quarantined_rows),
         "quality_rows_total": len(quality_review_rows),
-        "quality_rows_passed": sum(1 for item in quality_review_rows if bool(item.get("quality_passed", False))),
-        "quality_rows_failed": sum(1 for item in quality_review_rows if not bool(item.get("quality_passed", False))),
+        "quality_rows_passed": quality_rows_passed,
+        "quality_rows_failed": quality_rows_failed,
+        "quality_fail_examples": quality_fail_examples,
         "docs_creation_mode": "dry_run",
         "rows_docs_created": 0,
         "rows_task_docs_created": 0,

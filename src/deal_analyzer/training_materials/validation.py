@@ -49,12 +49,19 @@ SOURCES_SECTION_RE = re.compile(r"использованные\s+источни�
 CJK_RE = re.compile(r"[\u4E00-\u9FFF\u3400-\u4DBF\u3040-\u30FF\uAC00-\uD7AF]")
 
 _NUMBERED_LINE_RE = re.compile(r"^\d+[\.)]\s+")
+_INLINE_NUMBERED_RE = re.compile(r"(?:^|[\s;])\d+[\.)]\s+")
 _SPEECH_PREFIX_RE = re.compile(
-    r"^(?:[-*•]\s*)?(?:\d+[\.)]\s*)?(используй|скажи|формулировка)\s*:\s*(.+)$",
+    r"^(?:[-*•]\s*)?(?:\d+[\.)]\s*)?(?:\*\*)?(используй|скажи|формулировка|фраза|модуль|можно сказать)(?:\*\*)?\s*:\s*(.+)$",
     re.IGNORECASE,
 )
 _SPEECH_INSTEAD_RE = re.compile(r"^(?:[-*•]\s*)?(?:\d+[\.)]\s*)?вместо\s+.+\s+используй\s+.+$", re.IGNORECASE)
 _SPEECH_QUOTED_RE = re.compile(r'^(?:[-*•]\s*)?(?:\d+[\.)]\s*)?["«“][^"»”]{6,}["»”]\s*$')
+_SPEECH_INLINE_PREFIX_RE = re.compile(
+    r"(?:используй|скажи|формулировка|фраза|модуль|можно сказать)\s*:\s*[\"«“']?.{4,}?(?=(?:\s+(?:используй|скажи|формулировка|фраза|модуль|можно сказать)\s*:)|$)",
+    re.IGNORECASE,
+)
+_CHECKBOX_BULLET_RE = re.compile(r"^[-*•]\s*\[[ xX]\]\s+")
+_HEADING_LINE_RE = re.compile(r"^\s*#{1,4}\s+")
 
 
 def is_valid_url(value: Any) -> bool:
@@ -161,7 +168,7 @@ def _extract_section(text: str, heading_hints: list[str]) -> str:
     start_idx = -1
     for idx, raw_line in enumerate(lines):
         line = raw_line.strip().lower()
-        if not line.startswith("##"):
+        if not _HEADING_LINE_RE.match(line):
             continue
         if any(hint in line for hint in hints):
             start_idx = idx
@@ -170,7 +177,7 @@ def _extract_section(text: str, heading_hints: list[str]) -> str:
         return ""
     end_idx = len(lines)
     for idx in range(start_idx + 1, len(lines)):
-        if lines[idx].strip().startswith("## "):
+        if _HEADING_LINE_RE.match(lines[idx].strip()):
             end_idx = idx
             break
     return "\n".join(lines[start_idx:end_idx])
@@ -182,11 +189,20 @@ def _count_bullets(text: str) -> int:
         line = raw_line.strip()
         if not line:
             continue
-        if line.startswith(("- ", "• ", "* ")):
+        if line.startswith(("- ", "• ", "* ")) or _CHECKBOX_BULLET_RE.match(line):
             count += 1
+            inline_numbered = len(_INLINE_NUMBERED_RE.findall(line))
+            if inline_numbered > 1:
+                count += inline_numbered - 1
             continue
+        inline_numbered = len(_INLINE_NUMBERED_RE.findall(line))
         if _NUMBERED_LINE_RE.match(line):
             count += 1
+            if inline_numbered > 1:
+                count += inline_numbered - 1
+            continue
+        if inline_numbered > 1:
+            count += inline_numbered
     return count
 
 
@@ -194,13 +210,14 @@ def _count_speech_modules(text: str) -> int:
     count = 0
     for raw_line in str(text or "").splitlines():
         line = raw_line.strip()
-        if not line or line.startswith("## "):
+        if not line or _HEADING_LINE_RE.match(line):
             continue
+        inline_hits = len(_SPEECH_INLINE_PREFIX_RE.findall(line))
         prefixed = _SPEECH_PREFIX_RE.match(line)
         if prefixed:
             phrase = clean_text(prefixed.group(2))
             if phrase and phrase not in {'""', "''"}:
-                count += 1
+                count += max(1, inline_hits)
             continue
         if _SPEECH_INSTEAD_RE.match(line):
             count += 1
@@ -210,7 +227,25 @@ def _count_speech_modules(text: str) -> int:
             continue
         if _NUMBERED_LINE_RE.match(line) and len(clean_text(line)) >= 12:
             count += 1
+            if inline_hits > 1:
+                count += inline_hits - 1
+            continue
+        if inline_hits > 0:
+            count += inline_hits
     return count
+
+
+def _is_not_single_paragraph(*, text: str, sections_count: int, min_sections_threshold: int, min_non_empty_lines: int) -> bool:
+    raw = str(text or "")
+    non_empty_lines = [ln for ln in raw.splitlines() if ln.strip()]
+    if len(non_empty_lines) >= int(min_non_empty_lines or 0):
+        return True
+    if int(sections_count or 0) >= int(min_sections_threshold or 0) and bool(HEADING_RE.search(raw)):
+        return True
+    paragraph_blocks = [blk for blk in re.split(r"\n\s*\n", raw) if blk.strip()]
+    if len(paragraph_blocks) >= 3:
+        return True
+    return False
 
 
 def _contains_forbidden_phrases(text: str) -> bool:
@@ -295,10 +330,15 @@ def review_training_quality(training_text: str) -> dict[str, Any]:
     chars = len(text)
     section_count = len(HEADING_RE.findall(text))
     speech_section = _extract_section(text, ["речевые модули", "речевые", "модули"])
-    checklist_section = _extract_section(text, ["чек-лист", "чеклист"])
+    checklist_section = _extract_section(text, ["чек-лист", "чеклист", "контрольный список"])
     speech_modules_count = _count_speech_modules(speech_section)
     checklist_items_count = _count_bullets(checklist_section)
-    no_single_paragraph = len([ln for ln in text.splitlines() if ln.strip()]) >= 14
+    no_single_paragraph = _is_not_single_paragraph(
+        text=text,
+        sections_count=section_count,
+        min_sections_threshold=TRAINING_MIN_SECTIONS,
+        min_non_empty_lines=8,
+    )
     no_empty_quotes = not bool(EMPTY_QUOTES_RE.search(text)) and 'Используй: ""' not in text and 'Используй:""' not in text
     no_forbidden_phrases = not _contains_forbidden_phrases(text)
     contains_sources_section = _contains_sources_section(text)
@@ -355,7 +395,12 @@ def review_task_quality(task_text: str) -> dict[str, Any]:
     text = normalize_task_text(task_text)
     chars = len(text)
     section_count = len(HEADING_RE.findall(text))
-    no_single_paragraph = len([ln for ln in text.splitlines() if ln.strip()]) >= 8
+    no_single_paragraph = _is_not_single_paragraph(
+        text=text,
+        sections_count=section_count,
+        min_sections_threshold=6,
+        min_non_empty_lines=6,
+    )
     no_empty_quotes = not bool(EMPTY_QUOTES_RE.search(text)) and 'Используй: ""' not in text and 'Используй:""' not in text
     no_forbidden_phrases = not _contains_forbidden_phrases(text)
     contains_sources_section = _contains_sources_section(text)

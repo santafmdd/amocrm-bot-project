@@ -5,6 +5,15 @@ import re
 import time
 from typing import Any
 
+from src.deal_analyzer.employee_profiles.analyzer import (
+    apply_profile_to_row_fields,
+    build_behavior_markers,
+    build_employee_profile_context,
+)
+from src.deal_analyzer.employee_profiles.registry import (
+    build_employee_profile_registry,
+    resolve_employee_profile,
+)
 from src.deal_analyzer.llm_client import OllamaClient, OllamaClientError
 from src.deal_analyzer.llm_runtime import classify_llm_error
 
@@ -52,7 +61,10 @@ def _build_llm_messages(
         "Не используй фразу 'Лучше сказать:'. "
         "Не используй канцелярит и scripted-аналитику. "
         "Если данных мало, аккуратно укажи ограничения в data_limitations и сформируй осторожный вывод. "
-        "В expected_effect_quantity/expected_effect_quality формулируй управленческую гипотезу, не точный прогноз."
+        "В expected_effect_quantity/expected_effect_quality формулируй управленческую гипотезу, не точный прогноз. "
+        "Учитывай employee_profile из context: для direct_accountability формулируй прямо и по ответственности, "
+        "для expert_to_expert — через коммерческий результат и профессиональный рост. "
+        "Запрещены оскорбления и унижения."
     )
     if repair_mode:
         system += " Режим repair: исправь структуру и язык. Верни только валидный JSON-объект."
@@ -317,7 +329,13 @@ def _compact_source_cases(source_rows: list[dict[str, Any]]) -> list[dict[str, A
     return compact
 
 
-def _build_group_context(group: DailyControlInputGroup, roks_snapshot: dict[str, Any], *, compact: bool = False) -> dict[str, Any]:
+def _build_group_context(
+    group: DailyControlInputGroup,
+    roks_snapshot: dict[str, Any],
+    *,
+    compact: bool = False,
+    employee_profiles_registry: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     manager_metrics = (
         (roks_snapshot.get("manager_metrics") or {}) if isinstance(roks_snapshot.get("manager_metrics"), dict) else {}
     ).get(group.manager_name, {})
@@ -369,6 +387,12 @@ def _build_group_context(group: DailyControlInputGroup, roks_snapshot: dict[str,
         "roks_snapshot_status": roks_snapshot.get("status"),
         "source_cases": source_cases if not compact else _compact_source_cases(group.source_rows),
         "limitations": limitations,
+        "employee_profile": build_employee_profile_context(
+            manager_name=group.manager_name,
+            manager_role_profile=group.manager_role_profile,
+            source_rows=[item for item in group.source_rows if isinstance(item, dict)],
+            registry_raw=employee_profiles_registry,
+        ),
     }
     if compact:
         payload["context_mode"] = "compact_retry"
@@ -458,6 +482,7 @@ def _row_from_llm_payload(
     payload: dict[str, Any],
     backend: str,
     source_run_id: str,
+    employee_profiles_registry: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     score = _safe_score(payload.get("score_0_100"))
     criticality_code = _normalize_criticality(payload.get("criticality"), score)
@@ -467,7 +492,7 @@ def _row_from_llm_payload(
         week_start = str(group.week_start or "")
     if not week_end:
         week_end = str(group.week_end or "")
-    return {
+    row = {
         "week_start": week_start,
         "week_end": week_end,
         "period_start": group.period_start,
@@ -501,6 +526,19 @@ def _row_from_llm_payload(
         "evidence_short": _safe_text(payload.get("evidence_short")),
         "data_limitations": _safe_text(payload.get("data_limitations")),
     }
+    profile_registry = build_employee_profile_registry(employee_profiles_registry)
+    profile = resolve_employee_profile(
+        manager_name=str(row.get("manager_name") or group.manager_name),
+        manager_role_profile=str(group.manager_role_profile or ""),
+        registry=profile_registry,
+    )
+    row, _changes = apply_profile_to_row_fields(
+        row=row,
+        profile=profile,
+        fields=("what_to_tell_employee",),
+        date_hint_field="control_day_date",
+    )
+    return row
 
 
 def analyze_daily_packages(
@@ -643,10 +681,53 @@ def analyze_daily_packages(
     llm_success_fallback2_compact_retry = 0
     llm_json_repair_count = 0
     llm_failed_count = 0
+    employee_profile_context_rows: list[dict[str, Any]] = []
+    employee_behavior_marker_rows: list[dict[str, Any]] = []
 
     for idx, group in enumerate(packages):
-        full_context = _build_group_context(group, roks_snapshot, compact=False)
-        compact_context = _build_group_context(group, roks_snapshot, compact=True)
+        profile_context = build_employee_profile_context(
+            manager_name=group.manager_name,
+            manager_role_profile=group.manager_role_profile,
+            source_rows=[item for item in group.source_rows if isinstance(item, dict)],
+            registry_raw=getattr(cfg, "employee_profiles", None),
+        )
+        employee_profile_context_rows.append(
+            {
+                "manager_name": group.manager_name,
+                "control_day_date": group.control_day_date,
+                "communication_style": profile_context.get("communication_style", ""),
+                "motivators": profile_context.get("motivators", []),
+                "avoid": profile_context.get("avoid", []),
+                "profile_source": profile_context.get("profile_source", ""),
+            }
+        )
+        marker_payload = profile_context.get("behavior_markers", {})
+        if isinstance(marker_payload, dict):
+            employee_behavior_marker_rows.append(
+                {
+                    "manager_name": group.manager_name,
+                    "control_day_date": group.control_day_date,
+                    "repeated_growth_zones": marker_payload.get("repeated_growth_zones", []),
+                    "repeated_strong_sides": marker_payload.get("repeated_strong_sides", []),
+                    "preferred_behavior_pattern_under_pressure": marker_payload.get(
+                        "preferred_behavior_pattern_under_pressure",
+                        "",
+                    ),
+                    "coaching_response_style": marker_payload.get("coaching_response_style", ""),
+                }
+            )
+        full_context = _build_group_context(
+            group,
+            roks_snapshot,
+            compact=False,
+            employee_profiles_registry=getattr(cfg, "employee_profiles", None),
+        )
+        compact_context = _build_group_context(
+            group,
+            roks_snapshot,
+            compact=True,
+            employee_profiles_registry=getattr(cfg, "employee_profiles", None),
+        )
         request_record = {
             "row_index": idx,
             "group_key": f"{group.control_day_date}|{group.manager_name}",
@@ -933,6 +1014,7 @@ def analyze_daily_packages(
                 payload=selected_payload,
                 backend=selected_backend,
                 source_run_id=source_run_id,
+                employee_profiles_registry=getattr(cfg, "employee_profiles", None),
             )
 
         request_record["selected_backend"] = selected_backend
@@ -1012,5 +1094,7 @@ def analyze_daily_packages(
             for row in rows
             if str(row.get("data_limitations", "")).strip()
         ][:5],
+        "employee_profile_context_rows": employee_profile_context_rows,
+        "employee_behavior_marker_rows": employee_behavior_marker_rows,
     }
     return rows, diagnostics

@@ -1396,12 +1396,14 @@ def analyze_training_candidates(
             rows_passed_after_repair += 1
         model_used_by_row.append(
             {
+                "idempotency_key": str(candidate.idempotency_key or ""),
                 "row_number": int(candidate.row_number or 0),
                 "recipient": str(candidate.recipient or ""),
                 "plan_date": str(candidate.plan_date or ""),
                 "selected_backend": str(selected_backend or ""),
                 "selected_model": str(selected_model or ""),
                 "passed_after_repair": bool(row_passed_after_repair),
+                "final_quality_passed": None,
             }
         )
         profile = resolve_employee_profile(
@@ -1420,6 +1422,7 @@ def analyze_training_candidates(
             profile=profile,
             fields=("training_title", "training_material", "task_title", "task_material"),
             date_hint_field="plan_date",
+            preserve_multiline_fields=("training_material", "task_material"),
         )
         selected_payload["training_title"] = str(profile_payload_row.get("training_title") or "")
         selected_payload["training_material"] = str(profile_payload_row.get("training_material") or "")

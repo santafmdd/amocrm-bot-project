@@ -10,6 +10,7 @@ from src.config import load_config
 from src.logger import setup_logging
 
 from src.deal_analyzer.config import DealAnalyzerConfig, load_deal_analyzer_config
+from src.deal_analyzer.progress import ProgressReporter
 from src.deal_analyzer.daily_control.artifacts import write_json, write_markdown
 from src.deal_analyzer.daily_control.daily_analyzer import analyze_daily_packages
 from src.deal_analyzer.daily_control.day_grouper import group_by_manager_day
@@ -483,16 +484,31 @@ def _run_build(args: argparse.Namespace) -> None:
     app_cfg = load_config()
     logger = setup_logging(app_cfg.logs_dir, "INFO")
     run_dir = _new_daily_run_dir(app_cfg.project_root)
+    progress = ProgressReporter(
+        process="daily_control",
+        run_dir=run_dir,
+        heartbeat_seconds=int(getattr(cfg, "progress_heartbeat_seconds", 30) or 30),
+        logger=logger,
+        step_name="init",
+        total=0,
+    )
 
     period_start = _parse_iso_date(str(args.period_start), field="period_start").date()
     period_end = _parse_iso_date(str(args.period_end), field="period_end").date()
     if period_end < period_start:
         raise RuntimeError("period_end must be >= period_start")
+    progress.update(
+        step_name="period_resolved",
+        current=0,
+        total=0,
+        current_item={"stage": "period", "date": f"{period_start.isoformat()}..{period_end.isoformat()}"},
+    )
 
     retry_from_run_dir = Path(str(args.retry_from_run_dir or "")).resolve() if str(args.retry_from_run_dir or "").strip() else None
     managers = _manager_allowlist(cfg, args.managers)
 
     if retry_from_run_dir is not None:
+        progress.update(step_name="load_retry_groups", current=0, total=0, current_item={"stage": "retry_source"})
         groups, grouping_diag, roks_snapshot, source_sheet_name = _load_retry_groups(
             retry_from_run_dir=retry_from_run_dir,
             logger=logger,
@@ -522,6 +538,7 @@ def _run_build(args: argparse.Namespace) -> None:
             ],
         )
     else:
+        progress.update(step_name="sheet_discovery", current=0, total=0, current_item={"stage": "discover"})
         discovery = discover_daily_control_sheet(
             cfg=cfg,
             workbook_name="РОКС 2026",
@@ -548,6 +565,12 @@ def _run_build(args: argparse.Namespace) -> None:
             source_sheet_name=source_sheet_name,
             logger=logger,
         )
+        progress.update(
+            step_name="source_read_completed",
+            current=0,
+            total=0,
+            current_item={"stage": "source_read", "rows": len(source_snapshot.rows)},
+        )
 
         groups, grouping_diag = group_by_manager_day(
             headers=source_snapshot.headers,
@@ -564,6 +587,12 @@ def _run_build(args: argparse.Namespace) -> None:
         grouping_diag["groups_total_before_limit"] = int(groups_all_count)
         grouping_diag["groups_total_after_limit"] = int(len(groups))
         grouping_diag["groups_limit_applied"] = int(args.limit or 0)
+        progress.update(
+            step_name="groups_built",
+            current=0,
+            total=len(groups),
+            current_item={"stage": "grouping", "groups": len(groups)},
+        )
 
         app_root = Path(cfg.config_path).resolve().parents[1]
         sheet_client = None
@@ -627,6 +656,12 @@ def _run_build(args: argparse.Namespace) -> None:
         fallback_timeout_seconds=(int(args.fallback_timeout or 0) if int(args.fallback_timeout or 0) > 0 else None),
         no_retry_on_rate_limit=bool(args.no_retry_on_rate_limit),
         llm_max_attempts=int(args.llm_max_attempts or 3),
+    )
+    progress.update(
+        step_name="llm_completed",
+        current=len(rows),
+        total=max(len(groups), len(rows)),
+        current_item={"stage": "llm", "model": str(args.main_model or "") or "default"},
     )
     llm_runtime_status = llm_diag.get("llm_runtime", {}) if isinstance(llm_diag.get("llm_runtime"), dict) else {}
     fallback_node = llm_runtime_status.get("fallback", {}) if isinstance(llm_runtime_status.get("fallback"), dict) else {}
@@ -754,6 +789,20 @@ def _run_build(args: argparse.Namespace) -> None:
     write_json(run_dir / "daily_control_llm_runtime_status.json", llm_runtime_status)
     write_json(run_dir / "daily_control_payload.json", payload)
     write_json(run_dir / "daily_control_row_flow_debug.json", row_flow_debug)
+    write_json(
+        run_dir / "employee_profile_context_debug.json",
+        {
+            "rows_total": len(llm_diag.get("employee_profile_context_rows", []) if isinstance(llm_diag.get("employee_profile_context_rows"), list) else []),
+            "rows": llm_diag.get("employee_profile_context_rows", []),
+        },
+    )
+    write_json(
+        run_dir / "employee_behavior_markers.json",
+        {
+            "rows_total": len(llm_diag.get("employee_behavior_marker_rows", []) if isinstance(llm_diag.get("employee_behavior_marker_rows"), list) else []),
+            "rows": llm_diag.get("employee_behavior_marker_rows", []),
+        },
+    )
     write_json(run_dir / "daily_control_language_repair.json", language_repair)
     write_markdown(
         run_dir / "daily_control_language_repair.md",
@@ -828,9 +877,22 @@ def _run_build(args: argparse.Namespace) -> None:
             "rows_total": quality_review.get("rows_total", 0),
             "problem_rows_total": quality_review.get("problem_rows_total", 0),
         },
+        "employee_profile_context_rows": len(llm_diag.get("employee_profile_context_rows", []))
+        if isinstance(llm_diag.get("employee_profile_context_rows"), list)
+        else 0,
+        "employee_behavior_markers_rows": len(llm_diag.get("employee_behavior_marker_rows", []))
+        if isinstance(llm_diag.get("employee_behavior_marker_rows"), list)
+        else 0,
     }
     write_json(run_dir / "summary.json", summary)
     write_markdown(run_dir / "summary.md", title="Daily Control Summary", lines=_summary_markdown_lines(summary))
+    progress.update(
+        step_name="artifacts_written",
+        current=len(writer_rows),
+        total=max(len(groups), len(writer_rows)),
+        current_item={"stage": "artifacts", "rows": len(writer_rows)},
+    )
+    progress.finish(status="completed", step_name="build_completed")
 
     print(str(run_dir))
 

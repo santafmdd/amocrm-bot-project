@@ -96,6 +96,18 @@ def test_build_block_reason_uses_source_coverage_failed_not_rows_empty() -> None
     assert block_reason != "rows_empty"
 
 
+def test_training_block_reason_quality_gate_failed_not_rows_empty() -> None:
+    block_reason = _resolve_build_block_reason(
+        rows_training_candidates=3,
+        rows_docs_prepared=0,
+        llm_failed_count=0,
+        quality_rows_failed=3,
+        source_coverage_failed_rows=0,
+    )
+    assert block_reason == "quality_gate_failed"
+    assert block_reason != "rows_empty"
+
+
 def test_training_runtime_defaults_to_qwen_when_models_missing() -> None:
     cfg = SimpleNamespace(
         ollama_model="",
@@ -1476,6 +1488,61 @@ def test_speech_modules_count_accepts_multiple_formats() -> None:
     assert training_q["speech_modules_count"] >= 10
 
 
+def test_training_quality_counts_ispolzuy_speech_modules() -> None:
+    text = _long_training_material_with_speech_formats().replace(
+        'Скажи: "Чтобы не потерять детали, зафиксируем следующий шаг прямо сейчас."',
+        '- Используй: "Чтобы не потерять детали, зафиксируем следующий шаг прямо сейчас."',
+    )
+    q = review_training_quality(text)
+    assert q["speech_modules_count"] >= 10
+
+
+def test_training_quality_counts_numbered_checklist() -> None:
+    checklist_lines = "\n".join(
+        [
+            "1. Проверил контекст звонка.",
+            "2) Уточнил ЛПР.",
+            "- [ ] Зафиксировал боль и последствия.",
+            "- Закрепил следующий шаг с датой.",
+            "* Отправил подтверждение на email.",
+            "5. Проверил CRM-запись на конкретику.",
+            "6) Подготовил материалы к следующему касанию.",
+        ]
+    )
+    text = _long_training_material().replace(
+        "\n## Чек-лист на следующий рабочий день\n"
+        + "\n".join([f"- Чек-лист пункт {idx}: проверяем конкретный факт внедрения в звонке и CRM." for idx in range(1, 9)]),
+        "\n## Чек-лист на следующий рабочий день\n" + checklist_lines,
+    )
+    q = review_training_quality(text)
+    assert q["checklist_items_count"] >= 7
+
+
+def test_training_quality_not_single_paragraph_when_sections_present() -> None:
+    compact = (
+        "# Название обучения\n"
+        "## Для кого\nСотрудник: тест\n"
+        "## Зачем это обучение\nФокус на внедрении.\n"
+        "## Что увидели в звонках / дневном контроле\nЕсть повторяющиеся ошибки.\n"
+        "## Теория простыми словами\nТеория и объяснение механики.\n"
+        "## Основная модель / алгоритм\n1. Контекст 2. Процесс 3. Боль 4. Шаг.\n"
+        "## Как применять в звонке\nПрактика на реальных диалогах.\n"
+        "## Речевые модули\nИспользуй: \"Подтвердите, что это приоритет?\" Используй: \"Кто принимает решение?\" Используй: \"Когда вернемся к вопросу?\" Используй: \"Что мешает перейти к тесту?\" Используй: \"Какой следующий шаг фиксируем?\" Используй: \"Кто ответственный за запуск?\" Используй: \"Какие риски у текущего процесса?\" Используй: \"Когда удобно провести демо?\" Используй: \"Какой критерий успеха теста?\" Используй: \"Подтвердите дату следующего контакта.\"\n"
+        "## Частые ошибки\nРанний переход к презентации.\n"
+        "## Мини-тренировка\n1. Переписать фразы 2. Подготовить вопросы.\n"
+        "## Чек-лист на следующий рабочий день\n1. Контекст 2. ЛПР 3. Боль 4. Последствия 5. Ценность 6. Следующий шаг 7. Фиксация\n"
+        "## Как руководитель будет проверять внедрение\nПроверка записей и звонков."
+    )
+    q = review_training_quality(compact)
+    assert q["sections_count"] >= 8
+    assert q["no_single_paragraph_doc"] is True
+
+
+def test_training_quality_passes_realistic_generated_doc() -> None:
+    q = review_training_quality(_long_training_material())
+    assert q["quality_passed"] is True
+
+
 def test_foreign_words_allowlist_is_not_blocker() -> None:
     text = _long_training_material_with_speech_formats() + "\n\n" + (
         "Используем amoCRM, CRM, LPR, demo, email, Tilda, KPI, ROKS, call, lead, pipeline, budget, launch date. "
@@ -2179,6 +2246,207 @@ def test_build_keyboard_interrupt_persists_started_artifacts(monkeypatch) -> Non
     assert progress.get("current_stage") == "build_interrupted"
     assert (run_dir / "training_materials_runtime_status.json").exists()
     assert (run_dir / "training_materials_candidate_debug.json").exists()
+
+
+def test_training_summary_not_passed_after_repair_when_final_quality_failed(monkeypatch) -> None:
+    tmp_root = _new_tmp_root()
+    project_root = tmp_root / "project"
+    logs_dir = tmp_root / "logs"
+    project_root.mkdir(parents=True, exist_ok=True)
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    candidate = _candidate()
+
+    monkeypatch.setattr("src.deal_analyzer.training_materials.cli.load_deal_analyzer_config", lambda _p: _cfg(tmp_root))
+    monkeypatch.setattr(
+        "src.deal_analyzer.training_materials.cli.load_config",
+        lambda: SimpleNamespace(project_root=project_root, logs_dir=logs_dir),
+    )
+    monkeypatch.setattr("src.deal_analyzer.training_materials.cli.setup_logging", lambda *_args, **_kwargs: _DummyLogger())
+    monkeypatch.setattr(
+        "src.deal_analyzer.training_materials.cli.ensure_training_materials_oauth_scopes",
+        lambda **_kwargs: {"status": "ok", "docs_api_available": True, "missing_scopes": [], "scope_mismatch_detected": False, "reauth_required": False},
+    )
+    monkeypatch.setattr(
+        "src.deal_analyzer.training_materials.cli.collect_training_candidates",
+        lambda **_kwargs: ([candidate], {"rows_skipped_existing_links": 0, "plan_rows_total": 1}),
+    )
+    monkeypatch.setattr(
+        "src.deal_analyzer.training_materials.cli.collect_source_snippets",
+        lambda **_kwargs: (
+            [],
+            SourceCoverage(1, 1, 1, True, 2, ["A", "B"], ["https://a", "https://b"], [], "ok", []),
+        ),
+    )
+    bad_training = "# Название обучения\n## Для кого\nТест"
+    bad_task = "# Задание после обучения\n## Цель задания\nТест"
+    draft = TrainingDraft(
+        candidate=candidate,
+        training_title="Короткий документ",
+        training_material=bad_training,
+        task_title="Короткое задание",
+        task_material=bad_task,
+        analysis_backend_used="main_targeted_repair",
+        quality_metrics={
+            "training": review_training_quality(bad_training),
+            "task": review_task_quality(bad_task),
+        },
+    )
+    monkeypatch.setattr(
+        "src.deal_analyzer.training_materials.cli.analyze_training_candidates",
+        lambda **_kwargs: (
+            [draft],
+            [],
+            {
+                "llm_failed_count": 0,
+                "llm_requests": [],
+                "llm_responses": [],
+                "llm_runtime": {},
+                "llm_error_examples": [],
+                "model_used_by_row": [
+                    {
+                        "idempotency_key": candidate.idempotency_key,
+                        "row_number": candidate.row_number,
+                        "recipient": candidate.recipient,
+                        "plan_date": candidate.plan_date,
+                        "selected_backend": "main_targeted_repair",
+                        "selected_model": "qwen3.5:397b-cloud",
+                        "passed_after_repair": True,
+                        "final_quality_passed": None,
+                    }
+                ],
+                "rows_passed_after_repair": 1,
+            },
+        ),
+    )
+    run_dir = tmp_root / "run_quality_fail"
+    args = SimpleNamespace(
+        config=str(tmp_root / "cfg.json"),
+        run_dir=str(run_dir),
+        week_start="2026-04-20",
+        week_end="2026-04-24",
+        plan_sheet="План недели",
+        daily_sheet="Дневной контроль",
+        call_review_sheet="Разбор звонков",
+        manager="",
+        plan_date="",
+        limit=1,
+        offset=0,
+        max_runtime_minutes=0,
+        max_llm_calls=0,
+        main_timeout=0,
+        fallback_timeout=0,
+        allow_template_fallback=False,
+        allow_full_run=True,
+        resume=False,
+        dry_run=True,
+        force_reauth=False,
+        main_model="",
+        fallback_model="",
+        model_pool="",
+        require_external_sources=True,
+        allow_no_external_sources=False,
+        external_search_provider="auto",
+        external_search_limit=5,
+        external_source_min_count=2,
+        resume_run_dir="",
+        retry_failed_from_run_dir="",
+    )
+    _run_build(args)
+    summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    quarantine = json.loads((run_dir / "training_materials_quarantine.json").read_text(encoding="utf-8"))
+    assert summary["block_reason"] == "quality_gate_failed"
+    assert summary["quality_rows_failed"] >= 1
+    assert quarantine["rows_quarantined"] >= 1
+    assert summary["model_used_by_row"][0]["passed_after_repair"] is False
+    assert summary["model_used_by_row"][0]["final_quality_passed"] is False
+
+
+def test_training_progress_increments_candidates(monkeypatch) -> None:
+    tmp_root = _new_tmp_root()
+    project_root = tmp_root / "project"
+    logs_dir = tmp_root / "logs"
+    project_root.mkdir(parents=True, exist_ok=True)
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    candidates = [
+        TrainingCandidate(**{**asdict(_candidate()), "idempotency_key": "k1", "row_number": 2}),
+        TrainingCandidate(**{**asdict(_candidate()), "idempotency_key": "k2", "row_number": 3}),
+        TrainingCandidate(**{**asdict(_candidate()), "idempotency_key": "k3", "row_number": 4}),
+    ]
+
+    monkeypatch.setattr("src.deal_analyzer.training_materials.cli.load_deal_analyzer_config", lambda _p: _cfg(tmp_root))
+    monkeypatch.setattr(
+        "src.deal_analyzer.training_materials.cli.load_config",
+        lambda: SimpleNamespace(project_root=project_root, logs_dir=logs_dir),
+    )
+    monkeypatch.setattr("src.deal_analyzer.training_materials.cli.setup_logging", lambda *_args, **_kwargs: _DummyLogger())
+    monkeypatch.setattr(
+        "src.deal_analyzer.training_materials.cli.ensure_training_materials_oauth_scopes",
+        lambda **_kwargs: {"status": "ok", "docs_api_available": True, "missing_scopes": [], "scope_mismatch_detected": False, "reauth_required": False},
+    )
+    monkeypatch.setattr(
+        "src.deal_analyzer.training_materials.cli.collect_training_candidates",
+        lambda **_kwargs: (candidates, {"rows_skipped_existing_links": 0, "plan_rows_total": len(candidates)}),
+    )
+    monkeypatch.setattr(
+        "src.deal_analyzer.training_materials.cli.collect_source_snippets",
+        lambda **_kwargs: (
+            [],
+            SourceCoverage(1, 1, 1, True, 2, ["A", "B"], ["https://a", "https://b"], [], "ok", []),
+        ),
+    )
+
+    def _fake_analyze_training_candidates(**kwargs):
+        on_progress = kwargs.get("on_progress")
+        rows = kwargs.get("candidates", [])
+        for idx, item in enumerate(rows):
+            if callable(on_progress):
+                on_progress({"stage": "candidate_started", "candidate_index": idx, "row_number": item.row_number, "recipient": item.recipient})
+                on_progress({"stage": "candidate_prepared", "candidate_index": idx, "row_number": item.row_number, "recipient": item.recipient})
+        return [], [], {"llm_failed_count": 0, "llm_requests": [], "llm_responses": [], "llm_runtime": {}, "llm_error_examples": []}
+
+    monkeypatch.setattr("src.deal_analyzer.training_materials.cli.analyze_training_candidates", _fake_analyze_training_candidates)
+    monkeypatch.setattr("src.deal_analyzer.training_materials.cli.prepare_local_docs", lambda **_kwargs: [])
+    monkeypatch.setattr("src.deal_analyzer.training_materials.cli.build_post_training_task_payload", lambda **_kwargs: [])
+    monkeypatch.setattr("src.deal_analyzer.training_materials.cli.summarize_task_payload", lambda *_args, **_kwargs: {})
+
+    run_dir = tmp_root / "run_progress"
+    args = SimpleNamespace(
+        config=str(tmp_root / "cfg.json"),
+        run_dir=str(run_dir),
+        week_start="2026-04-06",
+        week_end="2026-04-10",
+        plan_sheet="План недели",
+        daily_sheet="Дневной контроль",
+        call_review_sheet="Разбор звонков",
+        manager="",
+        plan_date="",
+        limit=0,
+        offset=0,
+        max_runtime_minutes=0,
+        max_llm_calls=0,
+        main_timeout=0,
+        fallback_timeout=0,
+        allow_template_fallback=False,
+        allow_full_run=True,
+        resume=False,
+        dry_run=True,
+        force_reauth=False,
+        main_model="",
+        fallback_model="",
+        model_pool="",
+        require_external_sources=True,
+        allow_no_external_sources=False,
+        external_search_provider="auto",
+        external_search_limit=5,
+        external_source_min_count=2,
+        resume_run_dir="",
+        retry_failed_from_run_dir="",
+    )
+    _run_build(args)
+    progress_log = (run_dir / "progress.log").read_text(encoding="utf-8")
+    assert "candidate_started 1/3" in progress_log
+    assert "candidate_started 2/3" in progress_log
+    assert "candidate_started 3/3" in progress_log
 
 
 def test_write_with_empty_payload_and_generation_failures_returns_llm_generation_failed(monkeypatch) -> None:
